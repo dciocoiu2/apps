@@ -1,0 +1,27 @@
+AMQP 0-9-1
+AMQP 1.0
+RabbitMQ Streams
+MQTT versions 3.1,3.11 and 5.0
+RabbitMQ Streams 
+Secure Websocket and regular websocket
+STOMP (all curren versions) via a plugin by proxying internally over AMQP 0-9-1
+Web STOMP to support STOMP messaging to browser using WebSockets
+Web MQTT to support messaging to browser using WebSockets 
+A mamagement interface that supports a simple HTTP API to send and recieve messages
+and full capabilities of rabbitMQ itself, split by chapter and show full code and project structure for each
+---full reqs---
+Protocols:
+ AMQP 0-9-1 and 1.0 suppor (core foundation)
+ MQTT versions: 3.1,3.1.1,5.0
+ STOMP 1.0-1.2 via plugin routed over AMQP 0-9-1
+ WebSTOMP and WebMQTT over secure and insecure WebSocket
+ RabbitMQ Streams( segment-oriented append only log ww/ time-based cursors)
+Interfaces:
+    TCP socket listners for binary protocols
+    RESTul Management HTTP API to publish/consume/query brokers
+    Plubinn architecture for protocol bridging
+--dev process--
+ incrementally by chapter, each chapter incudes:
+    A foldr-based structure
+    Full file content with explanations
+    All wired into broker.py which is the single entry point

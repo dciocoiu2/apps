@@ -1,0 +1,14 @@
+| Chapter | Modules | Description | 
+| 1 | broker.py, config.py | Core bootstrapping, config parsing, TLS, threading | 
+| 2 | protocol/framing.py | AMQP frame encoding/decoding | 
+| 3 | protocol/amqp_0_9_1.py | Channel state machines, frame parsing | 
+| 4 | core/exchange.py, core/queue.py | Exchanges, bindings, fanout, headers | 
+| 5 | protocol/amqp_1_0.py | Link protocol, source/target, flow/transfer | 
+| 6 | core/stream.py, storage/stream_index.py | RabbitMQ stream replication | 
+| 7 | protocol/mqtt.py | Support for MQTT 3.x and 5.0 | 
+| 8 | protocol/stomp_plugin.py, plugins/stomp_proxy.py | Full STOMP support via plugin AMQP overlay | 
+| 9 | protocol/websocket.py, api/websocket_api.py | WebMQTT, WebSTOMP over ws/wss | 
+| 10 | api/http_api.py | RESTful publish/consume/inspect | 
+| 11 | auth/ | AuthN, AuthZ, vhost + user mgmt | 
+| 12 | Final features | TTLs, Dead-letter, Queued acks, Clustering plan | 
+

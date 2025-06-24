@@ -1,0 +1,57 @@
+✅ 1. Broker Boot Tests
+- Startup without config file: should fall back to defaults or fail gracefully.
+- Startup with TLS enabled but missing certs: verify error handling.
+- Startup with join_host/join_port: broker attempts to join cluster.
+- Verify log output shows expected listeners and cluster events.
+
+🔁 2. Queue Behavior Tests
+- Enqueue messages manually via REST or via code.
+- Register multiple consumers and check message dispatch.
+- Test FIFO order delivery for each queue.
+- Expire messages by simulating TTL and checking message drop.
+- Prefetch test (future extension): limit inflight delivery if implemented.
+
+🛰️ 3. Cluster Replication Tests
+- Start 2+ brokers, join each other manually or via GUI.
+- Publish a message on Broker A → ensure it appears in Broker B.
+- Shutdown a peer: verify it is pruned from topology.
+- Restart peer: verify rejoin behavior works consistently.
+
+🌐 4. Web GUI Tests
+- Dashboard loads at / and updates every few seconds.
+- Queue metrics shown accurately.
+- Topology displays correct self and peers.
+- Cluster join form works (POSTs to /join).
+- Shows message counts after publishing.
+
+📦 5. Replication API Tests
+- POST /replicate with a new message → message appears in target queue.
+- Replay same message ID → deduped via cache.
+- Send expired message → dropped, no enqueue.
+
+📊 6. Metrics Tests
+- POST messages → enqueued counter increases.
+- Deliver messages → delivered counter increases.
+- Latency calculated and shown.
+- Snapshot structure is stable JSON schema.
+
+🔒 7. TLS & Security Tests
+- Invalid or missing TLS certs → startup fails as expected.
+- mTLS enabled → client cert required (if applicable).
+- HTTP API over TLS: browser shows secure lock.
+- JWT auth (future extension): tokens must be verified server-side.
+
+🧪 8. Fault Tolerance & Edge Cases
+- Crash one broker → verify others continue.
+- Drop network between two brokers → PEERS prunes inactive node.
+- Simulate bad /join payload (missing fields) → expect 400 response.
+- Simulate malformed JSON → expect graceful 400 with error.
+
+🧩 9. Static File Routing
+- Access /web/index.html, /web/dashboard.js directly → must serve assets.
+- Unknown static path (e.g. /web/doesnotexist.css) → returns 404 JSON.
+
+🔄 10. System Stress / Load (manual or script)
+- Burst enqueue 1000+ messages → check queue stability.
+- Connect multiple consumers to same queue.
+- Test log volume and ensure logging remains performant.

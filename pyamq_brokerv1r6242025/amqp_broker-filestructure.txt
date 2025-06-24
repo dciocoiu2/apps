@@ -1,0 +1,51 @@
+amqp_broker/
+├── broker.py                     # 🚪 Entry point + dispatcher
+├── config.py                     # ⚙️ Settings and runtime flags
+├── protocol/                     
+│   ├── __init__.py               
+│   ├── amqp_0_9_1.py             # full channel and frame state machine(FCFSM)
+│   ├── amqp_1_0.py               # AMQP proto header, parse frame types and dispatch based on simp. prf
+│   ├── mqtt.py                   #
+│   ├── stomp_plugin.py           #
+│   ├── websocket.py              #
+│   └── framing.py                # handles binary framing, backbone of AMQP 0-9-1 and 1.0
+├── core/                         
+│   ├── __init__.py               
+│   ├── exchange.py               #
+│   ├── queue.py                  #
+│   ├── stream.py                 #
+│   ├── routing.py                #
+│   ├── delivery.py               #
+│   └── scheduler.py              #
+├── storage/
+│   ├── __init__.py
+│   ├── snapshot.py
+│   ├── persistence.py
+│   └── stream_index.py
+├── auth/
+│   ├── __init__.py
+│   ├── users.py
+│   └── vhosts.py
+├── api/
+│   ├── __init__.py
+│   ├── http_api.py
+│   └── websocket_api.py
+├── util/
+│   ├── __init__.py
+│   ├── threading_utils.py
+│   └── logging.py
+└── plugins/
+    ├── __init__.py
+    └── stomp_proxy.py
+
+---chapter 12---
+core/
+├── queue.py          🆕 TTL, prefetch, dead-lettering (updated)
+├── delivery.py       🆕 Confirm tracking (in-flight messages) (new file)
+storage/
+└── snapshot.py       (for future queue persistence) (new file)
+--ch13--
+config.py                        Add TLS/mTLS flags
+util/security.py                 TLS context manager + JWT checker
+broker.py                        Wire TLS + token parsing into listeners
+api/http_api.py                  Enforce JWT on HTTP endpoints
