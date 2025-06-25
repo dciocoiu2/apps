@@ -328,3 +328,132 @@ def main():
 if __name__ == '__main__':
     main()
 "@
+# === plugins\echo_logger.py ===
+Write-CodeFile "$root\\plugins\\echo_logger.py" @"
+allowed_roles = ['admin']
+
+def on_start():
+    print('[Plugin] Echo logger loaded.')
+
+def on_enqueue(queue, message):
+    print(f'[Echo] Queue=\{queue\} → \{message\}')
+
+def on_cluster_event(event, peer):
+    print(f'[Cluster] \{event.upper()\} event from peer: \{peer\}')
+"@
+
+# === tests\test_auth.py ===
+Write-CodeFile "$root\\tests\\test_auth.py" @"
+import requests
+def test_token_auth():
+    r = requests.post('http://localhost:15672/auth', json={'username': 'admin', 'password': 'admin123'})
+    assert r.status_code == 200
+    assert 'token' in r.json()
+"@
+
+# === api\web\index.html ===
+Write-CodeFile "$root\\api\\web\\index.html" @"
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AMQP Broker Dashboard</title>
+  <script src='/web/dashboard.js' defer></script>
+</head>
+<body>
+  <h1>📡 Broker Dashboard</h1>
+  <section>
+    <h2>Metrics</h2>
+    <pre id='metrics'></pre>
+    <h2>Topology</h2>
+    <pre id='topology'></pre>
+    <h2>Logs</h2>
+    <pre id='logs'></pre>
+    <h2>Charts</h2>
+    <a href='/web/stats.html'>📈 View Charts</a>
+  </section>
+</body>
+</html>
+"@
+
+# === api\web\dashboard.js ===
+Write-CodeFile "$root\\api\\web\\dashboard.js" @"
+const token = prompt('Bearer token:')
+async function get(path) {
+  const res = await fetch(path, { headers: { Authorization: 'Bearer ' + token } })
+  return await res.json()
+}
+async function update() {
+  const m = await get('/metrics')
+  const t = await get('/topology')
+  const l = await get('/logs')
+  document.getElementById('metrics').textContent = JSON.stringify(m, null, 2)
+  document.getElementById('topology').textContent = JSON.stringify(t, null, 2)
+  document.getElementById('logs').textContent = l.map(e => \`[\${e.time}] \${e.level}: \${e.msg}\`).join('\\n')
+}
+setInterval(update, 4000); update()
+"@
+
+# === api\web\stats.html ===
+Write-CodeFile "$root\\api\\web\\stats.html" @"
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Broker Charts</title>
+  <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+  <script src='/web/stats.js' defer></script>
+</head>
+<body>
+  <h1>📊 Real-Time Charts</h1>
+  <canvas id='qChart' width='800' height='300'></canvas>
+  <canvas id='latChart' width='800' height='300'></canvas>
+</body>
+</html>
+"@
+
+# === api\web\stats.js ===
+Write-CodeFile "$root\\api\\web\\stats.js" @"
+const token = prompt('Bearer token:')
+const ctxQ = document.getElementById('qChart').getContext('2d')
+const ctxL = document.getElementById('latChart').getContext('2d')
+
+const qChart = new Chart(ctxQ, {
+  type: 'bar',
+  data: { labels: [], datasets: [
+    { label: 'Enqueued', data: [], backgroundColor: '#4e79a7' },
+    { label: 'Delivered', data: [], backgroundColor: '#f28e2b' }
+  ]},
+  options: { responsive: true, scales: { y: { beginAtZero: true } } }
+})
+
+const latChart = new Chart(ctxL, {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label: 'Avg Latency (s)', data: [], borderColor: '#59a14f', fill: false }
+  ]},
+  options: { responsive: true, scales: { y: { beginAtZero: true } } }
+})
+
+async function update() {
+  const res = await fetch('/metrics', { headers: { Authorization: 'Bearer ' + token } })
+  const queues = (await res.json()).queues
+  const keys = Object.keys(queues)
+
+  qChart.data.labels = keys
+  qChart.data.datasets[0].data = keys.map(k => queues[k].enqueued)
+  qChart.data.datasets[1].data = keys.map(k => queues[k].delivered)
+  latChart.data.labels = keys
+  latChart.data.datasets[0].data = keys.map(k => queues[k].avg_latency)
+
+  qChart.update(); latChart.update()
+}
+setInterval(update, 3000); update()
+"@
+
+# === Final Message ===
+Write-Host "`n✅ Broker Build Complete at '$root'"
+Write-Host "   ➤ Start broker:      cd amqp_broker; python broker.py"
+Write-Host "   ➤ Dashboard:         http://localhost:15672/web/"
+Write-Host "   ➤ Live charts:       http://localhost:15672/web/stats.html"
+Write-Host "   ➤ Login:             POST /auth  (JSON {username, password})"
+Write-Host "   ➤ Issue token:       python rbac_token_issuer.py admin admin,reader,writer supersecret"
+Write-Host "   ➤ Run tests:         pytest tests/test_auth.py"
