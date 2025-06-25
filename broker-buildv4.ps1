@@ -170,178 +170,195 @@ payload = {
 
 print(jwt.encode(payload, secret, algorithm='HS256'))
 "@
+# === core\queue.py ===
+Write-CodeFile "$root\core\queue.py" @"
+import time
+from collections import deque
+from util.metrics import enqueue, deliver
+from util.plugins import trigger
 
-#==PART2==#
-# === broker.py ===
-Write-CodeFile "$root\broker.py" @"
-import threading, socket, sys
-from config import load_settings
-from util.logging import info
-from util.plugins import load_plugins
-from api.http_api import run_http_api
-from cluster.peerlink import join_network, start_heartbeat
+queues = {}
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        return s.getsockname()[0]
-    except:
-        return '127.0.0.1'
+class Queue:
+    def __init__(self, name): self.name, self.q, self.c = name, deque(), []
 
-def print_endpoints(ip, port):
-    print()
-    print(f' Web UI:         http://{ip}:{port}/web/')
-    print(f' Login:           POST /auth with username/password')
-    print(f'Dashboard:       /web/stats.html')
-    print(f' Metrics:         /metrics (JWT + RBAC secured)')
-    print(f' Replication:     /replicate\n')
+    def enqueue(self, msg):
+        ts = time.time()
+        self.q.append((msg, ts))
+        enqueue(self.name, ts)
+        trigger('on_enqueue', queue=self.name, message=msg)
+        self._deliver()
 
-def main():
-    try:
-        cfg = load_settings()
-    except Exception as e:
-        print(f' Failed to load config: {e}')
-        sys.exit(1)
+    def register(self, fn):
+        self.c.append(fn)
+        self._deliver()
 
-    port = cfg.get('admin_port', 15672)
-    ip = get_local_ip()
+    def _deliver(self):
+        while self.q and self.c:
+            msg, _ = self.q.popleft()
+            for fn in self.c: fn(msg)
+            deliver(self.name)
 
-    if cfg.get('enable_plugins'):
-        load_plugins(); info("Plugins loaded")
-
-    start_heartbeat()
-    h, p = cfg.get('join_host'), cfg.get('join_port')
-    if h and p: join_network(h, p)
-
-    threading.Thread(target=lambda: run_http_api(ip, port), daemon=True).start()
-    print_endpoints(ip, port)
-    info("Broker ready."); threading.Event().wait()
-
-if __name__ == '__main__':
-    main()
+def get_or_create_queue(name):
+    if name not in queues: queues[name] = Queue(name)
+    return queues[name]
 "@
 
-# === plugins\echo_logger.py ===
+# === cluster\peerlink.py ===
+Write-CodeFile "$root\cluster\peerlink.py" @"
+import time, threading, requests
+from util.plugins import trigger
+
+PEERS = {}
+NODE_ID = 'node-' + str(int(time.time()))
+
+def register_peer(id, h, p):
+    if id != NODE_ID:
+        PEERS[id] = {'host': h, 'port': p, 'last_seen': time.time()}
+        trigger('on_cluster_event', event='join', peer=id)
+
+def join_network(h, p):
+    try:
+        r = requests.post(f"http://{h}:{p}/join", json={'node_id': NODE_ID,'host':'localhost','port':5672})
+        for peer in r.json().get('peers', []): register_peer(**peer)
+    except Exception as e: print("[Join fail]", e)
+
+def heartbeat_loop():
+    while True:
+        time.sleep(10)
+        for nid, peer in list(PEERS.items()):
+            try:
+                r = requests.get(f"http://{peer['host']}:{peer['port']}/ping", timeout=2)
+                if r.status_code == 200: peer['last_seen'] = time.time()
+                else: PEERS.pop(nid, None); trigger('on_cluster_event', event='drop', peer=nid)
+            except: PEERS.pop(nid, None); trigger('on_cluster_event', event='drop', peer=nid)
+
+def start_heartbeat(): threading.Thread(target=heartbeat_loop, daemon=True).start()
+"@
+
+# === cluster\replicator.py ===
+Write-CodeFile "$root\cluster\replicator.py" @"
+import uuid, time, requests
+from cluster.peerlink import PEERS
+
+REPL_CACHE = set()
+
+def replicate(queue, body):
+    payload = {
+        'queue': queue,
+        'body': body,
+        'msg_id': str(uuid.uuid4()),
+        'expires': time.time() + 60
+    }
+    for p in PEERS.values():
+        try: requests.post(f"http://{p['host']}:{p['port']}/replicate", json=payload, timeout=2)
+        except: pass
+
+def handle(payload, fn):
+    if payload['msg_id'] in REPL_CACHE or time.time() > payload['expires']: return False
+    REPL_CACHE.add(payload['msg_id'])
+    fn(payload['queue'], payload['body'])
+    return True
+"@
+
+# === api\http_api.py ===
+Write-CodeFile "$root\api\http_api.py" @"
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from core.queue import get_or_create_queue
+from cluster.peerlink import register_peer, PEERS, NODE_ID
+from cluster.replicator import handle as handle_rep
+from util.metrics import snapshot
+from util.logs import get_logs
+from util.auth import login, validate_token
+
+class APIHandler(BaseHTTPRequestHandler):
+    def _send(self, code, data, typ='json'):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json' if typ == 'json' else 'text/html')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode() if typ == 'json' else data)
+
+    def _authed(self, role=None):
+        auth = self.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            token = auth.split(' ')[1]
+            return validate_token(token, [role] if role else None)
+        return False
+
+    def do_POST(self):
+        l = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(l).decode()
+        try: payload = json.loads(raw)
+        except: return self._send(400, {'error': 'invalid json'})
+
+        if self.path == '/auth':
+            t = login(payload.get('username'), payload.get('password'))
+            return self._send(200, {'token': t} if t else {'error': 'unauthorized'})
+
+        if self.path == '/join':
+            id, h, p = payload.get('node_id'), payload.get('host'), payload.get('port')
+            if id and h and p:
+                register_peer(id, h, p)
+                return self._send(200, {'joined': True})
+            return self._send(400, {'error': 'missing fields'})
+
+        if self.path == '/replicate':
+            if not self._authed('writer'): return self._send(403, {'error': 'unauthorized'})
+            ok = handle_rep(payload, lambda q,b: get_or_create_queue(q).enqueue(b))
+            return self._send(200, {'status': 'ok' if ok else 'skipped'})
+
+        return self._send(404, {'error': 'not found'})
+
+    def do_GET(self):
+        if self.path == '/metrics' and self._authed('reader'):
+            return self._send(200, snapshot())
+        elif self.path == '/topology' and self._authed('reader'):
+            return self._send(200, {'self': NODE_ID, 'peers': list(PEERS.keys())})
+        elif self.path == '/logs' and self._authed('reader'):
+            return self._send(200, get_logs())
+        elif self.path == '/ping':
+            return self._send(200, {'pong': True})
+        elif self.path.startswith('/web'):
+            fn = self.path[5:] or 'index.html'
+            fp = os.path.join(os.path.dirname(__file__), 'web', fn)
+            if os.path.exists(fp):
+                with open(fp, 'rb') as f:
+                    typ = 'text/html' if fn.endswith('.html') else 'application/javascript'
+                    return self._send(200, f.read(), typ)
+            return self._send(404, {'error': 'not found'})
+        elif self.path == '/':
+            with open(os.path.join(os.path.dirname(__file__), 'web', 'index.html'), 'rb') as f:
+                return self._send(200, f.read(), 'text/html')
+        else:
+            return self._send(403, {'error': 'unauthorized'})
+
+def run_http_api(host='0.0.0.0', port=15672):
+    HTTPServer((host, port), APIHandler).serve_forever()
+"@
+
 Write-CodeFile "$root\plugins\echo_logger.py" @"
 allowed_roles = ['admin']
 
 def on_start():
-    print('[Plugin] echo_logger loaded')
+    print('[Plugin] Echo logger loaded')
 
 def on_enqueue(queue, message):
-    print(f'[echo_logger] Queue {queue} received message: {message}')
+    print(f'[EchoLog] {queue} => {message}')
 
 def on_cluster_event(event, peer):
-    print(f'[echo_logger] Cluster {event.upper()} from {peer}')
+    print(f'[Cluster] {event.upper()} from {peer}')
 "@
 
-# === tests\test_auth.py ===
 Write-CodeFile "$root\tests\test_auth.py" @"
 import requests
-
-def test_token_auth():
+def test_token():
     r = requests.post('http://localhost:15672/auth', json={'username': 'admin', 'password': 'admin123'})
-    assert r.status_code == 200
-    assert 'token' in r.json()
+    assert r.status_code == 200 and 'token' in r.json()
 "@
 
-# === api\web\index.html ===
-Write-CodeFile "$root\api\web\index.html" @"
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Broker Dashboard</title>
-  <script src='/web/dashboard.js' defer></script>
-</head>
-<body>
-  <h1> Broker Dashboard</h1>
-  <section><h2>Metrics</h2><pre id='metrics'></pre></section>
-  <section><h2>Topology</h2><pre id='topology'></pre></section>
-  <section><h2>Logs</h2><pre id='logs'></pre></section>
-  <section><h2>Charts</h2><a href='/web/stats.html'> Live Charts</a></section>
-</body>
-</html>
-"@
-
-# === api\web\dashboard.js ===
-Write-CodeFile "$root\api\web\dashboard.js" @"
-const token = prompt('Bearer token?')
-
-async function get(path) {
-  const r = await fetch(path, { headers: { Authorization: 'Bearer ' + token } })
-  return await r.json()
-}
-
-async function update() {
-  const m = await get('/metrics')
-  const t = await get('/topology')
-  const l = await get('/logs')
-  document.getElementById('metrics').textContent = JSON.stringify(m, null, 2)
-  document.getElementById('topology').textContent = JSON.stringify(t, null, 2)
-  document.getElementById('logs').textContent = l.map(e => \`[\${e.time}] \${e.level}: \${e.msg}\`).join('\\n')
-}
-
-setInterval(update, 4000); update()
-"@
-
-# === api\web\stats.html ===
-Write-CodeFile "$root\api\web\stats.html" @"
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Live Stats</title>
-  <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
-  <script src='/web/stats.js' defer></script>
-</head>
-<body>
-  <h1>Real-Time Charts</h1>
-  <canvas id='qChart'></canvas>
-  <canvas id='latChart'></canvas>
-</body>
-</html>
-"@
-
-# === api\web\stats.js ===
-Write-CodeFile "$root\api\web\stats.js" @"
-const token = prompt('Bearer token?')
-const ctxQ = document.getElementById('qChart').getContext('2d')
-const ctxL = document.getElementById('latChart').getContext('2d')
-
-const qChart = new Chart(ctxQ, {
-  type: 'bar',
-  data: { labels: [], datasets: [
-    { label: 'Enqueued', data: [], backgroundColor: '#4e79a7' },
-    { label: 'Delivered', data: [], backgroundColor: '#f28e2b' }
-  ]},
-  options: { responsive: true }
-})
-
-const latChart = new Chart(ctxL, {
-  type: 'line',
-  data: { labels: [], datasets: [
-    { label: 'Avg Latency', data: [], borderColor: '#59a14f', fill: false }
-  ]},
-  options: { responsive: true }
-})
-
-async function update() {
-  const r = await fetch('/metrics', { headers: { Authorization: 'Bearer ' + token } })
-  const d = await r.json().queues
-  const keys = Object.keys(d)
-  qChart.data.labels = keys
-  latChart.data.labels = keys
-  qChart.data.datasets[0].data = keys.map(k => d[k].enqueued)
-  qChart.data.datasets[1].data = keys.map(k => d[k].delivered)
-  latChart.data.datasets[0].data = keys.map(k => d[k].avg_latency)
-  qChart.update(); latChart.update()
-}
-
-setInterval(update, 3000); update()
-"@
-
-Write-Host " Broker build complete at '$root'"
-Write-Host "    Start broker:        cd amqp_broker; python broker.py"
-Write-Host "    Auth test:           pytest tests/test_auth.py"
-Write-Host "    Web dashboard:       http://localhost:15672/web/"
-Write-Host "    Live charts:         http://localhost:15672/web/stats.html"
+Write-Host "`n✅ Broker Build Complete: Project created in '$root'"
+Write-Host "   ➤ Launch it: cd amqp_broker; python broker.py"
+Write-Host "   ➤ Dashboard: http://localhost:15672/web/"
+Write-Host "   ➤ API Test:  pytest tests/test_auth.py"
+Write-Host "   ➤ Token CLI: python rbac_token_issuer.py admin admin,reader,writer supersecret"
