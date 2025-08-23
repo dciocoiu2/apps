@@ -228,4 +228,99 @@ function Invoke-gRPC([string]$url,[int]$timeout,[int]$retry){
         }catch{if($i -eq $retry){$sw.Stop();return @{Url=$url;Type="gRPC";Result="FAIL";Message=$_.Exception.Message;Latency=$sw.ElapsedMilliseconds}}}
     }
 }
-#==part 1==
+function Generate-HTMLReport([System.Collections.Generic.List[object]]$Results, [string]$FilePath){
+    $htmlHeader = @"
+<html>
+<head>
+<title>IIS API Test Report</title>
+<style>
+body{font-family:Arial;}
+table{border-collapse:collapse;width:100%;}
+th,td{border:1px solid #ddd;padding:8px;text-align:left;}
+th{background-color:#4CAF50;color:white;cursor:pointer;}
+tr:nth-child(even){background-color:#f2f2f2;}
+.ok{background-color:#c6efce;color:#006100;}
+.fail{background-color:#ffc7ce;color:#9c0006;}
+</style>
+<script>
+function sortTable(n){
+    var table=document.getElementsByTagName('table')[0];
+    var rows=Array.from(table.rows).slice(1);
+    var asc=true;
+    if(table.getAttribute('data-sort-col')==n){asc=!JSON.parse(table.getAttribute('data-sort-asc'))}
+    rows.sort(function(a,b){
+        var x=a.cells[n].innerText.toLowerCase();var y=b.cells[n].innerText.toLowerCase();
+        return asc?x.localeCompare(y):y.localeCompare(x);
+    });
+    for(var i=0;i<rows.length;i++){table.appendChild(rows[i]);}
+    table.setAttribute('data-sort-col',n);table.setAttribute('data-sort-asc',asc);
+}
+</script>
+</head>
+<body>
+<h2>IIS API Test Report</h2>
+<table>
+<tr><th onclick='sortTable(0)'>Type</th><th onclick='sortTable(1)'>URL</th><th onclick='sortTable(2)'>Method</th><th onclick='sortTable(3)'>Status/Result</th><th onclick='sortTable(4)'>Latency(ms)</th><th onclick='sortTable(5)'>Message</th></tr>
+"@
+    $htmlRows = ""
+    foreach($r in $Results){
+        $statusClass = if($r.Result -eq "OK"){"ok"}else{"fail"}
+        $method = if($r.Method){$r.Method}else{"N/A"}
+        $msg = if($r.Message){$r.Message}else{""}
+        $htmlRows += "<tr class='$statusClass'><td>$($r.Type)</td><td>$($r.Url)</td><td>$method</td><td>$($r.Result)</td><td>$($r.Latency)</td><td>$msg</td></tr>`n"
+    }
+    $htmlFooter="</table></body></html>"
+    $fullHtml=$htmlHeader + $htmlRows + $htmlFooter
+    [System.IO.File]::WriteAllText($FilePath,$fullHtml)
+}
+
+$results = New-Object System.Collections.Generic.List[PSObject]
+$jobs = @()
+foreach($ep in $endpoints){
+    if($ConcurrencyMode -eq "Parallel"){
+        $jobs += Start-Job -ScriptBlock {
+            param($ep,$Timeout,$RetryCount,$HttpMethod,$Payload,$ContentType,$Username,$Password,$BearerToken,$Headers,$MaxLatency)
+            switch($ep.Type){
+                "REST" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+                "SOAP" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+                "WCF" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+                "WebSocket" {Invoke-WebSocket $ep.Url $Timeout $RetryCount}
+                "gRPC" {Invoke-gRPC $ep.Url $Timeout $RetryCount}
+            }
+        } -ArgumentList $ep,$Timeout,$RetryCount,$HttpMethod,$Payload,$ContentType,$Username,$Password,$BearerToken,$Headers,$MaxLatency
+        if($jobs.Count -ge $MaxConcurrency){
+            $completed = Wait-Job -Job $jobs -Any -Timeout 5
+            foreach($c in $completed){$results.Add(Receive-Job $c);Remove-Job $c}
+        }
+    }
+    else{
+        $res = switch($ep.Type){
+            "REST" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+            "SOAP" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+            "WCF" {Invoke-HttpRequest $ep.Url $HttpMethod $Timeout $RetryCount}
+            "WebSocket" {Invoke-WebSocket $ep.Url $Timeout $RetryCount}
+            "gRPC" {Invoke-gRPC $ep.Url $Timeout $RetryCount}
+        }
+        $results.Add($res)
+    }
+}
+
+if($ConcurrencyMode -eq "Parallel"){
+    $jobs | Wait-Job | ForEach-Object {
+        $results.Add(Receive-Job $_)
+        Remove-Job $_
+    }
+}
+
+if($OutputLog){
+    $results | ForEach-Object {
+        $line = "$($_.Type) $($_.Url) $($_.Method) $($_.Status) $($_.Result) $($_.Latency) $($_.Message)"
+        [System.IO.File]::AppendAllText($OutputLog,$line + "`n")
+    }
+}
+
+$timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
+$reportFile = "IISApiReport_$timestamp.html"
+Generate-HTMLReport $results $reportFile
+Write-Host "Report generated: $reportFile"
+if($UseWebGUI){$listener.Stop();Write-Host "Web GUI stopped."}
