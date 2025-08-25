@@ -8,19 +8,18 @@ $serializer.MaxJsonLength = 1024 * 1024 * 64
 
 function ExpandVars($text, $vars) {
     if (-not $text) { return $text }
-    return [System.Text.RegularExpressions.Regex]::Replace(
-        $text, '\$\{([^\}]+)\}', {
-            param($m)
-            $key = $m.Groups[1].Value
-            if ($vars.ContainsKey($key)) { return $vars[$key] }
-            return $m.Value
-        }
-    )
+    return [System.Text.RegularExpressions.Regex]::Replace($text, '\$\{([^\}]+)\}', { param($m)
+        $key = $m.Groups[1].Value
+        if ($vars -and $vars.ContainsKey($key)) { return $vars[$key] }
+        return $m.Value
+    })
 }
 
 function ParsePairs($text, $kvSep, $itemSep) {
     $d = @{}
+    if ([string]::IsNullOrWhiteSpace($text)) { return $d }
     foreach ($pair in $text -split $itemSep) {
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
         if ($pair.Contains($kvSep)) {
             $k, $v = $pair.Split($kvSep,2)
             $d[$k.Trim()] = $v.Trim()
@@ -66,7 +65,7 @@ $form.Controls.Add($lblDuration)
 $numDuration = New-Object Windows.Forms.NumericUpDown
 $numDuration.Location = New-Object Drawing.Point(460,10)
 $numDuration.Minimum = 0
-$numDuration.Maximum = 3600
+$numDuration.Maximum = 86400
 $numDuration.Value   = 60
 $form.Controls.Add($numDuration)
 
@@ -82,23 +81,23 @@ $txtBaseUrl.Text     = "https://example.com"
 $form.Controls.Add($txtBaseUrl)
 
 $lblHeaders = New-Object Windows.Forms.Label
-$lblHeaders.Text = "Global Headers (key:value):"
+$lblHeaders.Text = "Global Headers (key:value; ...):"
 $lblHeaders.Location = New-Object Drawing.Point(10,70)
 $form.Controls.Add($lblHeaders)
 
 $txtHeaders = New-Object Windows.Forms.TextBox
-$txtHeaders.Location = New-Object Drawing.Point(180,70)
-$txtHeaders.Size     = New-Object Drawing.Size(780,20)
+$txtHeaders.Location = New-Object Drawing.Point(190,70)
+$txtHeaders.Size     = New-Object Drawing.Size(770,20)
 $form.Controls.Add($txtHeaders)
 
 $lblVars = New-Object Windows.Forms.Label
-$lblVars.Text = "Global Variables (key=value):"
+$lblVars.Text = "Global Variables (key=value; ...):"
 $lblVars.Location = New-Object Drawing.Point(10,100)
 $form.Controls.Add($lblVars)
 
 $txtVars = New-Object Windows.Forms.TextBox
-$txtVars.Location = New-Object Drawing.Point(180,100)
-$txtVars.Size     = New-Object Drawing.Size(780,20)
+$txtVars.Location = New-Object Drawing.Point(190,100)
+$txtVars.Size     = New-Object Drawing.Size(770,20)
 $form.Controls.Add($txtVars)
 
 $lblSamplers = New-Object Windows.Forms.Label
@@ -108,64 +107,64 @@ $form.Controls.Add($lblSamplers)
 
 $lstSamplers = New-Object Windows.Forms.ListBox
 $lstSamplers.Location = New-Object Drawing.Point(80,130)
-$lstSamplers.Size     = New-Object Drawing.Size(880,200)
+$lstSamplers.Size     = New-Object Drawing.Size(880,220)
 $form.Controls.Add($lstSamplers)
 
 $btnAddSampler = New-Object Windows.Forms.Button
 $btnAddSampler.Text     = "Add Sampler"
-$btnAddSampler.Location = New-Object Drawing.Point(10,340)
+$btnAddSampler.Location = New-Object Drawing.Point(10,360)
 $form.Controls.Add($btnAddSampler)
 
 $btnEditSampler = New-Object Windows.Forms.Button
 $btnEditSampler.Text     = "Edit"
-$btnEditSampler.Location = New-Object Drawing.Point(110,340)
+$btnEditSampler.Location = New-Object Drawing.Point(120,360)
 $form.Controls.Add($btnEditSampler)
 
 $btnRemoveSampler = New-Object Windows.Forms.Button
 $btnRemoveSampler.Text     = "Remove"
-$btnRemoveSampler.Location = New-Object Drawing.Point(210,340)
+$btnRemoveSampler.Location = New-Object Drawing.Point(190,360)
 $form.Controls.Add($btnRemoveSampler)
 
 $btnSavePlan = New-Object Windows.Forms.Button
 $btnSavePlan.Text     = "Save Plan"
-$btnSavePlan.Location = New-Object Drawing.Point(10,380)
+$btnSavePlan.Location = New-Object Drawing.Point(10,400)
 $form.Controls.Add($btnSavePlan)
 
 $btnLoadPlan = New-Object Windows.Forms.Button
 $btnLoadPlan.Text     = "Load Plan"
-$btnLoadPlan.Location = New-Object Drawing.Point(110,380)
+$btnLoadPlan.Location = New-Object Drawing.Point(110,400)
 $form.Controls.Add($btnLoadPlan)
 
 $lblCsv = New-Object Windows.Forms.Label
 $lblCsv.Text     = "Results CSV:"
-$lblCsv.Location = New-Object Drawing.Point(10,420)
+$lblCsv.Location = New-Object Drawing.Point(10,440)
 $form.Controls.Add($lblCsv)
 
 $txtCsv = New-Object Windows.Forms.TextBox
-$txtCsv.Location = New-Object Drawing.Point(90,420)
+$txtCsv.Location = New-Object Drawing.Point(90,440)
 $txtCsv.Size     = New-Object Drawing.Size(800,20)
 $txtCsv.Text     = "results.csv"
 $form.Controls.Add($txtCsv)
 
 $btnCsv = New-Object Windows.Forms.Button
 $btnCsv.Text     = "Browse"
-$btnCsv.Location = New-Object Drawing.Point(900,420)
+$btnCsv.Location = New-Object Drawing.Point(900,440)
 $form.Controls.Add($btnCsv)
 
 $btnRunTest = New-Object Windows.Forms.Button
 $btnRunTest.Text     = "Run Test"
-$btnRunTest.Location = New-Object Drawing.Point(10,460)
+$btnRunTest.Location = New-Object Drawing.Point(10,480)
 $form.Controls.Add($btnRunTest)
 
 $btnStop = New-Object Windows.Forms.Button
 $btnStop.Text     = "Stop"
 $btnStop.Enabled  = $false
-$btnStop.Location = New-Object Drawing.Point(110,460)
+$btnStop.Location = New-Object Drawing.Point(110,480)
 $form.Controls.Add($btnStop)
 
 $txtLog = New-Object Windows.Forms.RichTextBox
-$txtLog.Location = New-Object Drawing.Point(10,500)
-$txtLog.Size     = New-Object Drawing.Size(960,280)
+$txtLog.Location = New-Object Drawing.Point(10,520)
+$txtLog.Size     = New-Object Drawing.Size(960,240)
 $txtLog.ReadOnly = $true
 $form.Controls.Add($txtLog)
 
@@ -179,134 +178,128 @@ function Log($msg) {
 function SamplerDialog($existing) {
     $dlg = New-Object Windows.Forms.Form
     $dlg.Text = if ($existing) { "Edit Sampler" } else { "New Sampler" }
-    $dlg.Size = New-Object Drawing.Size(600,400)
+    $dlg.Size = New-Object Drawing.Size(640,380)
     $dlg.StartPosition = "CenterParent"
 
-    $lbl1 = New-Object Windows.Forms.Label
-    $lbl1.Text     = "Label:"
-    $lbl1.Location = New-Object Drawing.Point(10,10)
-    $dlg.Controls.Add($lbl1)
-    $txt1 = New-Object Windows.Forms.TextBox
-    $txt1.Location = New-Object Drawing.Point(80,10)
-    $txt1.Size     = New-Object Drawing.Size(500,20)
-    if ($existing) { $txt1.Text = $existing.label }
-    $dlg.Controls.Add($txt1)
+    $l1 = New-Object Windows.Forms.Label
+    $l1.Text = "Label:"
+    $l1.Location = New-Object Drawing.Point(10,10)
+    $dlg.Controls.Add($l1)
+    $t1 = New-Object Windows.Forms.TextBox
+    $t1.Location = New-Object Drawing.Point(80,10)
+    $t1.Size = New-Object Drawing.Size(530,20)
+    if ($existing) { $t1.Text = $existing.label }
+    $dlg.Controls.Add($t1)
 
-    $lbl2 = New-Object Windows.Forms.Label
-    $lbl2.Text     = "Method:"
-    $lbl2.Location = New-Object Drawing.Point(10,40)
-    $dlg.Controls.Add($lbl2)
-    $cmb2 = New-Object Windows.Forms.ComboBox
-    $cmb2.Items.AddRange(@("GET","POST","PUT","DELETE","PATCH"))
-    $cmb2.DropDownStyle = "DropDownList"
-    $cmb2.Location      = New-Object Drawing.Point(80,40)
-    if ($existing) { $cmb2.SelectedItem = $existing.method } else { $cmb2.SelectedIndex = 0 }
-    $dlg.Controls.Add($cmb2)
+    $l2 = New-Object Windows.Forms.Label
+    $l2.Text = "Method:"
+    $l2.Location = New-Object Drawing.Point(10,40)
+    $dlg.Controls.Add($l2)
+    $c2 = New-Object Windows.Forms.ComboBox
+    $c2.Location = New-Object Drawing.Point(80,40)
+    $c2.DropDownStyle = "DropDownList"
+    $c2.Items.AddRange(@("GET","POST","PUT","DELETE","PATCH"))
+    if ($existing -and $existing.method) { $c2.SelectedItem = $existing.method } else { $c2.SelectedIndex = 0 }
+    $dlg.Controls.Add($c2)
 
-    $lbl3 = New-Object Windows.Forms.Label
-    $lbl3.Text     = "Path:"
-    $lbl3.Location = New-Object Drawing.Point(10,70)
-    $dlg.Controls.Add($lbl3)
-    $txt3 = New-Object Windows.Forms.TextBox
-    $txt3.Location = New-Object Drawing.Point(80,70)
-    $txt3.Size     = New-Object Drawing.Size(500,20)
-    if ($existing) { $txt3.Text = $existing.path }
-    $dlg.Controls.Add($txt3)
+    $l3 = New-Object Windows.Forms.Label
+    $l3.Text = "Path:"
+    $l3.Location = New-Object Drawing.Point(10,70)
+    $dlg.Controls.Add($l3)
+    $t3 = New-Object Windows.Forms.TextBox
+    $t3.Location = New-Object Drawing.Point(80,70)
+    $t3.Size = New-Object Drawing.Size(530,20)
+    if ($existing) { $t3.Text = $existing.path }
+    $dlg.Controls.Add($t3)
 
-    $lbl4 = New-Object Windows.Forms.Label
-    $lbl4.Text     = "URL (opt):"
-    $lbl4.Location = New-Object Drawing.Point(10,100)
-    $dlg.Controls.Add($lbl4)
-    $txt4 = New-Object Windows.Forms.TextBox
-    $txt4.Location = New-Object Drawing.Point(80,100)
-    $txt4.Size     = New-Object Drawing.Size(500,20)
-    if ($existing) { $txt4.Text = $existing.url }
-    $dlg.Controls.Add($txt4)
+    $l4 = New-Object Windows.Forms.Label
+    $l4.Text = "URL (optional):"
+    $l4.Location = New-Object Drawing.Point(10,100)
+    $dlg.Controls.Add($l4)
+    $t4 = New-Object Windows.Forms.TextBox
+    $t4.Location = New-Object Drawing.Point(110,100)
+    $t4.Size = New-Object Drawing.Size(500,20)
+    if ($existing) { $t4.Text = $existing.url }
+    $dlg.Controls.Add($t4)
 
-    $lbl5 = New-Object Windows.Forms.Label
-    $lbl5.Text     = "Headers (k:v;):"
-    $lbl5.Location = New-Object Drawing.Point(10,130)
-    $dlg.Controls.Add($lbl5)
-    $txt5 = New-Object Windows.Forms.TextBox
-    $txt5.Location = New-Object Drawing.Point(110,130)
-    $txt5.Size     = New-Object Drawing.Size(470,20)
-    if ($existing) {
+    $l5 = New-Object Windows.Forms.Label
+    $l5.Text = "Headers (k:v; ...):"
+    $l5.Location = New-Object Drawing.Point(10,130)
+    $dlg.Controls.Add($l5)
+    $t5 = New-Object Windows.Forms.TextBox
+    $t5.Location = New-Object Drawing.Point(130,130)
+    $t5.Size = New-Object Drawing.Size(480,20)
+    if ($existing -and $existing.headers) {
         $pairs = @()
-        foreach ($e in $existing.headers.GetEnumerator()) {
-            $pairs += "$($e.Key):$($e.Value)"
-        }
-        $txt5.Text = $pairs -join ";"
+        foreach ($e in $existing.headers.GetEnumerator()) { $pairs += "$($e.Key):$($e.Value)" }
+        $t5.Text = $pairs -join ";"
     }
-    $dlg.Controls.Add($txt5)
+    $dlg.Controls.Add($t5)
 
-    $lbl6 = New-Object Windows.Forms.Label
-    $lbl6.Text     = "Body:"
-    $lbl6.Location = New-Object Drawing.Point(10,160)
-    $dlg.Controls.Add($lbl6)
-    $txt6 = New-Object Windows.Forms.TextBox
-    $txt6.Location = New-Object Drawing.Point(80,160)
-    $txt6.Size     = New-Object Drawing.Size(500,100)
-    $txt6.Multiline = $true
-    if ($existing) { $txt6.Text = $existing.body }
-    $dlg.Controls.Add($txt6)
+    $l6 = New-Object Windows.Forms.Label
+    $l6.Text = "Body:"
+    $l6.Location = New-Object Drawing.Point(10,160)
+    $dlg.Controls.Add($l6)
+    $t6 = New-Object Windows.Forms.TextBox
+    $t6.Location = New-Object Drawing.Point(80,160)
+    $t6.Size = New-Object Drawing.Size(530,60)
+    $t6.Multiline = $true
+    if ($existing) { $t6.Text = $existing.body }
+    $dlg.Controls.Add($t6)
 
-    $lbl7 = New-Object Windows.Forms.Label
-    $lbl7.Text     = "Assert status ="
-    $lbl7.Location = New-Object Drawing.Point(10,270)
-    $dlg.Controls.Add($lbl7)
-    $txt7 = New-Object Windows.Forms.TextBox
-    $txt7.Location = New-Object Drawing.Point(110,270)
-    $txt7.Size     = New-Object Drawing.Size(60,20)
-    if ($existing) {
-        foreach ($a in $existing.assertions) {
-            if ($a.type -eq "status") { $txt7.Text = $a.equals }
-        }
+    $l7 = New-Object Windows.Forms.Label
+    $l7.Text = "Assert status ="
+    $l7.Location = New-Object Drawing.Point(10,230)
+    $dlg.Controls.Add($l7)
+    $t7 = New-Object Windows.Forms.TextBox
+    $t7.Location = New-Object Drawing.Point(110,230)
+    $t7.Size = New-Object Drawing.Size(60,20)
+    if ($existing -and $existing.assertions) {
+        foreach ($a in $existing.assertions) { if ($a.type -eq "status") { $t7.Text = $a.equals } }
     }
-    $dlg.Controls.Add($txt7)
+    $dlg.Controls.Add($t7)
 
-    $lbl8 = New-Object Windows.Forms.Label
-    $lbl8.Text     = "Assert body contains"
-    $lbl8.Location = New-Object Drawing.Point(180,270)
-    $dlg.Controls.Add($lbl8)
-    $txt8 = New-Object Windows.Forms.TextBox
-    $txt8.Location = New-Object Drawing.Point(330,270)
-    $txt8.Size     = New-Object Drawing.Size(250,20)
-    if ($existing) {
-        foreach ($a in $existing.assertions) {
-            if ($a.type -eq "bodyContains") { $txt8.Text = $a.text }
-        }
+    $l8 = New-Object Windows.Forms.Label
+    $l8.Text = "Assert body contains"
+    $l8.Location = New-Object Drawing.Point(180,230)
+    $dlg.Controls.Add($l8)
+    $t8 = New-Object Windows.Forms.TextBox
+    $t8.Location = New-Object Drawing.Point(330,230)
+    $t8.Size = New-Object Drawing.Size(280,20)
+    if ($existing -and $existing.assertions) {
+        foreach ($a in $existing.assertions) { if ($a.type -eq "bodyContains") { $t8.Text = $a.text } }
     }
-    $dlg.Controls.Add($txt8)
+    $dlg.Controls.Add($t8)
 
-    $btnOK = New-Object Windows.Forms.Button
-    $btnOK.Text     = "OK"
-    $btnOK.Location = New-Object Drawing.Point(500,330)
-    $dlg.Controls.Add($btnOK)
-    $btnCancel = New-Object Windows.Forms.Button
-    $btnCancel.Text     = "Cancel"
-    $btnCancel.Location = New-Object Drawing.Point(380,330)
-    $dlg.Controls.Add($btnCancel)
+    $ok = New-Object Windows.Forms.Button
+    $ok.Text = "OK"
+    $ok.Location = New-Object Drawing.Point(520,300)
+    $dlg.Controls.Add($ok)
+    $cancel = New-Object Windows.Forms.Button
+    $cancel.Text = "Cancel"
+    $cancel.Location = New-Object Drawing.Point(430,300)
+    $dlg.Controls.Add($cancel)
 
-    $btnOK.Add_Click({
-        $hdr = ParsePairs $txt5.Text ":" ";"
-        $as  = @()
-        if ($txt7.Text) { $as += @{ type="status"; equals=[int]$txt7.Text } }
-        if ($txt8.Text) { $as += @{ type="bodyContains"; text=$txt8.Text } }
+    $ok.Add_Click({
+        $hdr = ParsePairs $t5.Text ":" ";"
+        $as = @()
+        if ($t7.Text) { $as += @{ type="status"; equals=[int]$t7.Text } }
+        if ($t8.Text) { $as += @{ type="bodyContains"; text=$t8.Text } }
         $sam = @{
-            label       = $txt1.Text
-            method      = $cmb2.Text
-            path        = $txt3.Text
-            url         = $txt4.Text
-            headers     = $hdr
-            body        = $txt6.Text
-            assertions  = $as
+            label      = $t1.Text
+            method     = $c2.Text
+            path       = $t3.Text
+            url        = $t4.Text
+            headers    = $hdr
+            body       = $t6.Text
+            assertions = $as
         }
         $dlg.Tag = $sam
         $dlg.Close()
     })
-    $btnCancel.Add_Click({ $dlg.Close() })
+    $cancel.Add_Click({ $dlg.Tag = $null; $dlg.Close() })
 
-    $dlg.ShowDialog()
+    $dlg.ShowDialog() | Out-Null
     return $dlg.Tag
 }
 
@@ -321,10 +314,10 @@ $btnAddSampler.Add_Click({
 $btnEditSampler.Add_Click({
     $i = $lstSamplers.SelectedIndex
     if ($i -ge 0) {
-        $sNew = SamplerDialog $samplers[$i]
-        if ($sNew) {
-            $samplers[$i] = $sNew
-            $lstSamplers.Items[$i] = $sNew.label
+        $s = SamplerDialog $samplers[$i]
+        if ($s) {
+            $samplers[$i] = $s
+            $lstSamplers.Items[$i] = $s.label
         }
     }
 })
@@ -332,15 +325,15 @@ $btnEditSampler.Add_Click({
 $btnRemoveSampler.Add_Click({
     $i = $lstSamplers.SelectedIndex
     if ($i -ge 0) {
-        $samplers.RemoveAt($i)
+        $samplers = @($samplers[0..($i-1)] + $samplers[($i+1)..($samplers.Count-1)]) 2>$null
         $lstSamplers.Items.RemoveAt($i)
     }
 })
-function NewHttpClient($timeoutMs, $followRedirects, $cookieJar) {
+function NewHttpClient([int]$timeoutMs, [bool]$followRedirects, $cookieJar) {
     $h = [System.Net.Http.SocketsHttpHandler]::new()
-    $h.AllowAutoRedirect   = $followRedirects
-    $h.ConnectTimeout      = [TimeSpan]::FromMilliseconds($timeoutMs)
-    $h.CookieContainer     = $cookieJar
+    $h.AllowAutoRedirect    = $followRedirects
+    $h.ConnectTimeout       = [TimeSpan]::FromMilliseconds($timeoutMs)
+    $h.CookieContainer      = $cookieJar
     $h.AutomaticDecompression = `
         [System.Net.DecompressionMethods]::GZip -bor `
         [System.Net.DecompressionMethods]::Deflate -bor `
@@ -351,17 +344,18 @@ function NewHttpClient($timeoutMs, $followRedirects, $cookieJar) {
 }
 
 function BuildRequest($sampler, $globalHeaders, $vars, $baseUrl) {
-    $m = $sampler.method.ToUpperInvariant()
-    $u = if ([string]::IsNullOrEmpty($sampler.url)) {
-        ExpandVars $baseUrl $vars + ExpandVars $sampler.path $vars
+    $method = $sampler.method.ToUpperInvariant()
+    if ($sampler.url) {
+        $url = ExpandVars $sampler.url $vars
     } else {
-        ExpandVars $sampler.url $vars
+        $url = $baseUrl.TrimEnd('/') + '/' + $sampler.path.TrimStart('/')
+        $url = ExpandVars $url $vars
     }
     $req = [System.Net.Http.HttpRequestMessage]::new(
-        [System.Net.Http.HttpMethod]::new($m), $u
+        [System.Net.Http.HttpMethod]::new($method), $url
     )
-    foreach ($e in $globalHeaders.GetEnumerator()) {
-        $req.Headers.TryAddWithoutValidation($e.Key, ExpandVars $e.Value $vars) | Out-Null
+    foreach ($h in $globalHeaders.GetEnumerator()) {
+        $req.Headers.TryAddWithoutValidation($h.Key, ExpandVars $h.Value $vars) | Out-Null
     }
     if ($sampler.body) {
         $b = ExpandVars $sampler.body $vars
@@ -370,16 +364,16 @@ function BuildRequest($sampler, $globalHeaders, $vars, $baseUrl) {
     return $req
 }
 
-function EvaluateAssertions($asserts, $status, $elapsed, $body) {
+function EvaluateAssertions($asserts, [int]$status, [double]$elapsed, $body) {
     $ok = $true
     $msg = ""
     foreach ($a in $asserts) {
         switch ($a.type) {
             "status" {
-                if ($status -ne $a.equals) { $ok = $false; $msg = "status != $($a.equals)" }
+                if ($status -ne [int]$a.equals) { $ok = $false; $msg = "status != $($a.equals)" }
             }
             "bodyContains" {
-                if (-not $body.Contains($a.text)) { $ok = $false; $msg = "body missing [$($a.text)]" }
+                if (-not $body.Contains($a.text)) { $ok = $false; $msg = "body missing '$($a.text)'" }
             }
         }
         if (-not $ok) { break }
@@ -387,9 +381,18 @@ function EvaluateAssertions($asserts, $status, $elapsed, $body) {
     return ,$ok,$msg
 }
 
+function CsvEscape([string]$s) {
+    if ($null -eq $s) { return "" }
+    $q = $s.Replace('"','""')
+    if ($q.Contains(",") -or $q.Contains("`n") -or $q.Contains("`r")) {
+        return '"' + $q + '"'
+    }
+    return $q
+}
+
 $btnCsv.Add_Click({
     $dlg = New-Object Windows.Forms.SaveFileDialog
-    $dlg.Filter = "CSV (*.csv)|*.csv"
+    $dlg.Filter = "CSV files (*.csv)|*.csv"
     if ($dlg.ShowDialog() -eq "OK") {
         $txtCsv.Text = $dlg.FileName
     }
@@ -397,88 +400,105 @@ $btnCsv.Add_Click({
 
 $btnSavePlan.Add_Click({
     $dlg = New-Object Windows.Forms.SaveFileDialog
-    $dlg.Filter = "JSON (*.json)|*.json"
+    $dlg.Filter = "JSON files (*.json)|*.json"
     if ($dlg.ShowDialog() -eq "OK") {
         $plan = @{
-            threads       = [int]$numThreads.Value
-            rampUpSec     = [int]$numRamp.Value
-            durationSec   = [int]$numDuration.Value
-            global        = @{
+            threads     = [int]$numThreads.Value
+            rampUpSec   = [int]$numRamp.Value
+            durationSec = [int]$numDuration.Value
+            global      = @{
                 baseUrl         = $txtBaseUrl.Text
                 timeoutMs       = 30000
                 followRedirects = $true
                 headers         = ParsePairs $txtHeaders.Text ":" ";"
                 variables       = ParsePairs $txtVars.Text "=" ";"
-                thinkTimeMs     = @{ min=50; max=150 }
+                thinkTimeMs     = @{ min = 50; max = 150 }
             }
-            samplers      = $samplers
+            samplers = $samplers
         }
         $json = $serializer.Serialize($plan)
-        [System.IO.File]::WriteAllText($dlg.FileName, $json)
-        Log "Saved plan $($dlg.FileName)"
+        [System.IO.File]::WriteAllText($dlg.FileName, $json, [System.Text.Encoding]::UTF8)
+        Log "Saved plan to $($dlg.FileName)"
     }
 })
 
 $btnLoadPlan.Add_Click({
     $dlg = New-Object Windows.Forms.OpenFileDialog
-    $dlg.Filter = "JSON (*.json)|*.json"
+    $dlg.Filter = "JSON files (*.json)|*.json"
     if ($dlg.ShowDialog() -eq "OK") {
-        $j    = [System.IO.File]::ReadAllText($dlg.FileName)
-        $plan = $serializer.DeserializeObject($j)
-        $numThreads.Value = $plan.threads
-        $numRamp.Value    = $plan.rampUpSec
-        $numDuration.Value= $plan.durationSec
-        $txtBaseUrl.Text  = $plan.global.baseUrl
-        $txtHeaders.Text  = ($plan.global.headers.GetEnumerator() |
-            ForEach-Object { "$($_.Key):$($_.Value)" }) -join ";"
-        $txtVars.Text     = ($plan.global.variables.GetEnumerator() |
-            ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ";"
+        $json = [System.IO.File]::ReadAllText($dlg.FileName, [System.Text.Encoding]::UTF8)
+        $plan = $serializer.DeserializeObject($json)
+        $numThreads.Value   = $plan.threads
+        $numRamp.Value      = $plan.rampUpSec
+        $numDuration.Value  = $plan.durationSec
+        $txtBaseUrl.Text    = $plan.global.baseUrl
+        $txtHeaders.Text    = ($plan.global.headers.GetEnumerator() |
+                                ForEach-Object { "$($_.Key):$($_.Value)" }) -join ";"
+        $txtVars.Text       = ($plan.global.variables.GetEnumerator() |
+                                ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ";"
         $samplers.Clear()
         $lstSamplers.Items.Clear()
         foreach ($s in $plan.samplers) {
             $samplers += $s
             $lstSamplers.Items.Add($s.label) | Out-Null
         }
-        Log "Loaded plan $($dlg.FileName)"
+        Log "Loaded plan from $($dlg.FileName)"
     }
 })
 
+$results = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+$tasks   = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+$cts     = $null
+
 $btnRunTest.Add_Click({
+    $results.Clear()
+    $tasks.Clear()
+    $cts = [System.Threading.CancellationTokenSource]::new()
     $threads   = [int]$numThreads.Value
-    $rampUp    = [int]$numRamp.Value
+    $rampMs    = [int]($numRamp.Value * 1000)
     $duration  = [int]$numDuration.Value
-    $endAt     = [DateTime]::UtcNow.AddSeconds($duration)
+    $endTime   = if ($duration -gt 0) { [DateTime]::UtcNow.AddSeconds($duration) } else { [DateTime]::MaxValue }
     $gHdr      = ParsePairs $txtHeaders.Text ":" ";"
     $gVar      = ParsePairs $txtVars.Text "=" ";"
     $base      = $txtBaseUrl.Text
     $timeout   = 30000
     $follow    = $true
-    $cts       = New-Object Threading.CancellationTokenSource
-    $results   = New-Object Collections.Concurrent.ConcurrentQueue[object]
-    $txtLog.Clear()
-    Log "Starting $threads threads for $duration sec"
+    Log "Starting test: $threads threads, ramp $($numRamp.Value)s, duration $duration s"
 
-    for ($i=0; $i -lt $threads; $i++) {
-        $delay = if ($rampUp -gt 0) { [int]([Math]::Round($i/$threads*$rampUp*1000)) } else { 0 }
-        [Threading.Tasks.Task]::Run({
-            Start-Sleep -Milliseconds $delay
-            $jar     = New-Object Net.CookieContainer
-            $client  = NewHttpClient $timeout $follow $jar
-            $vars    = [Collections.Generic.Dictionary[string,string]]::new()
+    for ($i = 0; $i -lt $threads; $i++) {
+        $idx  = $i
+        $task = [System.Threading.Tasks.Task]::Run([System.Action]{
+            Start-Sleep -Milliseconds ([int]([Math]::Round($idx / $threads * $rampMs)))
+            $jar    = [System.Net.CookieContainer]::new()
+            $client = NewHttpClient $timeout $follow $jar
+            $vars   = [System.Collections.Generic.Dictionary[string,string]]::new()
             foreach ($kv in $gVar.GetEnumerator()) { $vars[$kv.Key] = $kv.Value }
-            while ([DateTime]::UtcNow -lt $endAt -and -not $cts.IsCancellationRequested) {
+            $rand   = [System.Random]::new()
+            while (-not $cts.IsCancellationRequested -and [DateTime]::UtcNow -lt $endTime) {
                 foreach ($s in $samplers) {
-                    $req  = BuildRequest $s $gHdr $vars $base
-                    $ts   = [DateTime]::UtcNow
-                    $sw   = [Diagnostics.Stopwatch]::StartNew()
+                    $req = BuildRequest $s $gHdr $vars $base
+                    $ts  = [DateTime]::UtcNow
+                    $sw  = [System.Diagnostics.Stopwatch]::StartNew()
                     try {
-                        $resp = $client.SendAsync($req,$cts.Token).GetAwaiter().GetResult()
+                        $resp = $client.SendAsync($req, $cts.Token).GetAwaiter().GetResult()
                         $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
                         $sw.Stop()
+                        $code, $ok, $msg = $null, $false, ""
                         $code = [int]$resp.StatusCode
-                        $ok,msg = EvaluateAssertions $s.assertions $code $sw.Elapsed.TotalMilliseconds $body
-                        $log = "{0} {1} {2}ms {3}" -f $s.label,$code,[math]::Round($sw.Elapsed.TotalMilliseconds,2), (if($ok){"OK"}else{"FAIL:$msg"})
-                        $form.Invoke([Action]{ Log $log })
+                        $ok,$msg = EvaluateAssertions $s.assertions $code $sw.Elapsed.TotalMilliseconds $body
+                        $rec = [ordered]@{
+                            timeStamp    = $ts
+                            label        = $s.label
+                            elapsedMs    = [double]$sw.Elapsed.TotalMilliseconds
+                            responseCode = $code
+                            success      = $ok
+                            failureMsg   = $msg
+                            threadName   = "T$([int]($idx+1))"
+                        }
+                        $results.Enqueue([System.Collections.Generic.Dictionary[string,object]]::new($rec)) | Out-Null
+                        $logMsg = "$($s.label) $code $([math]::Round($sw.Elapsed.TotalMilliseconds,2))ms " +
+                                  (if ($ok) { "OK" } else { "FAIL:$msg" })
+                        $form.Invoke([Action]{ Log $logMsg })
                         $resp.Dispose()
                     } catch {
                         $sw.Stop()
@@ -486,31 +506,40 @@ $btnRunTest.Add_Click({
                     } finally {
                         $req.Dispose()
                     }
-                    Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 150)
+                    Start-Sleep -Milliseconds $rand.Next(50,150)
+                    if ([DateTime]::UtcNow -ge $endTime) { break }
                 }
             }
             $client.Dispose()
-        }, $cts.Token) | Out-Null
+        }, $cts.Token)
+        $tasks.Add($task)
     }
-
     $btnRunTest.Enabled = $false
     $btnStop.Enabled   = $true
-
-    $btnStop.Add_Click({
-        $cts.Cancel()
-        $btnStop.Enabled   = $false
-        $btnRunTest.Enabled= $true
-
-        $swCsv = New-Object IO.StreamWriter($txtCsv.Text,$false,[Text.Encoding]::UTF8)
-        $swCsv.WriteLine("timeStamp,label,elapsedMs,responseCode,success,failureMsg")
-        $swCsv.Flush()
-        $swCsv.Close()
-
-        Log "Results saved to $($txtCsv.Text)"
-    })
 })
 
-$btnCsv.Add_Click({ $dlg=New-Object Windows.Forms.SaveFileDialog; $dlg.Filter="CSV (*.csv)|*.csv"; if($dlg.ShowDialog() -eq "OK"){ $txtCsv.Text=$dlg.FileName } })
+$btnStop.Add_Click({
+    if ($cts) { $cts.Cancel() }
+    try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(),5000) } catch {}
+    $btnStop.Enabled    = $false
+    $btnRunTest.Enabled = $true
+    $swCsv = [System.IO.StreamWriter]::new($txtCsv.Text, $false, [System.Text.Encoding]::UTF8)
+    $swCsv.WriteLine("timeStamp,label,elapsedMs,responseCode,success,failureMsg,threadName")
+    $item = $null
+    while ($results.TryDequeue([ref]$item)) {
+        $line = "{0},{1},{2},{3},{4},{5},{6}" -f
+            $item["timeStamp"].ToString("o"),
+            CsvEscape([string]$item["label"]),
+            [double]$item["elapsedMs"],
+            [int]$item["responseCode"],
+            ([bool]$item["success"]),
+            CsvEscape([string]$item["failureMsg"]),
+            CsvEscape([string]$item["threadName"])
+        $swCsv.WriteLine($line)
+    }
+    $swCsv.Close()
+    Log "Saved results to $($txtCsv.Text)"
+})
 
 $form.Add_FormClosing({ if ($cts) { $cts.Cancel() } })
 [void]$form.ShowDialog()
