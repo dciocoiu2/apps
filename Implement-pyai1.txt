@@ -1,0 +1,308 @@
+==========================
+FULL DIRECTORY STRUCTURE
+==========================
+
+llm_offline/                          – Root of the offline AI OS  
+├── config/                           – System configuration  
+│   ├── config.json                   – Global settings: dynamic model registry, active_model, decoding params, paths  
+│   ├── profiles.json                 – Mode presets (Coding, Math, Planning) with feature flags  
+│   ├── shortcuts.json                – CLI aliases (/switch, /profile, /exit, etc.)  
+│   ├── safety_rules.json             – Regex/content filters and refusal templates  
+│   ├── plugins.json                  – Enabled plugins, schemas, sandbox & permission settings  
+│   ├── users.json                    – User accounts, credentials, roles, per-user prefs  
+│   ├── rate_limits.json              – Per-user/session quotas for tokens, tools, API calls  
+│   ├── roles.json                    – RBAC role definitions mapping roles to permissions  
+│   ├── oauth2.json                   – Embedded OAuth2 provider config: clients, endpoints, scopes  
+│   └── optional_modules.json         – Flags to enable/disable internet-dependent or voice modules  
+
+├── models/                           – Locally stored LLM backends (dynamic discovery)  
+│   ├── starcoder2-7b/                – Quantized StarCoder2 weights & tokenizer  
+│   ├── codellama-7b-instruct/        – CodeLLaMA 7B instruction-tuned model files  
+│   ├── deepseek-coder-6.7b/          – DeepSeek Coder 6.7B model artifacts  
+│   ├── mistral-math-7b/              – Mistral Math 7B for symbolic reasoning  
+│   └── phi-3-mini/                   – Lightweight general-purpose fallback model  
+
+├── data/                             – Offline knowledge sources & embeddings  
+│   ├── instructions.jsonl            – Instruction-tuning examples & system messages  
+│   ├── code_corpus/                  – Indexed local source code for semantic search  
+│   ├── math_notes/                   – Reference formulas, proofs, worked examples  
+│   ├── docs_offline/                 – Downloaded API docs, manuals (HTML/MD)  
+│   ├── embeddings/                   – Persisted vector stores for RAG retrieval  
+│   ├── wikipedia_mirror/             – Compressed offline Wikipedia snapshot  
+│   ├── notebooks/                    – Jupyter notebooks for local analysis  
+│   └── textbooks/                    – Structured offline textbooks (e.g. OpenStax)  
+
+├── src/                              – Core application modules  
+│   ├── main.py                       – CLI REPL: streaming, interrupts, slash-command parser  
+│   ├── api.py                        – HTTP/JSON RPC server for GUI, n8n, local integrations  
+│   ├── auth.py                       – Embedded OAuth2 provider client & token management  
+│   ├── rbac.py                       – RBAC enforcement: decorators, permission checks  
+│   ├── model_manager.py              – Dynamic model discovery, load/switch/unload, capability tags  
+│   ├── inference.py                  – Prompt assembly, generation loop, streaming handler  
+│   ├── prompt_templates.py           – Predefined templates for coding, math, planning, RAG  
+│   ├── safety.py                     – Safety orchestration integrating firewall & rate limiter  
+│   ├── rag.py                        – Retrieval-Augmented Generation engine over local vector store  
+│   ├── tools.py                      – Tool registry, JSON-schema validation, invocation dispatcher  
+│   ├── memory.py                     – Conversation history, token budgeting, persistence  
+│   └── utils.py                      – Shared helpers: logging, token counting, path utilities  
+
+├── src/features/                     – Advanced offline feature modules  
+│   ├── chain_of_thought.py           – Step-by-step reasoning wrapper  
+│   ├── unit_test_gen.py              – Auto-generate pytest/unittest scaffolds  
+│   ├── static_analysis.py            – Unified interface to mypy/pyright/pytype/pyre  
+│   ├── math_renderer.py              – Render LaTeX-style math in CLI/HTML  
+│   ├── project_context.py            – Summarize and index local Git repos  
+│   ├── doc_search.py                 – Semantic and keyword search over offline docs  
+│   ├── snippet_library.py            – Manage/retrieve reusable code snippets  
+│   ├── syntax_highlight.py           – ANSI/HTML syntax highlighting for code blocks  
+│   ├── interrupt_stream.py           – Cooperative cancellation of streaming output  
+│   ├── sandbox_exec.py               – Resource-capped isolated subprocess execution  
+│   ├── output_verifier.py            – Execute and validate code/math outputs  
+│   ├── hallucination_check.py        – Cross-check model claims vs. retrieved facts  
+│   ├── plugin_loader.py              – Discover, validate, sandbox plugins with permissions  
+│   ├── multi_model_ensemble.py       – Fan-out prompts to multiple models & merge responses  
+│   ├── semantic_code_search.py       – Embedding-powered codebase Q&A  
+│   ├── session_replay.py             – Replay and diff previous chat sessions  
+│   ├── proof_synthesis.py            – Formal proof generation/verification (SymPy/Lean)  
+│   ├── code_refactor.py              – Automated refactoring with unified diffs  
+│   ├── multi_agent_sim.py            – Orchestrate collaborating/competing agents  
+│   ├── goal_planner.py               – Decompose high-level goals into subtasks  
+│   ├── self_debugger.py              – Critique and regenerate flawed outputs  
+│   ├── hypothesis_tester.py          – Propose, simulate, revise logic/math hypotheses  
+│   ├── api_builder.py                – Generate and serve local REST/GraphQL endpoints  
+│   ├── diagram_generator.py          – Render flowcharts/class diagrams via Graphviz  
+│   ├── ci_simulator.py               – Offline CI: tests, lint, type-check, reports  
+│   ├── citation_engine.py            – Generate BibTeX/Markdown citations for RAG sources  
+│   ├── semantic_file_search.py       – Natural-language file explorer  
+│   ├── prompt_history.py             – GUI: navigate & reuse past prompts  
+│   ├── session_bookmarks.py          – Tag & organize key exchanges  
+│   ├── plugin_console.py             – Live stdout/stderr viewer for plugins  
+│   ├── tabbed_chat.py                – Multi-session tabs in web GUI  
+│   ├── encryption_vault.py           – AES/GPG-backed local secret storage  
+│   ├── provenance_tracker.py         – Tag outputs with origin metadata  
+│   ├── consent_manager.py            – Track user opt-in/out for memory/plugins  
+│   ├── auto_plugin_gen.py            – Scaffold new plugins from NL specs  
+│   ├── model_profiler.py             – Benchmark models on tasks; route by profile  
+│   ├── fine_tune_dashboard.py        – Visualize LoRA/QLoRA runs & metrics  
+│   ├── prompt_mutator.py             – Rewrite prompts for clarity/style  
+│   ├── temporal_reasoning.py         – Reason about events and durations  
+│   ├── analogical_reasoning.py       – Draw analogies between concepts/math/code  
+│   ├── conceptnet_interface.py       – Query local ConceptNet dump offline  
+│   ├── question_decomposer.py        – Split complex queries into sub-questions  
+│   ├── code_review.py                – Local code review heuristics/suggestions  
+│   ├── refactoring_cli.py             – Batch refactoring CLI for repos  
+│   ├── coverage_estimator.py         – Estimate test coverage; propose missing tests  
+│   ├── dependency_auditor.py         – Audit env for outdated/unused/vulnerable packages  
+│   ├── encyclopedia_builder.py       – Build structured KBs from local docs  
+│   ├── dataset_annotator.py          – Label/summarize datasets via NL prompts  
+│   ├── codebase_summarizer.py        – High-level repo summaries: architecture, modules, TODOs  
+│   ├── plugin_builder_gui.py         – GUI for visual plugin creation/testing  
+│   ├── session_timeline.py           – Visual timeline of sessions & tool calls  
+│   ├── gui_notifications.py          – Desktop notifications for long tasks/errors  
+│   ├── threat_modeling.py            – Offline threat modeling assistant  
+│   ├── plugin_permissions.py         – Fine-grained plugin file/network/subprocess policies  
+│   ├── audit_trail_visualizer.py     – Graphical system & plugin activity viewer  
+│   ├── consent_ledger.py             – Encrypted ledger of user consents  
+│   ├── prompt_compiler.py            – Compile tasks into prompt chains or DSL  
+│   ├── plugin_dependency_resolver.py – Install plugin wheels from local cache  
+│   ├── plugin_marketplace.py         – Local vetted plugin catalog & installer  
+│   ├── model_router.py               – Route requests to best model by performance/profile  
+│   ├── image_to_code.py              – Generate UI code from screenshots (offline)  
+│   ├── music_generator.py            – Create MIDI/WAV with offline generative models  
+│   ├── game_builder.py               – Visual editor for simple games/puzzles (local)  
+│   ├── simulation_engine.py          – Agent-based sims (Mesa or custom)  
+│   ├── pdf_summarizer.py             – OCR+summarization of local PDFs (Tesseract opt.)  
+│   ├── notebook_interpreter.py       – Summarize/analyze .ipynb notebooks  
+│   ├── prompt_firewall.py            – Block/mask banned prompts via patterns  
+│   └── rate_limiter.py               – Enforce per-user/session token/tool quotas  
+
+├── src/optional/                     – Opt-in internet/external-API/voice modules  
+│   ├── README.md                     – Guide to enabling/disabling optional modules  
+│   ├── voice_input.py                – STT (offline Vosk default; optional cloud)  
+│   ├── voice_output.py               – TTS (offline pyttsx3 default; optional cloud)  
+│   ├── web_search_integration.py     – Web search client (disabled offline)  
+│   ├── external_api_tools.py         – Wrappers for GitHub, weather, etc. (consent-gated)  
+│   ├── remote_llm_proxy.py           – Bridge to remote LLM endpoints (off by default)  
+│   ├── oauth2_providers.py           – Helpers for specific OAuth2 IdPs (opt-in)  
+│   ├── cloud_storage_connectors.py   – S3/Drive import-export (opt-in)  
+│   └── online_ocr.py                 – Cloud OCR backends (fallback local Tesseract)  
+
+├── plugins/                          – User-defined sandboxed tool plugins (offline-first)  
+│   ├── get_time.py                   – Return current system time  
+│   ├── eval_expression.py            – Safely evaluate math expressions  
+│   ├── file_summary.py               – Summarize text or code files  
+│   ├── generate_regex.py             – Build regex from NL spec  
+│   ├── mypy_plugin.py                – Run mypy, parse diagnostics  
+│   ├── pyright_plugin.py             – Run pyright, parse results  
+│   ├── pytype_plugin.py              – Run Google’s pytype  
+│   ├── pyre_plugin.py                – Run Meta’s pyre  
+│   ├── lean_prover_plugin.py         – Interface to local Lean proof assistant  
+│   ├── git_commit_plugin.py          – Sandbox-safe Git operations (commit/diff/revert)  
+│   ├── notebook_summary_plugin.py    – Summarize Jupyter notebooks cell-by-cell  
+│   ├── diagram_plugin.py             – Expose diagram_generator as a tool  
+│   ├── citation_plugin.py            – Expose citation_engine for inline citations  
+│   └── api_generator_plugin.py       – Expose api_builder endpoints as plugin  
+
+├── web/                              – Local GUI with optional OAuth2 routes  
+│   ├── gui.py                        – FastAPI/Flask backend: pages, WebSockets, local APIs  
+│   ├── oauth.py                      – OAuth2 authorize/token/revoke endpoints (opt-in)  
+│   ├── templates/                    – HTML/Jinja2 views  
+│   │   ├── index.html                – Dashboard & chat interface  
+│   │   ├── login.html                – OAuth2 login redirect page (opt-in)  
+│   │   ├── oauth_callback.html       – OAuth2 callback/session setup (opt-in)  
+│   │   ├── config.html               – Model/profile/feature-flag editor  
+│   │   ├── plugins.html              – Plugin manager & marketplace UI  
+│   │   ├── logs.html                 – Log viewer & filter  
+│   │   ├── rag.html                  – RAG sources & embedding manager  
+│   │   ├── users.html                – User management & RBAC assignment  
+│   │   ├── audit.html                – Audit & provenance viewer  
+│   │   ├── dsl_builder.html          – Drag-and-drop prompt scripting  
+│   │   ├── tabbed_chat.html          – Multi-session chat tabs  
+│   │   ├── bookmarks.html            – Session bookmarks & tags UI  
+│   │   └── profiler.html             – Model profiling results visualization  
+│   ├── static/                       – Web assets  
+│   │   ├── css/style.css             – Core stylesheet  
+│   │   ├── js/app.js                 – Frontend logic & feature-flag toggles  
+│   │   └── icons/logo.svg            – App logo & icons  
+│   └── README.md                     – GUI launch & optional OAuth2 config guide  
+
+├── logs/                             – System and audit logs (rotated)  
+│   ├── session_YYYYMMDD.log          – Timestamped chat transcripts  
+│   ├── access.log                    – Web/API access with RBAC metadata  
+│   ├── error.log                     – Runtime errors & stack traces  
+│   ├── audit.log                     – Detailed tool/plugin/sandbox execution trail  
+│   ├── firewall.log                  – Blocked/pattern-matched prompt records  
+│   └── provenance.log                – Output source attribution records  
+
+├── scripts/                          – Utility & automation scripts  
+│   ├── quantize_model.py             – Quantize PyTorch weights for CPU inference  
+│   ├── download_model.py             – Fetch/place model files (opt-in network)  
+│   ├── index_corpus.py               – Build/update local RAG indices  
+│   ├── export_profile.py             – Export/import user profiles & prefs  
+│   ├── sandbox_test.py               – Validate sandbox limits & isolation  
+│   ├── plugin_validator.py           – Lint plugin manifests & permissions  
+│   ├── voice_setup.py                – Configure offline STT/TTS (opt-in voice modules)  
+│   ├── wikipedia_sync.py             – Update offline Wikipedia mirror (opt-in network)  
+│   ├── notebook_indexer.py           – Pre-index .ipynb for RAG  
+│   ├── dsl_runner.py                 – Execute prompt DSL pipelines  
+│   ├── fine_tune_runner.py           – Launch local LoRA/QLoRA fine-tuning jobs  
+│   └── model_benchmark.py            – Benchmark models on coding, math, latency  
+
+├── tests/                             – Unit & integration tests (offline-first; optional tests skip net modules)  
+│   ├── test_model_manager.py         – Dynamic discovery, list, switch behavior  
+│   ├── test_inference.py             – Prompt assembly, generation, streaming correctness  
+│   ├── test_safety.py                – Firewall & refusal logic tests  
+│   ├── test_tools.py                 – Tool registry/schema/dispatch tests  
+│   ├── test_rag.py                   – RAG retrieval ranking & injection tests  
+│   ├── test_plugins.py               – Plugin discovery, sandbox execution tests  
+│   ├── test_static_analysis.py       – Type-checker plugin integration tests  
+│   ├── test_git_integration.py       – Sandbox-safe Git commit/diff/revert tests  
+│   ├── test_pdf_summarizer.py        – PDF extraction & summarization tests  
+│   ├── test_notebook_interpreter.py  – Notebook parsing & summary tests  
+│   ├── test_prompt_dsl.py            – DSL parse & multi-step execution tests  
+│   ├── test_multi_agent_sim.py       – Agent collaboration & consensus tests  
+│   ├── test_goal_planner.py          – Task decomposition fidelity tests  
+│   ├── test_self_debugger.py         – Error detection & regeneration tests  
+│   ├── test_api_builder.py           – Generated API endpoint behavior tests  
+│   ├── test_diagram_generator.py     – Graphviz output validity tests  
+│   ├── test_ci_simulator.py          – Offline CI pipeline simulation tests  
+│   ├── test_citation_engine.py       – Citation formatting & source binding tests  
+│   ├── test_file_search.py           – NL file explorer precision/recall tests  
+│   ├── test_encryption_vault.py      – Secret store/retrieve & key rotation tests  
+│   ├── test_provenance_tracker.py    – Provenance integrity tests  
+│   ├── test_oauth.py                 – OAuth2 flows & RBAC enforcement tests  
+│   ├── test_optional_voice.py        – Voice STT/TTS modules tests (skipped unless enabled)  
+│   └── test_web_search_integration.py– Web search integration tests (skipped offline)  
+
+├── examples/                         – Guided demos & workflows  
+│   ├── coding_session.md             – Interactive coding assistant example  
+│   ├── math_session.md               – Math reasoning & proof demonstration  
+│   ├── plugin_demo.md                – Create/register/use a sandboxed plugin  
+│   ├── n8n_integration.md            – Automate via HTTP API calls example  
+│   ├── dsl_examples.md               – Prompt DSL recipes & chaining patterns  
+│   ├── multi_agent_demo.md           – Multi-agent debate/collaboration demo  
+│   ├── fine_tune_example.md          – Local LoRA/QLoRA tutorial  
+│   ├── api_builder_demo.md           – Generate & consume local APIs  
+│   ├── dataset_query.md              – Conversational data exploration guide  
+│   ├── logic_reasoning.md            – Logic/Prolog-style reasoning examples  
+│   ├── knowledge_graph_demo.md       – RDF/ConceptNet offline querying demo  
+│   ├── oauth_flow_demo.md            – OAuth2 + RBAC enforcement walkthrough  
+│   └── voice_mode_demo.md            – Voice input/output usage guide  
+
+└── README.md                         – Overview: install, offline-first principles, dynamic model selection, RBAC/OAuth2 usage, optional modules  
+
+==========================
+DETAILED IMPLEMENTATION PLAN
+==========================
+
+PHASE 1: Core Engine & CLI
+- Goal: Stand up config-driven LLM runtime and interactive shell.
+- Build: config.json/optional_modules.json, model_manager.py, prompt_templates.py, inference.py, main.py
+- Tests: test_model_manager.py (discovery, switch valid/invalid), test_inference.py (mocked generation), test_cli_commands.py (simulate “/switch”)
+- Deliverable: CLI REPL, dynamic model switching, streaming output, slash commands.
+
+PHASE 2: Coding & Math Specialization
+- Goal: Add CoT, math rendering, unit test scaffolds, sandboxed verification.
+- Build: chain_of_thought.py, math_renderer.py, unit_test_gen.py, syntax_highlight.py, sandbox_exec.py, output_verifier.py
+- Tests: test_math_renderer.py, test_unit_test_gen.py, test_output_verifier.py, test_chain_of_thought.py
+- Deliverable: Step-by-step reasoning, LaTeX math formatting, auto-generated tests, sandbox validation.
+
+PHASE 3: Retrieval & Tooling
+- Goal: Local RAG, semantic search, safe plugin execution.
+- Build: data/embeddings setup, rag.py, doc_search.py, semantic_code_search.py, tools.py, plugin_loader.py, hallucination_check.py
+- Tests: test_rag.py, test_doc_search.py, test_semantic_code_search.py, test_tools.py, test_sandbox_exec.py, test_hallucination_check.py
+- Deliverable: Vector store, context injection, plugin registry, fact-checking layer.
+
+PHASE 4: Static Analysis & Plugins
+- Goal: Integrate type-checker backends & plugin sandbox.
+- Build: static_analysis.py, plugin_loader.py enhancements, mypy/pyright/pytype/pyre plugins
+- Tests: test_static_analysis.py, test_plugins.py
+- Deliverable: Unified static analysis API, sandboxed plugin host.
+
+PHASE 5: Web GUI
+- Goal: Browser interface for chat, config, plugin mgr.
+- Build: web/gui.py, templates/, static/, tabbed_chat.py, plugin_console.py, session_bookmarks.py
+- Tests: test_web_routes.py (200 on key endpoints), manual GUI smoke test
+- Deliverable: Dashboard, multi-tab chat, feature-flag toggles.
+
+PHASE 6: Advanced Reasoning & Planning
+- Goal: Multi-agent, goal planning, self-debugger, proofs.
+- Build: multi_agent_sim.py, goal_planner.py, self_debugger.py, hypothesis_tester.py, proof_synthesis.py
+- Tests: test_multi_agent_sim.py, test_goal_planner.py, test_self_debugger.py, test_proof_synthesis.py
+- Deliverable: Agent orchestration, task decomposition, auto-debug, formal proof engine.
+
+PHASE 7: Developer Automation
+- Goal: Git ops, offline CI, API gen, diagrams.
+- Build: git_integration.py, ci_simulator.py, api_builder.py, diagram_generator.py
+- Tests: test_git_integration.py, test_ci_simulator.py, test_api_builder.py, test_diagram_generator.py
+- Deliverable: Version control automation, CI simulation, code-to-API, Graphviz diagrams.
+
+PHASE 8: Knowledge & Retrieval Expansion
+- Goal: Summarize PDFs/notebooks, citations, offline wiki.
+- Build: pdf_summarizer.py, notebook_interpreter.py, citation_engine.py, integrate wikipedia_mirror/
+- Tests: test_pdf_summarizer.py, test_notebook_interpreter.py, test_citation_engine.py
+- Deliverable: PDF/manual summarization, notebook Q&A, BibTeX/MD citations.
+
+PHASE 9: Safety, Privacy & Control
+- Goal: Firewall, rate limits, vault, consent, provenance.
+- Build: prompt_firewall.py, rate_limiter.py, encryption_vault.py, consent_manager.py, provenance_tracker.py
+- Tests: test_prompt_firewall.py, test_rate_limiter.py, test_encryption_vault.py, test_consent_manager.py, test_provenance_tracker.py
+- Deliverable: Input/output filtering, quotas, encrypted secret store, consent ledger, audit trail.
+
+PHASE 10: Extensibility & Intelligence
+- Goal: Auto-plugin gen, model profiling, fine-tune dashboard.
+- Build: auto_plugin_gen.py, plugin_marketplace.py, model_profiler.py, fine_tune_dashboard.py, fine_tune_runner.py
+- Tests: test_auto_plugin_gen.py, test_model_profiler.py, test_fine_tune_dashboard.py
+- Deliverable: NLP-to-plugin scaffolds, plugin catalog UI, benchmark metrics, LoRA/QLoRA visualization.
+
+PHASE 11: RBAC & Embedded OAuth2 Provider
+- Goal: Self-hosted OAuth2 provider & role-based guards.
+- Build: auth.py (provider endpoints + token storage), rbac.py guards, web/oauth.py, oauth2.json setup, users.json/roles.json seed data
+- Tests: test_oauth_provider.py (authorize/token/revoke flows), test_rbac.py (role enforcement on CLI/API)
+- Deliverable: Built-in OAuth2 server, secure login, token revocation, scoped permissions.
+
+PHASE 12: Final Integration & Packaging
+- Goal: Polish, optimize, document, package for distribution.
+- Build: README.md updates, installer.sh/launcher script, lazy model loading, cache optimization, tarball/zip packaging
+- Tests: end_to_end_test.sh (CLI, GUI, slash commands), stress_test.py (multi-session, heavy RAG)
+- Deliverable: Production-ready offline AI OS, USB/air-gapped installer, full docs & examples.
