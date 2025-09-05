@@ -1,4 +1,4 @@
-
+p
 networks:
   edge:
   core:
@@ -128,16 +128,6 @@ services:
       - MYSQL_PASSWORD=devpass
     ports:
       - "127.0.0.1:3307:3306"
-
-  mssql:
-    image: mcr.microsoft.com/mssql/server:2022-lts
-    networks: [data]
-    environment:
-      - ENABLE_DB=true
-      - ACCEPT_EULA=Y
-      - SA_PASSWORD=DevPass123!
-    ports:
-      - "127.0.0.1:1433:1433"
 
   k3s:
     image: rancher/k3s:v1.28.9-k3s1
