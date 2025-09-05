@@ -1,4 +1,3 @@
-version: "3.9"
 
 networks:
   edge:
@@ -7,38 +6,51 @@ networks:
 
 services:
 
-  openresty:
-    image: openresty/openresty:alpine
+  kong-db:
+    image: postgres:15
     networks: [core]
-    ports:
-      - "127.0.0.1:8080:80"
-      - "127.0.0.1:8443:443"
     environment:
-      - ENABLE_TLS=true
-      - RBAC_ENABLED=true
-      - SESSION_AFFINITY=true
-    entrypoint: /bin/sh
-    command: -c "
-      mkdir -p /etc/openresty/conf.d &&
-      echo '
-        server {
-          listen 80;
-          listen 443 ssl;
-          ssl_certificate /etc/openresty/certs/server.crt;
-          ssl_certificate_key /etc/openresty/certs/server.key;
-          location / {
-            access_by_lua_block {
-              local session = require \"resty.session\".start()
-              ngx.req.set_header(\"X-User-ID\", session.data.user_id or \"guest\")
-              ngx.req.set_header(\"X-Role\", session.data.role or \"viewer\")
-              ngx.req.set_header(\"X-Session-ID\", session.id)
-            }
-            proxy_pass http://backend_pool;
-          }
-        }
-      ' > /etc/openresty/conf.d/default.conf &&
-      openresty -g 'daemon off;'
-    "
+      - POSTGRES_DB=kong
+      - POSTGRES_USER=kong
+      - POSTGRES_PASSWORD=kong
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  kong-migrations:
+    image: kong/kong-gateway:3.9.1-ubuntu
+    networks: [core]
+    depends_on: [kong-db]
+    environment:
+      - KONG_DATABASE=postgres
+      - KONG_PG_HOST=kong-db
+      - KONG_PG_DATABASE=kong
+      - KONG_PG_USER=kong
+      - KONG_PG_PASSWORD=kong
+    command: kong migrations bootstrap
+
+  kong:
+    image: kong/kong-gateway:3.9.1-ubuntu
+    networks: [core]
+    depends_on: [kong-db, kong-migrations]
+    environment:
+      - KONG_DATABASE=postgres
+      - KONG_PG_HOST=kong-db
+      - KONG_PG_DATABASE=kong
+      - KONG_PG_USER=kong
+      - KONG_PG_PASSWORD=kong
+      - KONG_PROXY_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_LISTEN=0.0.0.0:8001, 0.0.0.0:8444 ssl
+      - KONG_ADMIN_GUI_LISTEN=0.0.0.0:8002, 0.0.0.0:8445 ssl
+      - KONG_ADMIN_GUI_URL=http://localhost:8002
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:8444:8444"
+      - "127.0.0.1:8002:8002"
+      - "127.0.0.1:8445:8445"
 
   waf:
     image: owasp/modsecurity-crs:nginx
@@ -48,12 +60,6 @@ services:
     environment:
       - PARANOIA=1
       - PROXY=1
-
-  console:
-    image: nginx:1.27-alpine
-    networks: [core]
-    ports:
-      - "127.0.0.1:7000:7000"
 
   portainer:
     image: portainer/portainer-ce:2.19.4
@@ -70,33 +76,6 @@ services:
     environment:
       - PASSWORD=devpass
       - ENABLE_LANG_SUPPORT=true
-      - RBAC_ENABLED=true
-
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.15
-    networks: [core]
-
-  apisix:
-    image: apache/apisix:3.9.1-debian
-    networks: [core]
-    depends_on: [etcd]
-    ports:
-      - "127.0.0.1:9180:9180"
-      - "127.0.0.1:9443:9443"
-      - "127.0.0.1:9091:9091"
-      - "127.0.0.1:9080:9080"
-    environment:
-      - ENABLE_TLS=true
-      - RBAC_ENABLED=true
-
-  apisix-dashboard:
-    image: apache/apisix-dashboard:3.0.1
-    networks: [core]
-    depends_on: [apisix, etcd]
-    ports:
-      - "127.0.0.1:9000:9000"
-    environment:
-      - APIX_ETCD_ENDPOINTS=http://etcd:2379
       - RBAC_ENABLED=true
 
   jenkins:
@@ -125,28 +104,6 @@ services:
       - REGISTRY_URL=http://registry:5000
       - DELETE_IMAGES=true
       - RBAC_ENABLED=true
-
-  registry-cleaner:
-    image: alpine:3.19
-    networks: [core]
-    entrypoint: sh
-    command: -c "while true; do find /var/lib/registry -type f -name '*.tar' -mtime +7 -delete; sleep 3600; done"
-
-  image-importer:
-    image: docker:cli
-    networks: [core]
-    entrypoint: sh
-    command: -c "for f in /var/lib/registry/*.tar; do docker load -i $f; done"
-
-  image-pusher:
-    image: docker:cli
-    networks: [core]
-    environment:
-      - REMOTE_REGISTRY=docker.io
-      - USERNAME=yourusername
-      - PASSWORD=yourpassword
-    entrypoint: sh
-    command: -c "echo $PASSWORD | docker login $REMOTE_REGISTRY -u $USERNAME --password-stdin && docker push $REMOTE_REGISTRY/yourimage:latest"
 
   mariadb:
     image: mariadb:11.4
