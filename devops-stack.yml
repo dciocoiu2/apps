@@ -9,35 +9,41 @@ services:
 
   kong-db:
     image: postgres
-    networks: [core]
+    networks:
+      - core
     environment:
-      - POSTGRES_DB=kong
-      - POSTGRES_USER=kong
-      - POSTGRES_PASSWORD=kong
+      POSTGRES_DB: kong
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
 
   kong-migrations:
     image: kong/kong-gateway
-    networks: [core]
-    depends_on: [kong-db]
+    networks:
+      - core
+    depends_on:
+      - kong-db
     environment:
-      - KONG_DATABASE=postgres
-      - KONG_PG_HOST=kong-db
-      - KONG_PG_DATABASE=kong
-      - KONG_PG_USER=kong
-      - KONG_PG_PASSWORD=kong
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_DATABASE: kong
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
     command: kong migrations bootstrap
 
   kong:
     image: kong/kong-gateway
-    networks: [core]
-    depends_on: [kong-db, kong-migrations]
+    networks:
+      - core
+    depends_on:
+      - kong-db
+      - kong-migrations
     environment:
-      - KONG_DATABASE=postgres
-      - KONG_PG_HOST=kong-db
-      - KONG_PG_DATABASE=kong
-      - KONG_PG_USER=kong
-      - KONG_PG_PASSWORD=kong
-      - KONG_ADMIN_GUI_URL=http://localhost:8002
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_DATABASE: kong
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_ADMIN_GUI_URL: http://localhost:8002
     ports:
       - "127.0.0.1:8000:8000"
       - "127.0.0.1:8443:8443"
@@ -46,104 +52,128 @@ services:
       - "127.0.0.1:8002:8002"
       - "127.0.0.1:8445:8445"
 
-  waf:
-    image: owasp/modsecurity-crs:4-nginx-202401121309
-    networks: [edge, core]
-    ports:
-      - "127.0.0.1:80:80"
-    environment:
-      - PARANOIA=1
-      - PROXY=1
+  kong-bootstrap:
+    image: curlimages/curl
+    depends_on:
+      - kong
+    networks:
+      - core
+    entrypoint: sh
+    command: >
+      -c "
+      sleep 10 &&
+      curl -i -X POST http://kong:8001/services --data name=default-service --data url=http://admin-overview:80 &&
+      curl -i -X POST http://kong:8001/routes --data service=default-service --data paths[]=/ &&
+      curl -i -X POST http://kong:8001/services/default-service/plugins --data name=rate-limiting --data config.minute=100 --data config.policy=local &&
+      curl -i -X POST http://kong:8001/services/default-service/plugins --data name=ip-restriction --data config.whitelist=127.0.0.1 &&
+      curl -i -X POST http://kong:8001/services/default-service/plugins --data name=request-transformer --data config.add.headers=X-Platform:DevOpsStack &&
+      curl -i -X POST http://kong:8001/services/default-service/plugins --data name=response-transformer --data config.add.headers=X-Secured-By:Kong &&
+      echo Kong plugins configured
+      "
 
   portainer:
     image: portainer/portainer-ce
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:9443:9443"
 
   code:
     image: codercom/code-server
-    networks: [core]
+    networks:
+      - core
     environment:
-      - PASSWORD=devpass
+      PASSWORD: devpass
 
   jenkins:
     image: jenkins/jenkins
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:8081:8080"
 
   registry:
     image: registry
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:5000:5000"
 
   registry-ui:
     image: joxit/docker-registry-ui
-    networks: [core]
-    depends_on: [registry]
+    networks:
+      - core
+    depends_on:
+      - registry
     ports:
       - "127.0.0.1:8082:80"
     environment:
-      - REGISTRY_URL=http://registry:5000
-      - DELETE_IMAGES=true
+      REGISTRY_URL: http://registry:5000
+      DELETE_IMAGES: true
 
   mariadb:
     image: mariadb
-    networks: [data]
+    networks:
+      - data
     environment:
-      - MARIADB_ROOT_PASSWORD=devpass
-      - MARIADB_DATABASE=devdb
-      - MARIADB_USER=dev
-      - MARIADB_PASSWORD=devpass
+      MARIADB_ROOT_PASSWORD: devpass
+      MARIADB_DATABASE: devdb
+      MARIADB_USER: dev
+      MARIADB_PASSWORD: devpass
     ports:
       - "127.0.0.1:3306:3306"
 
   mysql:
     image: mysql
-    networks: [data]
+    networks:
+      - data
     environment:
-      - MYSQL_ROOT_PASSWORD=devpass
-      - MYSQL_DATABASE=devdb
-      - MYSQL_USER=dev
-      - MYSQL_PASSWORD=devpass
+      MYSQL_ROOT_PASSWORD: devpass
+      MYSQL_DATABASE: devdb
+      MYSQL_USER: dev
+      MYSQL_PASSWORD: devpass
     ports:
       - "127.0.0.1:3307:3306"
 
   prometheus:
     image: prom/prometheus
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:9090:9090"
 
   grafana:
     image: grafana/grafana
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
 
   loki:
     image: grafana/loki
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:3100:3100"
 
   promtail:
     image: grafana/promtail
-    networks: [core]
+    networks:
+      - core
 
   admin-overview:
     image: nginx
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:7777:80"
 
   onboarding-ui:
     image: node
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:7788:80"
     entrypoint: sh
@@ -151,6 +181,7 @@ services:
 
   rbac-editor:
     image: nocobase/nocobase
-    networks: [core]
+    networks:
+      - core
     ports:
       - "127.0.0.1:7799:80"
