@@ -1,4 +1,3 @@
-p
 networks:
   edge:
   core:
@@ -7,17 +6,15 @@ networks:
 services:
 
   kong-db:
-    image: postgres:15
+    image: postgres
     networks: [core]
     environment:
       - POSTGRES_DB=kong
       - POSTGRES_USER=kong
       - POSTGRES_PASSWORD=kong
-    ports:
-      - "127.0.0.1:5432:5432"
 
   kong-migrations:
-    image: kong/kong-gateway:3.9.1-ubuntu
+    image: kong/kong-gateway
     networks: [core]
     depends_on: [kong-db]
     environment:
@@ -29,7 +26,7 @@ services:
     command: kong migrations bootstrap
 
   kong:
-    image: kong/kong-gateway:3.9.1-ubuntu
+    image: kong/kong-gateway
     networks: [core]
     depends_on: [kong-db, kong-migrations]
     environment:
@@ -38,11 +35,6 @@ services:
       - KONG_PG_DATABASE=kong
       - KONG_PG_USER=kong
       - KONG_PG_PASSWORD=kong
-      - KONG_PROXY_ACCESS_LOG=/dev/stdout
-      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
-      - KONG_ADMIN_ERROR_LOG=/dev/stderr
-      - KONG_ADMIN_LISTEN=0.0.0.0:8001, 0.0.0.0:8444 ssl
-      - KONG_ADMIN_GUI_LISTEN=0.0.0.0:8002, 0.0.0.0:8445 ssl
       - KONG_ADMIN_GUI_URL=http://localhost:8002
     ports:
       - "127.0.0.1:8000:8000"
@@ -53,49 +45,37 @@ services:
       - "127.0.0.1:8445:8445"
 
   waf:
-    image: owasp/modsecurity-crs:nginx
+    image: owasp/modsecurity-crs
     networks: [edge, core]
     ports:
       - "127.0.0.1:80:80"
-    environment:
-      - PARANOIA=1
-      - PROXY=1
 
   portainer:
-    image: portainer/portainer-ce:2.19.4
+    image: portainer/portainer-ce
     networks: [core]
     ports:
       - "127.0.0.1:9443:9443"
-    environment:
-      - ENABLE_EXPORT=true
-      - RBAC_ENABLED=true
 
   code:
-    image: codercom/code-server:latest
+    image: codercom/code-server
     networks: [core]
     environment:
       - PASSWORD=devpass
-      - ENABLE_LANG_SUPPORT=true
-      - RBAC_ENABLED=true
 
   jenkins:
-    image: jenkins/jenkins:lts
+    image: jenkins/jenkins
     networks: [core]
     ports:
       - "127.0.0.1:8081:8080"
-    environment:
-      - RBAC_ENABLED=true
 
   registry:
-    image: registry:2
+    image: registry
     networks: [core]
     ports:
       - "127.0.0.1:5000:5000"
-    environment:
-      - RBAC_ENABLED=true
 
   registry-ui:
-    image: joxit/docker-registry-ui:latest
+    image: joxit/docker-registry-ui
     networks: [core]
     depends_on: [registry]
     ports:
@@ -103,13 +83,11 @@ services:
     environment:
       - REGISTRY_URL=http://registry:5000
       - DELETE_IMAGES=true
-      - RBAC_ENABLED=true
 
   mariadb:
-    image: mariadb:11.4
+    image: mariadb
     networks: [data]
     environment:
-      - ENABLE_DB=true
       - MARIADB_ROOT_PASSWORD=devpass
       - MARIADB_DATABASE=devdb
       - MARIADB_USER=dev
@@ -118,10 +96,9 @@ services:
       - "127.0.0.1:3306:3306"
 
   mysql:
-    image: mysql:8.3
+    image: mysql
     networks: [data]
     environment:
-      - ENABLE_DB=true
       - MYSQL_ROOT_PASSWORD=devpass
       - MYSQL_DATABASE=devdb
       - MYSQL_USER=dev
@@ -130,7 +107,7 @@ services:
       - "127.0.0.1:3307:3306"
 
   k3s:
-    image: rancher/k3s:v1.28.9-k3s1
+    image: rancher/k3s
     privileged: true
     networks: [core]
     ports:
@@ -138,52 +115,45 @@ services:
       - "127.0.0.1:30080:30080"
 
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: prom/prometheus
     networks: [core]
     ports:
       - "127.0.0.1:9090:9090"
 
   grafana:
-    image: grafana/grafana:10.4.2
+    image: grafana/grafana
     networks: [core]
     ports:
       - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
-      - RBAC_ENABLED=true
 
   loki:
-    image: grafana/loki:2.9.8
+    image: grafana/loki
     networks: [core]
     ports:
       - "127.0.0.1:3100:3100"
 
   promtail:
-    image: grafana/promtail:2.9.8
+    image: grafana/promtail
     networks: [core]
 
   admin-overview:
-    image: nginx:1.27-alpine
+    image: nginx
     networks: [core]
     ports:
       - "127.0.0.1:7777:80"
-    environment:
-      - RBAC_ENABLED=true
 
   onboarding-ui:
-    image: node:20-alpine
+    image: node
     networks: [core]
     ports:
       - "127.0.0.1:7788:80"
     entrypoint: sh
     command: -c "npx serve /onboarding-ui"
-    environment:
-      - RBAC_ENABLED=true
 
   rbac-editor:
-    image: nocobase/nocobase:latest
+    image: nocobase/nocobase
     networks: [core]
     ports:
       - "127.0.0.1:7799:80"
-    environment:
-      - RBAC_ENABLED=true
