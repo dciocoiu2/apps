@@ -1,0 +1,212 @@
+
+
+networks:
+  edge:
+  core:
+  data:
+  apisix-net:
+
+services:
+
+  etcd:
+    image: bitnami/etcd:3.5.17
+    networks:
+      - apisix-net
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ports:
+      - "127.0.0.1:2379:2379"
+
+  apisix:
+    image: apache/apisix:3.9.0-debian
+    networks:
+      - apisix-net
+      - core
+    depends_on:
+      - etcd
+    environment:
+      APISIX_STAND_ALONE: "false"
+    command: >
+      sh -c "echo '
+      apisix:
+        node_listen: 9080
+        enable_admin: true
+        enable_admin_cors: true
+        admin_listen:
+          ip: 0.0.0.0
+          port: 9091
+        allow_admin:
+          - 0.0.0.0/0
+        admin_key:
+          - name: admin
+            key: edd1c9f034335f136f87ad84b625c8f1
+            role: admin
+      etcd:
+        host:
+          - http://etcd:2379
+      ' > /usr/local/apisix/conf/config.yaml && exec docker-entrypoint.sh docker-start"
+    ports:
+      - "127.0.0.1:9080:9080"
+      - "127.0.0.1:9443:9443"
+      - "127.0.0.1:9091:9091"
+
+  apisix-dashboard:
+    image: apache/apisix-dashboard:3.0.1
+    networks:
+      - apisix-net
+    depends_on:
+      - apisix
+    environment:
+      APIX_DASHBOARD_LISTEN_HOST: "0.0.0.0"
+      APIX_DASHBOARD_LISTEN_PORT: "9000"
+      APIX_DASHBOARD_ETCD_ENDPOINTS: "http://etcd:2379"
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  apisix-init:
+    image: curlimages/curl:8.4.0
+    networks:
+      - apisix-net
+    depends_on:
+      - apisix
+    entrypoint: sh
+    command: >
+      -c "
+      until curl -s http://apisix:9091/apisix/admin/routes -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1'; do sleep 3; done &&
+      curl -s -X PUT http://apisix:9091/apisix/admin/upstreams/1 \
+        -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+        -d '{\"type\":\"roundrobin\",\"nodes\":{\"admin-overview:80\":1}}' &&
+      curl -s -X PUT http://apisix:9091/apisix/admin/routes/1 \
+        -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+        -d '{\"uri\":\"/\",\"upstream_id\":\"1\",\"plugins\":{\"limit-req\":{\"rate\":100,\"burst\":0,\"rejected_code\":429},\"ip-restriction\":{\"allow\":[\"127.0.0.1\"]},\"response-rewrite\":{\"headers\":{\"X-Secured-By\":\"APISIX\"}}}}'
+      "
+
+  portainer:
+    image: portainer/portainer-ce:2.19.4
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:9443:9443"
+
+  code-server:
+    image: codercom/code-server:latest
+    networks:
+      - core
+    environment:
+      PASSWORD: devpass
+    ports:
+      - "127.0.0.1:7000:8080"
+
+  jenkins:
+    image: jenkins/jenkins:lts
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  registry:
+    image: registry:2
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:5000:5000"
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    networks:
+      - core
+    depends_on:
+      - registry
+    environment:
+      REGISTRY_URL: "http://registry:5000"
+      DELETE_IMAGES: "true"
+    ports:
+      - "127.0.0.1:8082:80"
+
+  mariadb:
+    image: mariadb:11.4
+    networks:
+      - data
+    environment:
+      MARIADB_ROOT_PASSWORD: devpass
+      MARIADB_DATABASE: devdb
+      MARIADB_USER: dev
+      MARIADB_PASSWORD: devpass
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  mysql:
+    image: mysql:8.3
+    networks:
+      - data
+    environment:
+      MYSQL_ROOT_PASSWORD: devpass
+      MYSQL_DATABASE: devdb
+      MYSQL_USER: dev
+      MYSQL_PASSWORD: devpass
+    ports:
+      - "127.0.0.1:3307:3306"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    networks:
+      - core
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  loki:
+    image: grafana/loki:2.9.8
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:3100:3100"
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    networks:
+      - core
+
+  admin-overview:
+    image: nginx:1.27-alpine
+    networks:
+      - core
+      - apisix-net
+    ports:
+      - "127.0.0.1:7777:80"
+
+  onboarding-ui:
+    image: node:20-alpine
+    networks:
+      - core
+    entrypoint: sh
+    command: -c "npx serve /onboarding-ui"
+    ports:
+      - "127.0.0.1:7788:80"
+
+  rbac-editor:
+    image: nocobase/nocobase:latest
+    networks:
+      - core
+    environment:
+      APP_ENV: development
+      APP_PORT: 13000
+      APP_KEY: test-key
+      DB_DIALECT: postgres
+      DB_HOST: kong-db
+      DB_PORT: 5432
+      DB_DATABASE: kong
+      DB_USER: kong
+      DB_PASSWORD: kong
+    ports:
+      - "127.0.0.1:7799:80"
