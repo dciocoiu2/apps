@@ -1,0 +1,171 @@
+# init-composev2.ps1
+# Generates docker-compose.yml with registry export dashboard and toggle
+
+$compose = @'
+version: "3.9"
+
+networks:
+  edge:
+  core:
+  data:
+
+services:
+
+  envoy:
+    image: envoyproxy/envoy:v1.30.2
+    networks: [edge, core]
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9901:9901"
+
+  waf:
+    image: owasp/modsecurity-crs:nginx
+    networks: [edge, core]
+    ports:
+      - "127.0.0.1:80:80"
+    environment:
+      - PARANOIA=1
+      - PROXY=1
+
+  nginx:
+    image: nginx:1.27-alpine
+    networks: [core]
+    depends_on: [console, apisix, k3s, grafana, jenkins, registry-ui]
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9113:9113"
+    volumes:
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+
+  console:
+    image: nginx:1.27-alpine
+    networks: [core]
+    depends_on: [portainer, code]
+    ports:
+      - "127.0.0.1:7000:7000"
+
+  portainer:
+    image: portainer/portainer-ce:2.19.4
+    networks: [core]
+    ports:
+      - "127.0.0.1:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ENABLE_EXPORT=${ENABLE_EXPORT}
+
+  code:
+    image: codercom/code-server:latest
+    networks: [core]
+    environment:
+      - PASSWORD=devpass
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    networks: [core]
+
+  apisix:
+    image: apache/apisix:3.9.1-debian
+    networks: [core]
+    depends_on: [etcd]
+    ports:
+      - "127.0.0.1:9180:9180"
+      - "127.0.0.1:9443:9443"
+      - "127.0.0.1:9091:9091"
+      - "127.0.0.1:9080:9080"
+
+  apisix-dashboard:
+    image: apache/apisix-dashboard:3.0.1
+    networks: [core]
+    depends_on: [apisix, etcd]
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      - APIX_ETCD_ENDPOINTS=http://etcd:2379
+
+  jenkins:
+    image: jenkins/jenkins:lts
+    networks: [core]
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  registry:
+    image: registry:2
+    networks: [core]
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - type: bind
+        source: ./registry-export
+        target: /var/lib/registry
+        bind:
+          propagation: rprivate
+    environment:
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry
+      - ENABLE_EXPORT=${ENABLE_EXPORT}
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    networks: [core]
+    depends_on: [registry]
+    ports:
+      - "127.0.0.1:8082:80"
+    environment:
+      - REGISTRY_URL=http://registry:5000
+      - DELETE_IMAGES=true
+      - ENABLE_EXPORT=${ENABLE_EXPORT}
+
+  mariadb:
+    image: mariadb:11.4
+    networks: [data]
+    environment:
+      - MARIADB_ROOT_PASSWORD=devpass
+      - MARIADB_DATABASE=devdb
+      - MARIADB_USER=dev
+      - MARIADB_PASSWORD=devpass
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  k3s:
+    image: rancher/k3s:v1.28.9-k3s1
+    privileged: true
+    networks: [core]
+    ports:
+      - "127.0.0.1:6443:6443"
+      - "127.0.0.1:30080:30080"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    networks: [core]
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    networks: [core]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+  loki:
+    image: grafana/loki:2.9.8
+    networks: [core]
+    ports:
+      - "127.0.0.1:3100:3100"
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    networks: [core]
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+'@
+
+Set-Content -Path "docker-compose.yml" -Value $compose
+Write-Host "✅ docker-compose.yml created with registry export dashboard."
+Write-Host "Access registry UI at http://localhost/registry-ui/"
+Write-Host "Toggle export via ENABLE_EXPORT in Portainer or .env file."
