@@ -53,7 +53,7 @@ services:
       - "127.0.0.1:9091:9091"
 
   apisix-dashboard:
-    image: apache/apisix-dashboard:3.0.1
+    image: apache/apisix-dashboard:latest
     networks:
       - apisix-net
     depends_on:
