@@ -26,10 +26,9 @@ services:
       - core
     depends_on:
       - etcd
-    environment:
-      APISIX_STAND_ALONE: "false"
+    entrypoint: /bin/sh
     command: >
-      sh -c "echo '
+      -c "echo '
       apisix:
         node_listen: 9080
         enable_admin: true
@@ -43,27 +42,20 @@ services:
           - name: admin
             key: edd1c9f034335f136f87ad84b625c8f1
             role: admin
+      plugins:
+        - prometheus
+        - jwt-auth
+        - limit-req
+        - ip-restriction
+        - response-rewrite
       etcd:
         host:
           - http://etcd:2379
-      ' > /usr/local/apisix/conf/config.yaml && exec docker-entrypoint.sh docker-start"
+      ' > /usr/local/apisix/conf/config.yaml && /usr/bin/apisix start"
     ports:
       - "127.0.0.1:9080:9080"
       - "127.0.0.1:9443:9443"
       - "127.0.0.1:9091:9091"
-
-  apisix-dashboard:
-    image: apache/apisix-dashboard:latest
-    networks:
-      - apisix-net
-    depends_on:
-      - apisix
-    environment:
-      APIX_DASHBOARD_LISTEN_HOST: "0.0.0.0"
-      APIX_DASHBOARD_LISTEN_PORT: "9000"
-      APIX_DASHBOARD_ETCD_ENDPOINTS: "http://etcd:2379"
-    ports:
-      - "127.0.0.1:9000:9000"
 
   apisix-init:
     image: curlimages/curl:8.4.0
@@ -78,9 +70,15 @@ services:
       curl -s -X PUT http://apisix:9091/apisix/admin/upstreams/1 \
         -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
         -d '{\"type\":\"roundrobin\",\"nodes\":{\"admin-overview:80\":1}}' &&
+      curl -s -X PUT http://apisix:9091/apisix/admin/plugins/prometheus \
+        -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+        -d '{}' &&
+      curl -s -X PUT http://apisix:9091/apisix/admin/consumers/dev-user \
+        -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+        -d '{\"username\":\"dev-user\",\"plugins\":{\"jwt-auth\":{\"key\":\"dev-key\",\"secret\":\"dev-secret\"}}}' &&
       curl -s -X PUT http://apisix:9091/apisix/admin/routes/1 \
         -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
-        -d '{\"uri\":\"/\",\"upstream_id\":\"1\",\"plugins\":{\"limit-req\":{\"rate\":100,\"burst\":0,\"rejected_code\":429},\"ip-restriction\":{\"allow\":[\"127.0.0.1\"]},\"response-rewrite\":{\"headers\":{\"X-Secured-By\":\"APISIX\"}}}}'
+        -d '{\"uri\":\"/\",\"upstream_id\":\"1\",\"plugins\":{\"limit-req\":{\"rate\":100,\"burst\":0,\"rejected_code\":429},\"ip-restriction\":{\"allow\":[\"127.0.0.1\"]},\"response-rewrite\":{\"headers\":{\"X-Secured-By\":\"APISIX\"}},\"jwt-auth\":{}}}'
       "
 
   portainer:
@@ -120,7 +118,7 @@ services:
     depends_on:
       - registry
     environment:
-      REGISTRY_URL: "http://registry:5000"
+      REGISTRY_URL: http://registry:5000
       DELETE_IMAGES: "true"
     ports:
       - "127.0.0.1:8082:80"
