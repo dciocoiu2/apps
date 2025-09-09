@@ -1,0 +1,122 @@
+Test Saddle: Kubernetes Lab Validation
+
+1. Portainer GUI
+   - Open: http://localhost:9000
+   - Expect: Login screen appears; Docker and K3s environments are listed
+   - Action: Deploy container from image nginx:latest
+     → Navigate to "Containers" > "Add container"
+     → Name: test-nginx
+     → Image: nginx:latest
+     → Publish port 8088:80
+     → Start and verify access at http://localhost:8088
+
+2. Kubernetes Dashboard
+   - Open: http://localhost:8001
+   - Expect: Dashboard loads; namespaces and pods are visible
+   - Action: Deploy sample app via manifest
+     → Use YAML Editor or kubectl to apply:
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: test-pod
+       spec:
+         containers:
+         - name: nginx
+           image: nginx
+     → Verify pod status is Running
+
+3. Helm Dashboard
+   - Open: http://localhost:8080
+   - Expect: Dashboard loads; Helm releases are listed
+   - Action: Install nginx chart
+     → Search for "nginx" in charts
+     → Install with default values
+     → Verify release appears and pod is created
+
+4. YAML Editor
+   - Open: http://localhost:8081
+   - Expect: Editor loads with syntax highlighting
+   - Action: Paste and validate a Kubernetes Deployment YAML
+     → Use sample nginx deployment
+     → Check for syntax errors and apply via kubectl
+
+5. Code IDE (Code-Server)
+   - Open: https://localhost:8443
+   - Expect: VS Code interface loads
+   - Action: Clone Git repo and run code
+     → Open terminal in IDE
+     → Run: git clone https://github.com/docker/getting-started
+     → Open a file and run: python3 hello.py or gcc hello.c
+
+6. GitLab CI/CD
+   - Open: http://localhost:8082
+   - Expect: GitLab login page appears
+   - Action: Create project and pipeline
+     → Create new project "test-ci"
+     → Add .gitlab-ci.yml:
+       stages:
+         - test
+       test_job:
+         script:
+           - echo "CI test passed"
+     → Commit and verify pipeline runs
+
+7. Vault Secrets Manager
+   - Open: http://localhost:8200
+   - Expect: Vault UI loads
+   - Action: Login with token "root"
+     → Create secret at path "secret/test"
+     → Key: password, Value: mypass123
+     → Retrieve and verify value
+
+8. Prometheus
+   - Open: http://localhost:9090
+   - Expect: Prometheus UI loads
+   - Action: Run query: up
+     → Verify node-exporter and prometheus targets are "up"
+
+9. Grafana
+   - Open: http://localhost:3001
+   - Expect: Login screen appears
+   - Action: Login (admin/admin), add Prometheus data source
+     → URL: http://localhost:9090
+     → Import dashboard ID 1860 (Node Exporter Full)
+     → Verify metrics display
+
+10. Node Exporter
+    - Open: http://localhost:9100/metrics
+    - Expect: Raw metrics appear
+    - Action: Confirm CPU, memory, and disk metrics are present
+
+11. Dozzle Log Viewer
+    - Open: http://localhost:8888
+    - Expect: Real-time logs appear
+    - Action: View logs for test-nginx container
+     → Confirm access logs show HTTP requests
+
+12. Kubebox Terminal
+    - Open: http://localhost:9091
+    - Expect: Terminal loads with cluster overview
+    - Action: Open shell into test-pod
+     → Navigate to Pods > test-pod > Shell
+     → Run: curl localhost inside pod
+
+13. Local Registry
+    - Open: http://localhost:5000/v2/_catalog
+    - Expect: JSON list of images
+    - Action: Tag and push image
+     → docker tag nginx localhost:5000/nginx
+     → docker push localhost:5000/nginx
+     → Verify image appears in catalog
+
+14. Welcome Homepage
+    - Open: http://localhost:3000
+    - Expect: List of all services with working links
+    - Action: Click each link and verify redirection
+
+15. Cleanup
+    - Run: docker compose down -v
+    - Expect: All containers and volumes removed
+    - Action: Confirm exported data (Git repos, Vault secrets) are preserved
+
+End of Test Saddle
