@@ -1,0 +1,124 @@
+services:
+  master:
+    image: ubuntu:22.04
+    container_name: kube-lab-master
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "8001:8001"
+      - "9000:9000"
+      - "5000:5000"
+      - "8080:8080"
+      - "8081:8081"
+      - "8443:8443"
+      - "8888:8888"
+      - "3000:3000"
+      - "9091:9091"
+      - "8082:8082"
+      - "8200:8200"
+      - "9090:9090"
+      - "3001:3000"
+      - "9100:9100"
+    networks:
+      - labnet
+    volumes:
+      - portainer_data:/data
+      - kubeconfig:/root/.kube
+      - gitlab_data:/var/opt/gitlab
+      - vault_data:/vault/file
+      - grafana_data:/grafana
+      - prometheus_data:/prometheus
+    command: >
+      bash -c "
+        apt-get update &&
+        apt-get install -y curl wget docker.io nodejs npm git build-essential python3 openjdk-11-jdk nginx unzip &&
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=--disable traefik --disable servicelb --docker sh - &&
+        mkdir -p /root/.kube &&
+        cp /etc/rancher/k3s/k3s.yaml /root/.kube/config &&
+        sed -i s/127.0.0.1/localhost/ /root/.kube/config &&
+        docker run -d -p 5000:5000 --name local-registry registry:2 &&
+        docker run -d -p 9000:9000 -v portainer_data:/data --name portainer portainer/portainer-ce &&
+        docker run -d -p 8888:8888 -v /var/run/docker.sock:/var/run/docker.sock --name dozzle amir20/dozzle &&
+        git clone https://github.com/komodorio/helm-dashboard.git /helm-dashboard &&
+        cd /helm-dashboard && npm install && npm run build && npm start &
+        git clone https://github.com/guifier/yaml-editor.git /yaml-editor &&
+        cd /yaml-editor && npm install && npm start -- --port 8081 &
+        curl -fsSL https://code-server.dev/install.sh | sh &&
+        code-server --bind-addr 0.0.0.0:8443 --auth none &
+        git clone https://github.com/astefanutti/kubebox.git /kubebox &&
+        cd /kubebox && npm install && PORT=9091 npm start &
+        docker run -d --name gitlab -p 8082:80 -v gitlab_data:/var/opt/gitlab \
+          -e GITLAB_OMNIBUS_CONFIG=external_url http://localhost:8082 \
+          gitlab/gitlab-ce:latest &&
+        docker run -d --name vault -p 8200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+          -v vault_data:/vault/file hashicorp/vault:latest &&
+        docker run -d --name node-exporter -p 9100:9100 --pid=host --net=host quay.io/prometheus/node-exporter:latest &&
+        mkdir -p /prometheus &&
+        echo global: > /prometheus/prometheus.yml &&
+        echo scrape_interval: 15s >> /prometheus/prometheus.yml &&
+        echo scrape_configs: >> /prometheus/prometheus.yml &&
+        echo - job_name: prometheus >> /prometheus/prometheus.yml &&
+        echo   static_configs: >> /prometheus/prometheus.yml &&
+        echo   - targets: [localhost:9090] >> /prometheus/prometheus.yml &&
+        echo - job_name: node-exporter >> /prometheus/prometheus.yml &&
+        echo   static_configs: >> /prometheus/prometheus.yml &&
+        echo   - targets: [localhost:9100] >> /prometheus/prometheus.yml &&
+        docker run -d --name prometheus -p 9090:9090 -v prometheus_data:/prometheus \
+          -v /prometheus/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus &&
+        mkdir -p /grafana/provisioning/dashboards &&
+        mkdir -p /grafana/dashboards &&
+        echo apiVersion: 1 > /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo providers: >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo - name: Default >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo   orgId: 1 >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo   type: file >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo   disableDeletion: false >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo   updateIntervalSeconds: 10 >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo   options: >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo     path: /var/lib/grafana/dashboards >> /grafana/provisioning/dashboards/dashboard.yaml &&
+        echo { > /grafana/dashboards/sample.json &&
+        echo dashboard: { >> /grafana/dashboards/sample.json &&
+        echo id: null, >> /grafana/dashboards/sample.json &&
+        echo title: Sample Dashboard, >> /grafana/dashboards/sample.json &&
+        echo panels: [], >> /grafana/dashboards/sample.json &&
+        echo schemaVersion: 16, >> /grafana/dashboards/sample.json &&
+        echo version: 1 >> /grafana/dashboards/sample.json &&
+        echo }, >> /grafana/dashboards/sample.json &&
+        echo overwrite: true >> /grafana/dashboards/sample.json &&
+        echo } >> /grafana/dashboards/sample.json &&
+        docker run -d --name grafana -p 3001:3000 \
+          -v grafana_data:/var/lib/grafana \
+          -v /grafana/provisioning:/etc/grafana/provisioning \
+          -v /grafana/dashboards:/var/lib/grafana/dashboards \
+          grafana/grafana &&
+        echo <html> > /var/www/html/index.html &&
+        echo <head><title>Welcome</title></head> >> /var/www/html/index.html &&
+        echo <body><h1>Kubernetes Lab Ready</h1><ul> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:9000>Portainer</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8001>Kubernetes Dashboard</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8080>Helm Dashboard</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8081>YAML Editor</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=https://localhost:8443>Code IDE</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8888>Log Viewer</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:9091>Kubebox Terminal</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8082>GitLab CI/CD</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:8200>Vault Secrets</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:9090>Prometheus</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:3001>Grafana</a></li> >> /var/www/html/index.html &&
+        echo <li><a href=http://localhost:5000>Registry</a></li> >> /var/www/html/index.html &&
+        echo </ul></body></html> >> /var/www/html/index.html &&
+        echo server { listen 3000; root /var/www/html; index index.html; } > /etc/nginx/sites-enabled/default &&
+        nginx -g daemon off
+      "
+
+volumes:
+  portainer_data:
+  kubeconfig:
+  gitlab_data:
+  vault_data:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  labnet:
+    driver: bridge
