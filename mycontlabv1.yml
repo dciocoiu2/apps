@@ -1,0 +1,88 @@
+services:
+  registry:
+    image: registry:2
+    container_name: local-registry
+    ports:
+      - "5000:5000"
+    networks:
+      - labnet
+    restart: unless-stopped
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - "9000:9000"
+    volumes:
+      - portainer_data:/data
+    networks:
+      - labnet
+    restart: unless-stopped
+
+  k3s-master:
+    image: rancher/k3s:v1.28.4-k3s1
+    container_name: k3s-master
+    privileged: true
+    environment:
+      - INSTALL_K3S_EXEC=--disable traefik --disable servicelb --docker
+    command: >
+      sh -c "
+        echo '
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: kubernetes-dashboard
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: kubernetes-dashboard
+          namespace: kubernetes-dashboard
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              k8s-app: kubernetes-dashboard
+          template:
+            metadata:
+              labels:
+                k8s-app: kubernetes-dashboard
+            spec:
+              containers:
+              - name: kubernetes-dashboard
+                image: kubernetesui/dashboard:v2.7.0
+                ports:
+                - containerPort: 8443
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: kubernetes-dashboard
+          namespace: kubernetes-dashboard
+        spec:
+          ports:
+          - port: 443
+            targetPort: 8443
+          selector:
+            k8s-app: kubernetes-dashboard
+        ' > /dashboard.yaml &&
+        k3s server &
+        sleep 10 &&
+        kubectl apply -f /dashboard.yaml &&
+        kubectl proxy --address=0.0.0.0 --port=8001 --accept-hosts='^localhost$'
+      "
+    ports:
+      - "6443:6443"
+      - "8001:8001"
+    networks:
+      - labnet
+    depends_on:
+      - registry
+    restart: unless-stopped
+
+volumes:
+  portainer_data:
+
+networks:
+  labnet:
+    driver: bridge
