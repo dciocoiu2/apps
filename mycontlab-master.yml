@@ -122,3 +122,31 @@ volumes:
 networks:
   labnet:
     driver: bridge
+
+echo '
+------------------------------------------------------------
+Kubernetes Lab Successfully Deployed
+------------------------------------------------------------
+Access your GUI tools at the following URLs:
+
+Portainer GUI           - http://localhost:9000
+Kubernetes Dashboard    - http://localhost:8001
+Helm Dashboard          - http://localhost:8080
+YAML Editor             - http://localhost:8081
+Code IDE with Git       - https://localhost:8443
+GitLab CI/CD            - http://localhost:8082
+Vault Secrets Manager   - http://localhost:8200
+Prometheus Metrics      - http://localhost:9090
+Grafana Dashboards      - http://localhost:3001
+Node Exporter Metrics   - http://localhost:9100/metrics
+Log Viewer              - http://localhost:8888
+Kubebox Terminal        - http://localhost:9091
+Local Registry          - http://localhost:5000
+Welcome Homepage        - http://localhost:3000
+
+To shut down and clean up:
+docker compose down -v
+
+All services are running inside a single container
+------------------------------------------------------------
+'
