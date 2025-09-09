@@ -4,15 +4,22 @@ services:
     container_name: kube-lab-master
     privileged: true
     ports:
-      - "${LAB_PORT}:80"
+      - "${LAB_PORT:-8080}:80"
     env_file:
       - lab.env
     networks:
       - labnet
     volumes:
       - nginx_config:/etc/nginx
+      - exports:/exports
     command: >
       bash -c "
+        # Create lab.env if missing
+        if [ ! -f lab.env ]; then
+          echo LAB_HOST=localhost > lab.env
+          echo LAB_PORT=8080 >> lab.env
+        fi
+
         apt-get update &&
         apt-get install -y curl wget docker.io nodejs npm git build-essential python3 openjdk-11-jdk nginx &&
         
@@ -24,7 +31,9 @@ services:
         docker run -d -p 9090:9090 --name prometheus prom/prometheus &&
         docker run -d -p 9100:9100 --name node-exporter quay.io/prometheus/node-exporter:latest &&
         docker run -d -p 8888:8888 -v /var/run/docker.sock:/var/run/docker.sock --name dozzle amir20/dozzle &&
-
+        docker run -d -p 9091:9091 --name kubebox -e KUBECONFIG=/root/.kube/config astefanutti/kubebox &&
+        docker run -d -p 5000:5000 --name registry registry:2 &&
+        
         # Inline NGINX config
         echo 'events {}' > /etc/nginx/nginx.conf &&
         echo 'http {' >> /etc/nginx/nginx.conf &&
@@ -37,14 +46,41 @@ services:
         echo '    location /prometheus/ { proxy_pass http://localhost:9090/; }' >> /etc/nginx/nginx.conf &&
         echo '    location /node-exporter/ { proxy_pass http://localhost:9100/; }' >> /etc/nginx/nginx.conf &&
         echo '    location /dozzle/ { proxy_pass http://localhost:8888/; }' >> /etc/nginx/nginx.conf &&
+        echo '    location /kubebox/ { proxy_pass http://localhost:9091/; }' >> /etc/nginx/nginx.conf &&
+        echo '    location /registry/ { proxy_pass http://localhost:5000/; }' >> /etc/nginx/nginx.conf &&
         echo '  }' >> /etc/nginx/nginx.conf &&
         echo '}' >> /etc/nginx/nginx.conf &&
 
-        nginx -g 'daemon off;'
+        nginx -g 'daemon off;' &
+
+        sleep 5 &&
+        echo '
+------------------------------------------------------------
+Kubernetes Lab Successfully Deployed
+------------------------------------------------------------
+Access your GUI tools at http://${LAB_HOST:-localhost}:${LAB_PORT:-8080}
+
+Endpoints:
+  /portainer/        - Portainer GUI
+  /grafana/          - Grafana Dashboards
+  /vault/            - Vault Secrets Manager
+  /gitlab/           - GitLab CI/CD
+  /prometheus/       - Prometheus Metrics
+  /node-exporter/    - Node Exporter Metrics
+  /dozzle/           - Log Viewer
+  /kubebox/          - Kubernetes Terminal
+  /registry/         - Local Docker Registry
+
+To shut down and clean up:
+  docker compose down -v
+
+------------------------------------------------------------
+'
       "
 
 volumes:
   nginx_config:
+  exports:
 
 networks:
   labnet:
