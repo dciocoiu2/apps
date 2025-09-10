@@ -1,5 +1,7 @@
-# clustlab-master.yml
+# contlab-master.yml
+# rev3final
 
+version: '3.8'
 
 services:
   loxilb:
@@ -8,7 +10,7 @@ services:
     privileged: true
     restart: unless-stopped
     ports:
-      - "127.0.0.1:11111:11111" # LoxiLB Web UI/API
+      - "127.0.0.1:11111:11111"
     networks:
       - llbnet
 
@@ -16,23 +18,73 @@ services:
     image: haproxy:2.9
     container_name: haproxy
     restart: unless-stopped
-    volumes:
-      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    command: >
+      sh -c "echo '
+        global
+          daemon
+          maxconn 256
+        defaults
+          mode http
+          timeout connect 5000ms
+          timeout client 50000ms
+          timeout server 50000ms
+        frontend http-in
+          bind *:80
+          default_backend servers
+        backend servers
+          server server1 httpbin:80 maxconn 32
+      ' > /usr/local/etc/haproxy/haproxy.cfg && haproxy -f /usr/local/etc/haproxy/haproxy.cfg"
     ports:
       - "127.0.0.1:80:80"
       - "127.0.0.1:443:443"
+    volumes:
+      - haproxy-config:/usr/local/etc/haproxy
     networks:
       - llbnet
       - default
 
-  haproxy-wi:
-    image: haproxy-wi/haproxy-wi:latest
-    container_name: haproxy-wi
+  custom-haproxy-ui:
+    image: node:18
+    container_name: custom-haproxy-ui
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8081:8080"
+    volumes:
+      - haproxy-config:/usr/local/etc/haproxy
     environment:
       - ADMIN_PASSWORD=admin
+    command: >
+      sh -c "mkdir -p /app && echo '
+        const express = require(\"express\");
+        const fs = require(\"fs\");
+        const app = express();
+        const configPath = \"/usr/local/etc/haproxy/haproxy.cfg\";
+        app.use(express.urlencoded({ extended: true }));
+        app.get(\"/\", (req, res) => {
+          let cfg = \"\";
+          try {
+            if (fs.existsSync(configPath)) {
+              cfg = fs.readFileSync(configPath, \"utf8\");
+            }
+          } catch (e) {}
+          res.send(
+            \"<h1>HAProxy-WI</h1>\" +
+            \"<form method=POST>\" +
+            \"<textarea name=config rows=20 cols=100>\" +
+            cfg.replace(/&/g, \"&amp;\").replace(/</g, \"&lt;\").replace(/>/g, \"&gt;\") +
+            \"</textarea><br>\" +
+            \"<button type=submit>Save</button>\" +
+            \"</form>\"
+          );
+        });
+        app.post(\"/\", (req, res) => {
+          try {
+            fs.writeFileSync(configPath, req.body.config || \"\");
+          } catch (e) {}
+          res.send(\"<p>Config updated. Restart HAProxy to apply changes.</p><a href='/'>&larr; Back</a>\");
+        });
+        app.listen(8080);
+      ' > /app/server.js && node /app/server.js"
+    ports:
+      - "127.0.0.1:8081:8080"
     networks:
       - default
 
@@ -40,23 +92,86 @@ services:
     image: envoyproxy/envoy:v1.30-latest
     container_name: envoy
     restart: unless-stopped
-    volumes:
-      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
-      - ./envoy/modules:/opt/wasm:ro
+    command: >
+      sh -c "echo '
+        static_resources:
+          listeners:
+            - name: listener_0
+              address:
+                socket_address: { address: 0.0.0.0, port_value: 10080 }
+              filter_chains:
+                - filters:
+                    - name: envoy.filters.network.http_connection_manager
+                      typed_config:
+                        \"@type\": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                        stat_prefix: ingress_http
+                        route_config:
+                          name: local_route
+                          virtual_hosts:
+                            - name: backend
+                              domains: [\"*\"]
+                              routes:
+                                - match: { prefix: \"/\" }
+                                  route: { cluster: httpbin }
+                        http_filters:
+                          - name: envoy.filters.http.router
+          clusters:
+            - name: httpbin
+              connect_timeout: 0.25s
+              type: LOGICAL_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: httpbin
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: httpbin
+                              port_value: 80
+        admin:
+          access_log_path: /tmp/admin_access.log
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 9901 }
+      ' > /etc/envoy/envoy.yaml && envoy -c /etc/envoy/envoy.yaml"
     expose:
       - "10080"
       - "10443"
     networks:
       - default
 
-  envoy-ui:
-    image: jmalloc/envoy-ui:latest
-    container_name: envoy-ui
+  custom-envoy-ui:
+    image: node:18
+    container_name: custom-envoy-ui
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8082:8080"
     environment:
       - ENVOY_ADMIN_API=http://envoy:9901
+    command: >
+      sh -c "mkdir -p /app && echo '
+        const express = require(\"express\");
+        const axios = require(\"axios\");
+        const app = express();
+        const API = process.env.ENVOY_ADMIN_API || \"http://envoy:9901\";
+        app.get(\"/\", async (req, res) => {
+          try {
+            const statsP = axios.get(API + \"/stats?format=json\");
+            const clustersP = axios.get(API + \"/clusters?format=json\");
+            const configP = axios.get(API + \"/config_dump\");
+            const [stats, clusters, config] = (await Promise.all([statsP, clustersP, configP])).map(r => r.data);
+            res.send(
+              \"<h1>Envoy Dashboard</h1>\" +
+              \"<h2>Stats</h2><pre>\" + JSON.stringify(stats, null, 2) + \"</pre>\" +
+              \"<h2>Clusters</h2><pre>\" + JSON.stringify(clusters, null, 2) + \"</pre>\" +
+              \"<h2>Config Dump</h2><pre>\" + JSON.stringify(config, null, 2) + \"</pre>\"
+            );
+          } catch (e) {
+            res.status(500).send(\"Error fetching data: \" + (e && e.message ? e.message : String(e)));
+          }
+        });
+        app.listen(8080);
+      ' > /app/server.js && node /app/server.js"
+    ports:
+      - "127.0.0.1:8082:8080"
     networks:
       - default
 
@@ -78,22 +193,27 @@ services:
     image: apache/apisix:3.9.0-debian
     container_name: apisix
     restart: unless-stopped
-    volumes:
-      - ./apisix/conf/config.yaml:/usr/local/apisix/conf/config.yaml:ro
-    networks:
-      - default
-
-  apisix-dashboard:
-    image: apache/apisix-dashboard:3.0.1
-    container_name: apisix-dashboard
-    restart: unless-stopped
+    command: >
+      sh -c "echo '
+        apisix:
+          node_listen: 9080
+          enable_admin: true
+          enable_admin_ui: true
+          admin_key:
+            - name: admin
+              key: edd1c9f034335f136f87ad84b625c8f1
+              role: admin
+        etcd:
+          host:
+            - \"http://etcd:2379\"
+      ' > /usr/local/apisix/conf/config.yaml && /docker-entrypoint.sh docker-start"
     ports:
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9180:9180" # Admin API + UI
     networks:
       - default
 
   httpbin:
-    image: mccutchen/go-httpbin:v2.12.1
+    image: kennethreitz/httpbin
     container_name: httpbin
     restart: unless-stopped
     networks:
@@ -101,6 +221,7 @@ services:
 
 volumes:
   etcd-data:
+  haproxy-config:
 
 networks:
   llbnet:
