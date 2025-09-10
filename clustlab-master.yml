@@ -1,8 +1,6 @@
 # contlab-master.yml
 # rev3final
 
-version: '3.8'
-
 services:
   loxilb:
     image: ghcr.io/loxilb-io/loxilb:latest
