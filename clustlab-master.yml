@@ -1,0 +1,107 @@
+# clustlab-master.yml
+
+
+services:
+  loxilb:
+    image: ghcr.io/loxilb-io/loxilb:latest
+    container_name: loxilb
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11111:11111" # LoxiLB Web UI/API
+    networks:
+      - llbnet
+
+  haproxy:
+    image: haproxy:2.9
+    container_name: haproxy
+    restart: unless-stopped
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    networks:
+      - llbnet
+      - default
+
+  haproxy-wi:
+    image: haproxy-wi/haproxy-wi:latest
+    container_name: haproxy-wi
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      - ADMIN_PASSWORD=admin
+    networks:
+      - default
+
+  envoy:
+    image: envoyproxy/envoy:v1.30-latest
+    container_name: envoy
+    restart: unless-stopped
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./envoy/modules:/opt/wasm:ro
+    expose:
+      - "10080"
+      - "10443"
+    networks:
+      - default
+
+  envoy-ui:
+    image: jmalloc/envoy-ui:latest
+    container_name: envoy-ui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8082:8080"
+    environment:
+      - ENVOY_ADMIN_API=http://envoy:9901
+    networks:
+      - default
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/etcd-data
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      - default
+
+  apisix:
+    image: apache/apisix:3.9.0-debian
+    container_name: apisix
+    restart: unless-stopped
+    volumes:
+      - ./apisix/conf/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+    networks:
+      - default
+
+  apisix-dashboard:
+    image: apache/apisix-dashboard:3.0.1
+    container_name: apisix-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+    networks:
+      - default
+
+  httpbin:
+    image: mccutchen/go-httpbin:v2.12.1
+    container_name: httpbin
+    restart: unless-stopped
+    networks:
+      - default
+
+volumes:
+  etcd-data:
+
+networks:
+  llbnet:
+    driver: bridge
