@@ -300,3 +300,81 @@ foreach ($file in $sourceFiles) {
 Write-Host ""
 Write-Host "Build complete. Executables saved to: $outDir"
 Write-Host "Run a device with: .\\netlab\\out\\router.exe --mode emulated"
+
+# Step 7: Launch devices in emulated mode (no LAN/WAN exposure)
+
+$labName   = "netlab"
+$outDir    = Join-Path $labName "out"
+$configDir = Join-Path $labName "configs"
+
+# Get all device executables
+$executables = Get-ChildItem -Path $outDir -Filter "*.exe"
+
+foreach ($exe in $executables) {
+  $deviceName = [System.IO.Path]::GetFileNameWithoutExtension($exe.Name)
+  $configPath = Join-Path $configDir "$deviceName.toml"
+
+  if (-not (Test-Path $configPath)) {
+    Write-Host "Skipping $deviceName: no config file found."
+    continue
+  }
+
+  # Launch in emulated mode with config
+  $cmd = "`"$($exe.FullName)`" --mode emulated"
+  Write-Host "Launching $deviceName in emulated mode..."
+  Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit", "-Command", $cmd
+}
+
+# Step 8: Simulate packet flow across all layers in-memory (no LAN/WAN)
+
+$labName    = "netlab"
+$includeDir = Join-Path $labName "include"
+$srcDir     = Join-Path $labName "src"
+
+# Load all source files into memory (simulation only)
+$layers = @(
+  @{ name='l2switch'; role='L2 Switch'; next='router'  },
+  @{ name='router';   role='L3 Router'; next='firewall'},
+  @{ name='firewall'; role='L4 Firewall'; next='session'},
+  @{ name='session';  role='L5 Session'; next='parser'},
+  @{ name='parser';   role='L6 Parser'; next='app'    },
+  @{ name='app';      role='L7 App';     next=''      }
+)
+
+# Simulated packet structure
+$packet = @{
+  src     = "host"
+  dst     = "l2switch"
+  payload = "GET /index"
+  trace   = @()
+}
+
+# Simulated device registry
+$devices = @{}
+
+# Register each device with a receive function
+foreach ($layer in $layers) {
+  $name = $layer.name
+  $next = $layer.next
+
+  $devices[$name] = {
+    param($pkt)
+    $pkt.trace += "$name received from $($pkt.src): $($pkt.payload)"
+    if ($next -ne "") {
+      $pkt.src = $name
+      $pkt.dst = $next
+      & $devices[$next] $pkt
+    } else {
+      $pkt.trace += "$name reached final layer"
+    }
+  }
+}
+
+# Start simulation
+Write-Host "Starting virtual packet flow simulation..."
+& $devices["l2switch"] $packet
+
+# Display trace log
+Write-Host "`nPacket Trace:"
+$packet.trace | ForEach-Object { Write-Host " - $_" }
+
