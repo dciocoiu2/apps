@@ -373,7 +373,6 @@ foreach ($layer in $layers) {
 # Start simulation
 Write-Host "Starting virtual packet flow simulation..."
 & $devices["l2switch"] $packet
-
 # Display trace log
 Write-Host "`nPacket Trace:"
 $packet.trace | ForEach-Object { Write-Host " - $_" }
