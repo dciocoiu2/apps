@@ -1,0 +1,25 @@
+# Step-by-step: Run modular networking lab in emulated mode
+
+# 1. Bootstrap the lab (generates all source files, headers, build harness)
+powershell -ExecutionPolicy Bypass -File .\bootstrap-netlab.ps1
+
+# 2. Build all device executables using the auto-downloaded TCC compiler
+powershell -ExecutionPolicy Bypass -File .\netlab\build.ps1
+
+# 3. Run each device in emulated mode with CLI and tracing enabled
+.\netlab\out\netlab-router.exe --name r1 --mode emulated --cli --trace
+.\netlab\out\netlab-router.exe --name r2 --mode emulated --cli --trace
+.\netlab\out\netlab-switch.exe --name s1 --mode emulated --cli --trace
+.\netlab\out\netlab-firewall.exe --name fw1 --mode emulated --cli --trace
+.\netlab\out\netlab-host.exe --name h1 --mode emulated --cli --trace
+.\netlab\out\netlab-host.exe --name h2 --mode emulated --cli --trace
+
+# 4. Inside each CLI shell, test functionality:
+#    router: show routes
+#    switch: show macs
+#    firewall: show rules
+#    host: ping, http
+
+# 5. To exit any device shell, type: exit
+
+# All devices run independently in virtual mode — no real networking required
