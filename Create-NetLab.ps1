@@ -270,3 +270,33 @@ Write-Host " 1. Compile devices with the downloaded compiler or your toolchain"
 Write-Host " 2. Run a device:   ./netlab-router.exe --mode emulated"
 Write-Host " 3. For realnet:    --mode realnet --iface tap0 (requires TUN/TAP)"
 Write-Host ""
+
+# Step 6: Compile all device source files using TCC (Windows only)
+
+$labName     = "netlab"
+$srcDir      = Join-Path $labName "src"
+$outDir      = Join-Path $labName "out"
+$includeDir  = Join-Path $labName "include"
+$binDir      = Join-Path $labName "bin"
+
+# Locate TCC executable
+$tccExe = Get-ChildItem -Path $binDir -Filter "tcc-win*.exe" | Select-Object -First 1
+if (-not $tccExe) {
+  Write-Host "TCC compiler not found in $binDir. Run Step 5 first."
+  return
+}
+
+# Compile each .c file in src/
+$sourceFiles = Get-ChildItem -Path $srcDir -Filter "*.c"
+foreach ($file in $sourceFiles) {
+  $name      = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+  $outputExe = Join-Path $outDir "$name.exe"
+  $cmd       = "`"$($tccExe.FullName)`" -I`"$includeDir`" -o `"$outputExe`" `"$($file.FullName)`""
+
+  Write-Host "Compiling $name.c -> $name.exe"
+  Invoke-Expression $cmd
+}
+
+Write-Host ""
+Write-Host "Build complete. Executables saved to: $outDir"
+Write-Host "Run a device with: .\\netlab\\out\\router.exe --mode emulated"
