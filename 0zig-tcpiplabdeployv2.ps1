@@ -18,15 +18,20 @@ function Write-ZigFile($path, $content) {
 Write-ZigFile "$root/build.zig" @'
 const std = @import("std");
 
-pub fn build(b: *std.build.Builder) void {
-    const mode = b.standardReleaseOptions();
-    const exe = b.addExecutable("stack", "src/main.zig");
-    exe.setBuildMode(mode);
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const exe = b.addExecutable(.{
+        .name = "stack",
+        .root_source_file = "src/main.zig",
+        .target = target,
+        .optimize = optimize,
+    });
     exe.install();
 }
 '@
 
-# main.zig
+# src/main.zig
 Write-ZigFile "$root/src/main.zig" @'
 const std = @import("std");
 const injectEchoPacket = @import("io/injector.zig").injectEchoPacket;
@@ -46,7 +51,7 @@ pub fn main() void {
 }
 '@
 
-# io/interface.zig
+# src/io/interface.zig
 Write-ZigFile "$root/src/io/interface.zig" @'
 const std = @import("std");
 
@@ -71,16 +76,15 @@ pub const NetInterface = struct {
 };
 '@
 
-# io/injector.zig
+# src/io/injector.zig
 Write-ZigFile "$root/src/io/injector.zig" @'
 const std = @import("std");
 
 pub fn injectEchoPacket(allocator: *std.mem.Allocator) []u8 {
     const packet = allocator.alloc(u8, 64) catch unreachable;
-    packet[0..6] = [_]u8{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
-    packet[6..12] = [_]u8{0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
-    packet[12] = 0x08;
-    packet[13] = 0x00;
+    packet[0..6] = [_]u8{0xaa,0xbb,0xcc,0xdd,0xee,0xff};
+    packet[6..12] = [_]u8{0x11,0x22,0x33,0x44,0x55,0x66};
+    packet[12] = 0x08; packet[13] = 0x00;
     packet[14..34] = [_]u8{
         0x45,0x00,0x00,0x30,0x00,0x00,0x40,0x00,
         0x40,0x06,0x00,0x00,10,0,0,1,10,0,0,2
@@ -95,7 +99,7 @@ pub fn injectEchoPacket(allocator: *std.mem.Allocator) []u8 {
 }
 '@
 
-# net/ethernet.zig
+# src/net/ethernet.zig
 Write-ZigFile "$root/src/net/ethernet.zig" @'
 const std = @import("std");
 
@@ -116,7 +120,7 @@ pub const EthernetFrame = struct {
 };
 '@
 
-# net/ipv4.zig
+# src/net/ipv4.zig
 Write-ZigFile "$root/src/net/ipv4.zig" @'
 const std = @import("std");
 
@@ -144,7 +148,7 @@ pub const IPv4Packet = struct {
 };
 '@
 
-# net/icmp.zig
+# src/net/icmp.zig
 Write-ZigFile "$root/src/net/icmp.zig" @'
 const std = @import("std");
 
@@ -169,7 +173,7 @@ pub const ICMPPacket = struct {
 };
 '@
 
-# net/tcp.zig
+# src/net/tcp.zig
 Write-ZigFile "$root/src/net/tcp.zig" @'
 const std = @import("std");
 
@@ -206,7 +210,7 @@ pub const TCPPacket = struct {
 };
 '@
 
-# net/metrics.zig
+# src/net/metrics.zig
 Write-ZigFile "$root/src/net/metrics.zig" @'
 const std = @import("std");
 
@@ -228,7 +232,7 @@ pub const ProtocolMetrics = struct {
 };
 '@
 
-# net/logger.zig
+# src/net/logger.zig
 Write-ZigFile "$root/src/net/logger.zig" @'
 const std = @import("std");
 
@@ -243,7 +247,7 @@ pub const Logger = struct {
 };
 '@
 
-# net/router.zig
+# src/net/router.zig
 Write-ZigFile "$root/src/net/router.zig" @'
 const std = @import("std");
 const EthernetFrame = @import("ethernet.zig").EthernetFrame;
@@ -275,7 +279,7 @@ pub fn dispatch(packet: []u8) void {
 }
 '@
 
-# plugins/echo_server.zig
+# src/plugins/echo_server.zig
 Write-ZigFile "$root/src/plugins/echo_server.zig" @'
 const std = @import("std");
 const TCPPacket = @import("../net/tcp.zig").TCPPacket;
@@ -289,7 +293,7 @@ pub const EchoServer = struct {
 };
 '@
 
-# plugins/config_loader.zig
+# src/plugins/config_loader.zig
 Write-ZigFile "$root/src/plugins/config_loader.zig" @'
 const std = @import("std");
 
@@ -315,11 +319,11 @@ fn echoHandler(buf: []u8) void {
     EchoServer.handle(packet);
     const end = std.time.nanoTimestamp();
     const elapsed = end - start;
-    std.debug.print("Plugin echo executed in {} ns\n", .{elapsed});
+    std.debug.print("Plugin echo executed in {d} ns\n", .{elapsed});
 }
 '@
 
-# test/fuzz.zig
+# src/test/fuzz.zig
 Write-ZigFile "$root/src/test/fuzz.zig" @'
 const std = @import("std");
 const dispatch = @import("../net/router.zig").dispatch;
@@ -343,4 +347,4 @@ pub fn fuzz(allocator: *std.mem.Allocator, iterations: usize) void {
 }
 '@
 
-Write-Host "TCP/IP lab deployed at $root with structured metrics, plugin profiling, injector, router, and fuzz harness"
+Write-Host "TCP/IP lab deployed at $root with corrected build.zig, structured metrics, plugin profiling, injector, router, and fuzz harness"
