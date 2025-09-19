@@ -1,230 +1,215 @@
+version: '3.9'
+
+networks:
+  labnet: {}
+
 services:
+
+  # ─────────────────────────────────────────────────────────────
+  # Traefik: Reverse proxy and dashboard
+  # ─────────────────────────────────────────────────────────────
   traefik:
     image: traefik:v2.10
     command:
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      - "--providers.docker=true"
-      - "--api.dashboard=true"
-      - "--log.level=INFO"
-      - "--certificatesresolvers.selfsigned.acme.tlschallenge=true"
-      - "--certificatesresolvers.selfsigned.acme.email=demo@example.com"
-      - "--certificatesresolvers.selfsigned.acme.storage=/acme.json"
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --api.insecure=true
     ports:
-      - "80:80"
-      - "443:443"
-      - "8080:8080"
+      - "80:80"      # Public HTTP entrypoint
+      - "8080:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - labnet
-    volumes:
-      - acme:/acme.json
     labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.demo.rule=Host(`demo.localhost`)"
-      - "traefik.http.routers.demo.entrypoints=web"
-      - "traefik.http.routers.demo-secure.rule=Host(`demo.localhost`)"
-      - "traefik.http.routers.demo-secure.entrypoints=websecure"
-      - "traefik.http.routers.demo-secure.tls.certresolver=selfsigned"
-      - "traefik.http.services.demo.loadbalancer.server.port=5000"
-    restart: unless-stopped
+      - traefik.enable=true
+      - traefik.http.routers.traefik.rule=Host(`localhost`) && PathPrefix(`/traefik`)
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.entrypoints=web
+      - traefik.http.middlewares.traefik-stripprefix.stripprefix.prefixes=/traefik
+      - traefik.http.routers.traefik.middlewares=traefik-stripprefix
 
+  # ─────────────────────────────────────────────────────────────
+  # demo-api: Flask app with Prometheus metrics
+  # ─────────────────────────────────────────────────────────────
+  demo-api:
+    image: python:3.11-slim
+    working_dir: /app
+    networks:
+      - labnet
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.demo.rule=Host(`localhost`) && PathPrefix(`/demo`)
+      - traefik.http.routers.demo.entrypoints=web
+      - traefik.http.services.demo.loadbalancer.server.port=5000
+      - traefik.http.middlewares.demo-stripprefix.stripprefix.prefixes=/demo
+      - traefik.http.routers.demo.middlewares=demo-stripprefix
+    entrypoint:
+      - sh
+      - -c
+      - |
+        pip install --index-url=https://pypi.org/simple \
+          --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+          flask prometheus_flask_exporter && \
+        cat > app.py <<'EOF'
+        from flask import Flask, jsonify
+        from prometheus_flask_exporter import PrometheusMetrics
+        import time, random
+        app = Flask(__name__)
+        metrics = PrometheusMetrics(app)
+        @app.route('/')
+        def index():
+            time.sleep(random.uniform(0.1, 0.5))
+            return jsonify(message='Hello from the demo API')
+        @app.route('/health')
+        def health():
+            return jsonify(status='ok')
+        if __name__ == '__main__':
+            app.run(host='0.0.0.0', port=5000)
+        EOF
+        python app.py
+
+  # ─────────────────────────────────────────────────────────────
+  # HAProxy: TCP proxy to demo-api
+  # ─────────────────────────────────────────────────────────────
   haproxy:
     image: haproxy:2.9
-    ports:
-      - "9000:9000"
     networks:
       - labnet
-    configs:
-      - source: haproxy_cfg
-        target: /usr/local/etc/haproxy/haproxy.cfg
-    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.haproxy.rule=Host(`localhost`) && PathPrefix(`/`)
+      - traefik.http.routers.haproxy.entrypoints=web
+      - traefik.http.services.haproxy.loadbalancer.server.port=9000
+      - traefik.http.middlewares.haproxy-stripprefix.stripprefix.prefixes=/
+      - traefik.http.routers.haproxy.middlewares=haproxy-stripprefix
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/haproxy.cfg <<'EOF'
+        global
+        defaults
+          mode tcp
+          timeout connect 5s
+          timeout client 30s
+          timeout server 30s
+        frontend ft_demo
+          bind *:9000
+          default_backend bk_demo
+        backend bk_demo
+          server demo-api demo-api:5000
+        EOF
+        haproxy -f /tmp/haproxy.cfg
 
-  demo-api:
-    build:
-      context: .
-      dockerfile: inline.Dockerfile.demoapi
-    configs:
-      - source: demoapi_py
-        target: /app/demoapi.py
-    networks:
-      - labnet
-    restart: unless-stopped
-
+  # ─────────────────────────────────────────────────────────────
+  # Locust: Load testing UI and client
+  # ─────────────────────────────────────────────────────────────
   locust:
-    image: locustio/locust
-    ports:
-      - "8089:8089"
-    configs:
-      - source: locustfile
-        target: /mnt/locust/locustfile.py
-    command: -f /mnt/locust/locustfile.py --host=http://demo-api:5000
+    image: python:3.11-slim
+    working_dir: /mnt/locust
     networks:
       - labnet
-    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=labnet
+      - traefik.http.routers.locust.rule=Host(`localhost`) && PathPrefix(`/locust`)
+      - traefik.http.routers.locust.entrypoints=web
+      - traefik.http.services.locust.loadbalancer.server.port=8089
+      - traefik.http.middlewares.locust-strip.stripprefix.prefixes=/locust
+      - traefik.http.routers.locust.middlewares=locust-strip
+    entrypoint:
+      - sh
+      - -c
+      - |
+        pip install --index-url=https://pypi.org/simple \
+          --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+          locust && \
+        cat > locustfile.py <<'EOF'
+        from locust import HttpUser, task, between
+        class DemoUser(HttpUser):
+            wait_time = between(1, 3)
+            @task
+            def hit_root(self):
+                self.client.get("/")
+            @task
+            def check_health(self):
+                self.client.get("/health")
+        EOF
+        locust -f locustfile.py --host=http://toxiproxy:5001
 
-  prometheus:
-    image: prom/prometheus
-    ports:
-      - "9090:9090"
-    configs:
-      - source: prometheus_cfg
-        target: /etc/prometheus/prometheus.yml
+  # ─────────────────────────────────────────────────────────────
+  # Toxiproxy: Network fault injection
+  # ─────────────────────────────────────────────────────────────
+  toxiproxy:
+    image: shopify/toxiproxy
     networks:
       - labnet
-    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=labnet
+      - traefik.http.routers.toxiproxy.rule=Host(`localhost`) && PathPrefix(`/toxiproxy`)
+      - traefik.http.routers.toxiproxy.entrypoints=web
+      - traefik.http.services.toxiproxy.loadbalancer.server.port=8474
+      - traefik.http.middlewares.toxiproxy-strip.stripprefix.prefixes=/toxiproxy
+      - traefik.http.middlewares.toxiproxy-ua.headers.customrequestheaders.User-Agent=
+      - traefik.http.routers.toxiproxy.middlewares=toxiproxy-strip,toxiproxy-ua
 
-  grafana:
-    image: grafana/grafana-oss
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    configs:
-      - source: grafana_datasource
-        target: /etc/grafana/provisioning/datasources/prometheus.yml
-      - source: grafana_dashboard
-        target: /etc/grafana/provisioning/dashboards/demo-dashboard.yml
-      - source: grafana_dashboard_json
-        target: /etc/grafana/provisioning/dashboards/demo.json
+  # ─────────────────────────────────────────────────────────────
+  # Toxiproxy Configurator: Inject latency and timeout
+  # ─────────────────────────────────────────────────────────────
+  toxiproxy-config:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      - toxiproxy
+      - demo-api
     networks:
       - labnet
-    restart: unless-stopped
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until curl -sf http://toxiproxy:8474/proxies >/dev/null; do sleep 0.5; done;
+        curl -sS -X POST http://toxiproxy:8474/proxies \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "name": "demo_api_proxy",
+            "listen": "0.0.0.0:5001",
+            "upstream": "demo-api:5000"
+          }' >/dev/null || true;
+        curl -sS -X POST http://toxiproxy:8474/proxies/demo_api_proxy/toxics \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "name": "latency",
+            "type": "latency",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": { "latency": 200, "jitter": 50 }
+          }' >/dev/null || true;
+        curl -sS -X POST http://toxiproxy:8474/proxies/demo_api_proxy/toxics \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "name": "timeout_10pct",
+            "type": "timeout",
+            "stream": "downstream",
+            "toxicity": 0.10,
+            "attributes": { "timeout": 5000 }
+          }' >/dev/null || true;
+        echo 'Toxiproxy configured.'
 
-  netem:
-    image: alpine
-    command: sh -c "apk add --no-cache iproute2 && tc qdisc add dev eth0 root netem loss 10%"
-    entrypoint: []
+  # ─────────────────────────────────────────────────────────────
+  # Endpoints: Service registry UI
+  # ─────────────────────────────────────────────────────────────
+  endpoints:
+    image: python:3.11-slim
+    working_dir: /srv
     networks:
       - labnet
-    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.endpoints.rule=Host(`localhost`) && PathPrefix(`/endpoints`)
+      - traefik.http.routers.endpoints.entrypoints=web
+      - traefik.http.services.endpoints.loadbalancer.server.port=[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/danuo/rocket/tree/10c7f2b015942910a8a3f66726af9f665aff37f0/start_render_agents.py?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "1")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/Odaimoko/TTDS2019-20/tree/f846c1e60bc4ab06f541f674619d4c72a617ea80/util.py?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "2")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/ngtaloc/TotNghiep-Project/tree/8b72be93496d37f227ac7d87d5aae25d5241d519/WebEng%2FWebEng%2FContent%2FTemplate%2Fplugins%2Fraphael%2Fraphael.js?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "3")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/bmilcs/dotfiles/tree/9fb34be2f084d60f4f39d8e0bf1bef48fddedf3e/bootstrap.sh?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "4")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/fernando-peres/MSI2019/tree/c554908ed0365c304ec75d7c4645872feb2e29b4/.history%2Fcode%2Fpreprocessing_20191117102941.py?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "5")
 
-  mtr:
-    image: alpine
-    command: sh -c "apk add --no-cache mtr && mtr -rw demo-api"
-    entrypoint: []
-    networks:
-      - labnet
-    restart: "no"
-
-configs:
-  haproxy_cfg:
-    inline: |
-      global
-        log stdout format raw local0
-      defaults
-        mode tcp
-        timeout connect 5s
-        timeout client 30s
-        timeout server 30s
-      frontend ft_demo
-        bind *:9000
-        default_backend bk_demo
-      backend bk_demo
-        server demo-api demo-api:5000
-
-  prometheus_cfg:
-    inline: |
-      global:
-        scrape_interval: 5s
-      scrape_configs:
-        - job_name: 'demo-api'
-          static_configs:
-            - targets: ['demo-api:5000']
-
-  grafana_datasource:
-    inline: |
-      apiVersion: 1
-      datasources:
-        - name: Prometheus
-          type: prometheus
-          access: proxy
-          url: http://prometheus:9090
-          isDefault: true
-
-  grafana_dashboard:
-    inline: |
-      apiVersion: 1
-      providers:
-        - name: 'default'
-          orgId: 1
-          folder: ''
-          type: file
-          disableDeletion: false
-          updateIntervalSeconds: 10
-          options:
-            path: /etc/grafana/provisioning/dashboards
-
-  grafana_dashboard_json:
-    inline: |
-      {
-        "id": null,
-        "title": "Demo API Metrics",
-        "panels": [
-          {
-            "type": "graph",
-            "title": "Request Rate",
-            "targets": [
-              {
-                "expr": "flask_http_request_total",
-                "legendFormat": "requests",
-                "refId": "A"
-              }
-            ],
-            "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 }
-          }
-        ],
-        "schemaVersion": 16,
-        "version": 1
-      }
-
-  locustfile:
-    inline: |
-      from locust import HttpUser, task, between
-
-      class DemoUser(HttpUser):
-          wait_time = between(1, 3)
-
-          @task
-          def hit_root(self):
-              self.client.get("/")
-
-          @task
-          def check_health(self):
-              self.client.get("/health")
-
-  demoapi_py:
-    inline: |
-      from flask import Flask, jsonify
-      from prometheus_flask_exporter import PrometheusMetrics
-      import time, random
-
-      app = Flask(__name__)
-      metrics = PrometheusMetrics(app)
-
-      @app.route("/")
-      def index():
-          time.sleep(random.uniform(0.1, 0.5))  # Simulated latency
-          return jsonify(message="Hello from the demo API!")
-
-      @app.route("/health")
-      def health():
-          return jsonify(status="ok")
-
-      if __name__ == "__main__":
-          app.run(host="0.0.0.0", port=5000)
-
-x-bake:
-  files:
-    inline.Dockerfile.demoapi: |
-      FROM python:3.11-slim
-      WORKDIR /app
-      COPY demoapi.py .
-      RUN pip install flask prometheus_flask_exporter
-      CMD ["python", "demoapi.py"]
-
-volumes:
-  acme:
-
-networks:
-  labnet:
-    driver: bridge
