@@ -9,7 +9,7 @@ $reqFile = "$projectRoot\requirements.txt"
 Write-Host "Creating project directory..."
 New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null
 
-Write-Host "📝 Writing requirements.txt..."
+Write-Host "Writing requirements.txt..."
 @"
 fastapi
 uvicorn
@@ -18,6 +18,7 @@ numpy
 pydantic
 sqlalchemy
 duckdb
+duckdb-engine
 "@ | Set-Content -Path $reqFile
 
 Write-Host "Writing sql_server.py..."
