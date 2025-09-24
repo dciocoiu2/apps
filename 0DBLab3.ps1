@@ -28,7 +28,7 @@ def get_engine():
     return create_engine('duckdb:///:memory:')
 "@ | Set-Content -Path $sqlFile
 
-Write-Host "Writing app.py..."
+Write-Host " Writing app.py..."
 @"
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -91,67 +91,126 @@ def user_stats():
     return df.describe().to_dict()
 "@ | Set-Content -Path $appFile
 
-Write-Host "Writing lab_manual.md..."
+Write-Host " Writing lab_manual.md..."
 @"
-#FastAPI + DuckDB API Lab Manual
+#  FastAPI + DuckDB API Lab Manual
 
-##Setup Instructions
+This lab provides a reproducible, OS-agnostic API environment for onboarding, testing, and plugin validation.
 
-\`\`\`bash
+---
+
+## Setup Instructions
+
+###  Windows
+
+\`\`\`powershell
 cd fastapi_duckdb_app
 python -m venv venv
-.\venv\Scripts\Activate.ps1   # Windows
-# Or: source venv/bin/activate  # macOS/Linux
-
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 \`\`\`
 
-##Run the API Lab
+### 🐧 Linux / macOS
+
+\`\`\`bash
+cd fastapi_duckdb_app
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+\`\`\`
+
+---
+
+##  Run the API Lab
 
 \`\`\`bash
 uvicorn app:app --reload
 \`\`\`
 
-##Test Endpoints
+Access the lab at: http://127.0.0.1:8000
 
-### Create a User
+---
+
+##  Test Endpoints
+
+###  Windows (PowerShell)
+
+#### Create a User
+
+\`\`\`powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/users/" `
+  -Method POST `
+  -Body '{"name":"Alice","email":"alice@example.com"}' `
+  -ContentType "application/json"
+\`\`\`
+
+#### Get a User
+
+\`\`\`powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/users/1" -Method GET
+\`\`\`
+
+#### Get Synthetic Stats
+
+\`\`\`powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/stats/" -Method GET
+\`\`\`
+
+---
+
+###  Linux / macOS (curl)
+
+#### Create a User
 
 \`\`\`bash
 curl -X POST http://127.0.0.1:8000/users/ \
 -H "Content-Type: application/json" \
--d '{\"name\":\"Alice\",\"email\":\"alice@example.com\"}'
+-d '{"name":"Alice","email":"alice@example.com"}'
 \`\`\`
 
-### Get a User
+#### Get a User
 
 \`\`\`bash
 curl http://127.0.0.1:8000/users/1
 \`\`\`
 
-### Get Synthetic Stats
+#### Get Synthetic Stats
 
 \`\`\`bash
 curl http://127.0.0.1:8000/stats/
 \`\`\`
 
+---
+
+###  GUI Option: Postman or Insomnia
+
+- Import OpenAPI spec from: http://127.0.0.1:8000/openapi.json
+- Use visual interface to test endpoints
+- Ideal for onboarding non-terminal users
+
+---
+
 ## Extend the Lab
 
 - Swap DuckDB for SQLite/PostgreSQL for integration testing
 - Add role-based access or escalation paths
-- Use FastAPI’s OpenAPI docs at http://127.0.0.1:8000/docs
+- Use FastAPI’s OpenAPI docs at: http://127.0.0.1:8000/docs
 
-## Safety Notes
+---
+
+##  Safety Notes
 
 - DuckDB runs in-memory; no persistent writes
 - No external services or hardware dependencies
 - Ideal for onboarding, regression testing, and plugin validation
 "@ | Set-Content -Path $manualFile
 
-Write-Host "Lab scaffolded in '$projectRoot'."
+Write-Host " Lab scaffolded in '$projectRoot'."
 Write-Host "Onboarding manual: lab_manual.md"
-Write-Host "`nTo get started:"
+Write-Host "To get started:"
 Write-Host "    cd $projectRoot"
 Write-Host "    python -m venv venv"
-Write-Host "    .\\venv\\Scripts\\Activate.ps1"
+Write-Host "    .\\venv\\Scripts\\Activate.ps1   # Windows"
+Write-Host "    source venv/bin/activate         # Linux/macOS"
 Write-Host "    pip install -r requirements.txt"
 Write-Host "    uvicorn app:app --reload"
