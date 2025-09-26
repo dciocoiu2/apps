@@ -1,5 +1,3 @@
-#0mqlabv2.ps1
-#9262025
 $folders = @("app", "rabbitmq")
 foreach ($folder in $folders) {
     if (-not (Test-Path $folder)) {
@@ -69,6 +67,10 @@ Set-Content -Path "app\main.py" -Value $appCode -Encoding UTF8
 
 $rabbitConf = @'
 loopback_users.guest = false
+
+cluster_formation.peer_discovery_backend = classic
+cluster_formation.classic_config.nodes.1 = rabbit@rabbitmq2
+cluster_formation.classic_config.nodes.2 = rabbit@rabbitmq3
 
 shovel.source_to_dest.source.uri = amqp://rabbitmq1
 shovel.source_to_dest.source.queue = source-queue
@@ -214,5 +216,4 @@ Write-Host 'Invoke-RestMethod -Uri "http://localhost:8000/shovel" -Headers @{ Au
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/source-queue" -Method PUT -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body "{}"'
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/dest-queue" -Method PUT -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body "{}"'
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/exchanges/%2F/amq.default/publish" -Method POST -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body ''{ "routing_key": "source-queue", "payload": "Hello from PowerShell", "payload_encoding": "string" }'''
-Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/dest-queue/get" -Method POST -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body ''{ "count": 1, "ackmode": "ack_requeue_false", "encoding": "auto", "truncate": 500 }'''
-Write-Host "Stop lab with docker-compose down -v"
+Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/dest-queue/get" -Method POST -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json"
