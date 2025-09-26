@@ -6,7 +6,7 @@ foreach ($folder in $folders) {
 }
 
 $appCode = @'
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -61,19 +61,16 @@ def mongo_test():
 
 @app.post("/publish", dependencies=[Depends(require_role("admin"))])
 def publish_message(msg: Message):
-    try:
-        res = requests.post(
-            "http://rabbitmq1:15672/api/exchanges/%2F/amq.default/publish",
-            auth=("guest", "guest"),
-            json={
-                "routing_key": msg.routing_key,
-                "payload": msg.payload,
-                "payload_encoding": "string"
-            }
-        )
-        return res.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    res = requests.post(
+        "http://rabbitmq1:15672/api/exchanges/%2F/amq.default/publish",
+        auth=("guest", "guest"),
+        json={
+            "routing_key": msg.routing_key,
+            "payload": msg.payload,
+            "payload_encoding": "string"
+        }
+    )
+    return res.json()
 '@
 Set-Content -Path "app\main.py" -Value $appCode -Encoding UTF8
 
@@ -86,6 +83,7 @@ cluster_formation.classic_config.nodes.2 = rabbit@rabbitmq3
 Set-Content -Path "rabbitmq\rabbitmq.conf" -Value $rabbitConf -Encoding UTF8
 
 $compose = @'
+version: "3.9"
 
 services:
   rabbitmq1:
@@ -100,6 +98,9 @@ services:
       RABBITMQ_NODENAME: rabbit@rabbitmq1
     volumes:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+    depends_on:
+      - rabbitmq2
+      - rabbitmq3
     networks:
       - labnet
 
@@ -185,15 +186,15 @@ services:
     image: tiangolo/uvicorn-gunicorn-fastapi:python3.11
     container_name: api
     ports:
-      - "8000:80"
+      - "8080:80"
     volumes:
       - ./app:/app
-    networks:
-      - labnet
     depends_on:
       - redis
       - rabbitmq1
       - mongo1
+    networks:
+      - labnet
 
 networks:
   labnet:
@@ -204,10 +205,10 @@ Set-Content -Path "docker-compose.yml" -Value $compose -Encoding UTF8
 Write-Host "Lab scaffold created"
 Write-Host "Start lab with docker-compose up -d"
 Write-Host "Windows PowerShell test commands:"
-Write-Host 'Invoke-RestMethod -Uri "http://localhost:8000"'
-Write-Host 'Invoke-RestMethod -Uri "http://localhost:8000/cache" -Headers @{ Authorization = "Bearer usertoken" }'
-Write-Host 'Invoke-RestMethod -Uri "http://localhost:8000/mongo" -Headers @{ Authorization = "Bearer admintoken" }'
-Write-Host 'Invoke-RestMethod -Uri "http://localhost:8000/publish" -Method POST -Headers @{ Authorization = "Bearer admintoken" } -Body @{ routing_key = "test-queue"; payload = "Hello from FastAPI" } | ConvertTo-Json -Depth 3'
+Write-Host 'Invoke-RestMethod -Uri "http://localhost:8080"'
+Write-Host 'Invoke-RestMethod -Uri "http://localhost:8080/cache" -Headers @{ Authorization = "Bearer usertoken" }'
+Write-Host 'Invoke-RestMethod -Uri "http://localhost:8080/mongo" -Headers @{ Authorization = "Bearer admintoken" }'
+Write-Host 'Invoke-RestMethod -Uri "http://localhost:8080/publish" -Method POST -Headers @{ Authorization = "Bearer admintoken" } -Body @{ routing_key = "test-queue"; payload = "Hello from FastAPI" } | ConvertTo-Json -Depth 3'
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/test-queue" -Method PUT -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body "{}"'
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/exchanges/%2F/amq.default/publish" -Method POST -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body ''{ "routing_key": "test-queue", "payload": "Hello from PowerShell", "payload_encoding": "string" }'''
 Write-Host 'Invoke-RestMethod -Uri "http://localhost:15672/api/queues/%2F/test-queue/get" -Method POST -Headers @{ Authorization = "Basic Z3Vlc3Q6Z3Vlc3Q=" } -ContentType "application/json" -Body ''{ "count": 1, "ackmode": "ack_requeue_false", "encoding": "auto", "truncate": 500 }'''
