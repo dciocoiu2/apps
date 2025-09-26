@@ -48,7 +48,7 @@ def read_root():
 
 @app.get("/cache", dependencies=[Depends(require_role("user"))])
 def cache_test():
-    r = redis.Redis(host="redis", port=6379)
+    r = redis.Redis(host="redis-cluster", port=6379)
     r.set("lab", "ready")
     return {"cache": r.get("lab").decode()}
 
@@ -62,7 +62,7 @@ def mongo_test():
 @app.post("/publish", dependencies=[Depends(require_role("admin"))])
 def publish_message(msg: Message):
     res = requests.post(
-        "http://rabbitmq1:15672/api/exchanges/%2F/amq.default/publish",
+        "http://rabbitmq:15672/api/exchanges/%2F/amq.default/publish",
         auth=("guest", "guest"),
         json={
             "routing_key": msg.routing_key,
@@ -76,9 +76,6 @@ Set-Content -Path "app\main.py" -Value $appCode -Encoding UTF8
 
 $rabbitConf = @'
 loopback_users.guest = false
-cluster_formation.peer_discovery_backend = classic
-cluster_formation.classic_config.nodes.1 = rabbit@rabbitmq2
-cluster_formation.classic_config.nodes.2 = rabbit@rabbitmq3
 '@
 Set-Content -Path "rabbitmq\rabbitmq.conf" -Value $rabbitConf -Encoding UTF8
 
@@ -86,49 +83,54 @@ $compose = @'
 version: "3.9"
 
 services:
-  rabbitmq1:
+  rabbitmq:
     image: rabbitmq:3-management
-    hostname: rabbitmq1
-    container_name: rabbitmq1
+    hostname: rabbitmq
+    container_name: rabbitmq
     ports:
       - "15672:15672"
       - "5672:5672"
     environment:
       RABBITMQ_ERLANG_COOKIE: "secretcookie"
-      RABBITMQ_NODENAME: rabbit@rabbitmq1
+      RABBITMQ_NODENAME: rabbit@rabbitmq
     volumes:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
-    depends_on:
-      - rabbitmq2
-      - rabbitmq3
     networks:
       - labnet
 
-  rabbitmq2:
-    image: rabbitmq:3-management
-    hostname: rabbitmq2
-    container_name: rabbitmq2
-    environment:
-      RABBITMQ_ERLANG_COOKIE: "secretcookie"
-      RABBITMQ_NODENAME: rabbit@rabbitmq2
-    networks:
-      - labnet
-
-  rabbitmq3:
-    image: rabbitmq:3-management
-    hostname: rabbitmq3
-    container_name: rabbitmq3
-    environment:
-      RABBITMQ_ERLANG_COOKIE: "secretcookie"
-      RABBITMQ_NODENAME: rabbit@rabbitmq3
-    networks:
-      - labnet
-
-  redis:
+  redis1:
     image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
+    container_name: redis1
+    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - labnet
+
+  redis2:
+    image: redis:7-alpine
+    container_name: redis2
+    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - labnet
+
+  redis3:
+    image: redis:7-alpine
+    container_name: redis3
+    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - labnet
+
+  redis-init:
+    image: redis:7-alpine
+    container_name: redis-init
+    depends_on:
+      - redis1
+      - redis2
+      - redis3
+    entrypoint: >
+      sh -c "
+      sleep 5;
+      echo yes | redis-cli --cluster create redis1:6379 redis2:6379 redis3:6379 --cluster-replicas 0
+      "
     networks:
       - labnet
 
@@ -190,8 +192,8 @@ services:
     volumes:
       - ./app:/app
     depends_on:
-      - redis
-      - rabbitmq1
+      - redis-init
+      - rabbitmq
       - mongo1
     networks:
       - labnet
