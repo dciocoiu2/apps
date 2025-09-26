@@ -87,6 +87,8 @@ shovel.dynamic_shovel.destination.exchange_key = info.forwarded
 Set-Content -Path "rabbitmq\rabbitmq.conf" -Value $rabbitConf -Encoding UTF8
 
 $compose = @'
+version: "3.9"
+
 services:
   rabbitmq1:
     image: rabbitmq:3-management
