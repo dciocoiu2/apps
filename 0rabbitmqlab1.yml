@@ -1,0 +1,82 @@
+# rabbitmqLab1.yml
+# docker-compose -f rabbitmqLab1.yml up -d
+services:
+  rabbit1:
+    image: rabbitmq:4.1.4-management
+    hostname: rabbit1
+    container_name: rabbit1
+    environment:
+      RABBITMQ_ERLANG_COOKIE: 'secretcookie'
+      RABBITMQ_NODENAME: rabbit@rabbit1
+    ports:
+      - "25674:15672"  # Management UI
+      - "35674:5672"   # AMQP
+      - "5552:5552"    # Stream
+    volumes:
+      - type: tmpfs
+        target: /var/lib/rabbitmq
+    networks:
+      - rabbitnet
+    command: >
+      bash -c "
+        rabbitmq-plugins enable --offline rabbitmq_federation rabbitmq_federation_management rabbitmq_shovel rabbitmq_shovel_management &&
+        rabbitmq-server &
+        sleep 10 &&
+        rabbitmqctl add_vhost /main &&
+        rabbitmqctl set_permissions -p /main guest '.*' '.*' '.*' &&
+        rabbitmqadmin -V /main declare exchange name=dlx type=direct durable=true &&
+        rabbitmqadmin -V /main declare queue name=dlq durable=true &&
+        rabbitmqadmin -V /main declare binding source=dlx destination=dlq routing_key=dlq &&
+        rabbitmqadmin -V /main declare queue name=classic.queue durable=true &&
+        rabbitmqadmin -V /main declare queue name=quorum.queue durable=true arguments='{
+          \"x-queue-type\":\"quorum\",
+          \"x-dead-letter-exchange\":\"dlx\",
+          \"x-dead-letter-routing-key\":\"dlq\"
+        }' &&
+        rabbitmqadmin -V /main publish routing_key=classic.queue payload='Classic queue test' &&
+        rabbitmqadmin -V /main publish routing_key=quorum.queue payload='Quorum queue test' properties='{\"expiration\":\"1000\"}' &&
+        wait
+      "
+  rabbit2:
+    image: rabbitmq:4.1.4-management
+    hostname: rabbit2
+    container_name: rabbit2
+    environment:
+      RABBITMQ_ERLANG_COOKIE: 'secretcookie'
+      RABBITMQ_NODENAME: rabbit@rabbit2
+    ports:
+      - "25675:15672"
+      - "35675:5672"
+      - "5553:5552"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/rabbitmq
+    networks:
+      - rabbitnet
+    depends_on:
+      - rabbit1
+    command: >
+      bash -c "
+        rabbitmq-plugins enable --offline rabbitmq_federation rabbitmq_federation_management rabbitmq_shovel rabbitmq_shovel_management &&
+        rabbitmq-server &
+        sleep 10 &&
+        rabbitmqctl stop_app &&
+        rabbitmqctl join_cluster rabbit@rabbit1 &&
+        rabbitmqctl start_app &&
+        rabbitmqctl add_vhost /main &&
+        rabbitmqctl set_permissions -p /main guest '.*' '.*' '.*' &&
+        rabbitmqctl set_parameter -p /main federation-upstream rabbit1-upstream '{\"uri\":\"amqp://guest:guest@rabbit1:5672/main\"}' &&
+        rabbitmqctl set_policy -p /main --apply-to queues classic-federation '^classic\\.queue$' '{\"federation-upstream\":\"rabbit1-upstream\"}' &&
+        rabbitmqadmin -V /main declare queue name=dlq durable=true &&
+        rabbitmqctl set_parameter -p /main shovel quorum-shovel '{
+          \"src-uri\": \"amqp://guest:guest@rabbit1:5672/main\",
+          \"src-queue\": \"quorum.queue\",
+          \"dest-uri\": \"amqp://guest:guest@rabbit2:5672/main\",
+          \"dest-queue\": \"dlq\"
+        }' &&
+        wait
+      "
+
+networks:
+  rabbitnet:
+    driver: bridge
