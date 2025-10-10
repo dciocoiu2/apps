@@ -1,0 +1,133 @@
+version: '3.8'
+services:
+master:
+  image: rancher/k3s:v1.29.0-k3s1
+  privileged: true
+  environment:
+    - K3S_KUBECONFIG_OUTPUT=/output/kubeconfig.yaml
+    - K3S_KUBECONFIG_MODE=644
+  command: server --disable traefik
+  volumes:
+    - /var/lib/rancher/k3s
+    - /var/lib/kubelet
+    - /etc/kubernetes
+    - /output
+  ports:
+    - "6443:6443"
+    - "8080:8080"
+    - "9090:9090"
+    - "6379:6379"
+    - "3306:3306"
+    - "27017:27017"
+    - "9092:9092"
+    - "2181:2181"
+    - "8001:8001"
+    - "8081:8081"
+    - "8082:8082"
+    - "8083:8083"
+    - "7000-7100:7000-7100"
+  networks: [internal]
+
+redis:
+  image: redis:7.2-alpine
+  command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+  restart: always
+  networks: [internal]
+
+zookeeper:
+  image: confluentinc/cp-zookeeper:7.5.0
+  environment:
+    ZOOKEEPER_CLIENT_PORT: "2181"
+    ZOOKEEPER_TICK_TIME: "2000"
+  restart: always
+  networks: [internal]
+
+kafka:
+  image: confluentinc/cp-kafka:7.5.0
+  environment:
+    KAFKA_BROKER_ID: "1"
+    KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+    KAFKA_LISTENERS: "PLAINTEXT://:9092"
+    KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+  restart: always
+  networks: [internal]
+
+mongodb:
+  image: mongo:6.0
+  restart: always
+  networks: [internal]
+
+mariadb:
+  image: mariadb:11.3
+  environment:
+    MYSQL_ROOT_PASSWORD: rootpass
+    MYSQL_DATABASE: appdb
+    MYSQL_USER: appuser
+    MYSQL_PASSWORD: apppass
+  restart: always
+  networks: [internal]
+
+kafka-ui:
+  image: obsidiandynamics/kafdrop
+  environment:
+    KAFKA_BROKERCONNECT: "kafka:9092"
+    SERVER_PORT: "8081"
+  ports:
+    - "8081:8081"
+  restart: always
+  networks: [internal]
+
+mongo-express:
+  image: mongo-express:1.0.0-alpha
+  environment:
+    ME_CONFIG_MONGODB_SERVER: mongodb
+    ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+    ME_CONFIG_BASICAUTH_USERNAME: admin
+    ME_CONFIG_BASICAUTH_PASSWORD: admin
+  ports:
+    - "8082:8082"
+  restart: always
+  networks: [internal]
+
+adminer:
+  image: adminer:latest
+  ports:
+    - "8083:8083"
+  restart: always
+  networks: [internal]
+
+dashboard:
+  image: kubernetesui/dashboard:v2.7.0
+  ports:
+    - "8001:8001"
+  restart: always
+  networks: [internal]
+
+app:
+  image: node:20-alpine
+  working_dir: /app
+  command: sh -c "
+    apk add --no-cache curl bash python3 make g++ &&
+    echo '{\"name\":\"tf12-app\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"dependencies\":{\"express\":\"^4.18.2\",\"redis\":\"^4.6.7\",\"kafkajs\":\"^2.2.4\",\"mongodb\":\"^5.8.0\",\"mysql2\":\"^3.3.2\"}}' > /app/package.json &&
+    echo 'const express=require(\"express\");const {createClient}=require(\"redis\");const {Kafka}=require(\"kafkajs\");const {MongoClient}=require(\"mongodb\");const mysql=require(\"mysql2/promise\");const app=express();const port=8080;(async()=>{const redisClient=createClient({url:process.env.REDIS_URL});await redisClient.connect();const kafka=new Kafka({brokers:[process.env.KAFKA_BROKER]});const producer=kafka.producer();await producer.connect();const mongoClient=new MongoClient(process.env.MONGO_URL);await mongoClient.connect();const mongoDb=mongoClient.db();const mysqlConn=await mysql.createConnection({host:process.env.MYSQL_HOST,user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,database:process.env.MYSQL_DB});await mysqlConn.execute(\"CREATE TABLE IF NOT EXISTS test_table(id INT AUTO_INCREMENT PRIMARY KEY,msg VARCHAR(255))\");app.get(\"/\",async(req,res)=>{await redisClient.set(\"hello\",\"world\");await producer.send({topic:\"test\",messages.env.MYSQL_PASSWORD,database:process.env.MYSQL_DB});await mysqlConn.execute(\"CREATE TABLE IF NOT EXISTS test_table(id INT AUTO_INCREMENT PRIMARY KEY,msg VARCHAR(255))\");app.get(\"/\",async(req,res)=>{await redisClient.set(\"hello\",\"world\");await producer.send({topic:\"test\",messages:[{value:\"hello kafka\"}]});await mongoDb.collection(\"test\").insertOne({msg:\"hello mongo\",ts:new Date()});await mysqlConn.execute(\"INSERT INTO test_table(msg) VALUES(?)\",[\"hello mariadb\"]);res.send(\"12-factor app connected to Redis,Kafka,MongoDB,MariaDB\")});app.get(\"/health\",async(req,res)=>res.json({ok:true}));app.listen(port,()=>console.log(\"app listening\"))})();' > /app/index.js &&
+    npm install --no-audit --no-fund &&
+    node index.js
+  "
+  environment:
+    REDIS_URL: redis://redis:6379
+    KAFKA_BROKER: kafka:9092
+    MONGO_URL: mongodb://mongodb:27017/appdb
+    MYSQL_HOST: mariadb
+    MYSQL_USER: appuser
+    MYSQL_PASSWORD: apppass
+    MYSQL_DB: appdb
+  ports:
+    - "8080:8080"
+  tmpfs:
+    /app:rw,size=65536
+  networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
