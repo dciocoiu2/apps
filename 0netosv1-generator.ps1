@@ -1247,5 +1247,176 @@ impl WindowsPlumbing {
 "@
 
 Write-Host "Batch 8/11 complete: Plumbing subsystem created under $Root/src/plumbing"
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/mgmt/mod.rs
+W "$Root/src/mgmt/mod.rs" @"
+pub mod cfg_store;
+pub mod validator;
+pub mod rbac;
+pub mod audit;
+pub mod observability;
+
+pub use cfg_store::ConfigStore;
+pub use validator::Validator;
+pub use rbac::{Role, Rbac};
+pub use audit::AuditLog;
+pub use observability::Observability;
+"@
+
+# src/mgmt/cfg_store.rs
+W "$Root/src/mgmt/cfg_store.rs" @"
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    staged: HashMap<String, String>,
+    running: HashMap<String, String>,
+}
+
+impl ConfigStore {
+    pub fn new() -> Self {
+        Self { staged: HashMap::new(), running: HashMap::new() }
+    }
+
+    pub fn stage(&mut self, key: &str, value: &str) {
+        self.staged.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn commit(&mut self) {
+        self.running = self.staged.clone();
+        self.staged.clear();
+    }
+
+    pub fn rollback(&mut self) {
+        self.staged.clear();
+    }
+
+    pub fn diff(&self) -> Vec<(String, String)> {
+        self.staged.iter().map(|(k,v)| (k.clone(), v.clone())).collect()
+    }
+}
+"@
+
+# src/mgmt/validator.rs
+W "$Root/src/mgmt/validator.rs" @"
+#[derive(Default)]
+pub struct Validator {}
+
+impl Validator {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn validate(&self, key: &str, value: &str) -> bool {
+        println!(\"[Validator] Validating {} = {}\", key, value);
+        true
+    }
+}
+"@
+
+# src/mgmt/rbac.rs
+W "$Root/src/mgmt/rbac.rs" @"
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Role {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+pub struct Rbac {
+    pub role: Role,
+}
+
+impl Rbac {
+    pub fn new(role: Role) -> Self {
+        Self { role }
+    }
+
+    pub fn can_apply(&self) -> bool {
+        matches!(self.role, Role::Admin | Role::Operator)
+    }
+
+    pub fn can_view(&self) -> bool {
+        true
+    }
+}
+"@
+
+# src/mgmt/audit.rs
+W "$Root/src/mgmt/audit.rs" @"
+use chrono::Utc;
+
+#[derive(Debug)]
+pub struct AuditEntry {
+    pub timestamp: String,
+    pub user: String,
+    pub action: String,
+}
+
+pub struct AuditLog {
+    entries: Vec<AuditEntry>,
+}
+
+impl AuditLog {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    pub fn record(&mut self, user: &str, action: &str) {
+        let entry = AuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            user: user.to_string(),
+            action: action.to_string(),
+        };
+        println!(\"[Audit] {} by {} at {}\", action, user, entry.timestamp);
+        self.entries.push(entry);
+    }
+
+    pub fn list(&self) -> &Vec<AuditEntry> {
+        &self.entries
+    }
+}
+"@
+
+# src/mgmt/observability.rs
+W "$Root/src/mgmt/observability.rs" @"
+use prometheus::{Encoder, TextEncoder, Registry, IntCounter};
+
+pub struct Observability {
+    pub registry: Registry,
+    pub requests: IntCounter,
+}
+
+impl Observability {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+        let requests = IntCounter::new(\"requests_total\", \"Total requests\").unwrap();
+        registry.register(Box::new(requests.clone())).unwrap();
+        Self { registry, requests }
+    }
+
+    pub fn inc_requests(&self) {
+        self.requests.inc();
+    }
+
+    pub fn export(&self) -> String {
+        let encoder = TextEncoder::new();
+        let mf = self.registry.gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&mf, &mut buffer).unwrap();
+        String::from_utf8(buffer).unwrap()
+    }
+}
+"@
+
+Write-Host "Batch 9/11 complete: Management subsystem created under $Root/src/mgmt"
+
 
 
