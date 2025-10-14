@@ -1418,5 +1418,145 @@ impl Observability {
 
 Write-Host "Batch 9/11 complete: Management subsystem created under $Root/src/mgmt"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/shared/mod.rs
+W "$Root/src/shared/mod.rs" @"
+pub mod netio;
+pub mod packet;
+pub mod timers;
+pub mod perf;
+
+pub use netio::NetIo;
+pub use packet::{EthernetFrame, Ipv4Packet, Ipv6Packet, TcpSegment, UdpDatagram};
+pub use timers::DeterministicTimer;
+pub use perf::PerfTuner;
+"@
+
+# src/shared/netio.rs
+W "$Root/src/shared/netio.rs" @"
+#[derive(Debug, Clone)]
+pub enum IoMode {
+    KernelSocket,
+    AfXdp,
+    Dpdk,
+}
+
+pub struct NetIo {
+    pub mode: IoMode,
+}
+
+impl NetIo {
+    pub fn new(mode: IoMode) -> Self {
+        Self { mode }
+    }
+
+    pub fn send(&self, buf: &[u8]) {
+        println!(\"[NetIo::{:?}] Sending {} bytes\", self.mode, buf.len());
+    }
+
+    pub fn recv(&self) -> Option<Vec<u8>> {
+        println!(\"[NetIo::{:?}] Receiving packet\", self.mode);
+        None
+    }
+}
+"@
+
+# src/shared/packet.rs
+W "$Root/src/shared/packet.rs" @"
+#[derive(Debug, Clone)]
+pub struct EthernetFrame {
+    pub src: [u8; 6],
+    pub dst: [u8; 6],
+    pub ethertype: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ipv4Packet {
+    pub src: [u8; 4],
+    pub dst: [u8; 4],
+    pub proto: u8,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ipv6Packet {
+    pub src: [u8; 16],
+    pub dst: [u8; 16],
+    pub next_header: u8,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpSegment {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpDatagram {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: Vec<u8>,
+}
+"@
+
+# src/shared/timers.rs
+W "$Root/src/shared/timers.rs" @"
+use std::time::{Duration, Instant};
+
+pub struct DeterministicTimer {
+    start: Instant,
+    interval: Duration,
+}
+
+impl DeterministicTimer {
+    pub fn new(interval_ms: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            interval: Duration::from_millis(interval_ms),
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.start.elapsed() >= self.interval
+    }
+}
+"@
+
+# src/shared/perf.rs
+W "$Root/src/shared/perf.rs" @"
+pub struct PerfTuner {
+    pub numa_nodes: usize,
+    pub hugepages: bool,
+}
+
+impl PerfTuner {
+    pub fn new() -> Self {
+        Self { numa_nodes: 1, hugepages: false }
+    }
+
+    pub fn pin_to_core(&self, core: usize) {
+        println!(\"[Perf] Pinning thread to core {}\", core);
+    }
+
+    pub fn enable_hugepages(&mut self) {
+        self.hugepages = true;
+        println!(\"[Perf] Hugepages enabled\");
+    }
+}
+"@
+
+Write-Host "Batch 10/11 complete: Shared core subsystem created under $Root/src/shared"
 
 
