@@ -1163,4 +1163,89 @@ impl Inventory {
 
 Write-Host "Batch 7/11 complete: Hardware autodetection subsystem created under $Root/src/hardware"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/plumbing/mod.rs
+W "$Root/src/plumbing/mod.rs" @"
+pub mod linux;
+pub mod macos;
+pub mod windows;
+
+pub use linux::LinuxPlumbing;
+pub use macos::MacosPlumbing;
+pub use windows::WindowsPlumbing;
+"@
+
+# src/plumbing/linux.rs
+W "$Root/src/plumbing/linux.rs" @"
+#[derive(Default)]
+pub struct LinuxPlumbing {}
+
+impl LinuxPlumbing {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn create_netns(&self, name: &str) {
+        println!(\"[Linux] Creating netns {} (would call unshare/setns)\", name);
+    }
+
+    pub fn create_veth(&self, a: &str, b: &str) {
+        println!(\"[Linux] Creating veth pair {} <-> {}\", a, b);
+    }
+
+    pub fn create_macvlan(&self, parent: &str, child: &str) {
+        println!(\"[Linux] Creating macvlan {} on parent {}\", child, parent);
+    }
+
+    pub fn attach_sriov_vf(&self, dev: &str, vf: u32) {
+        println!(\"[Linux] Attaching SR-IOV VF {} to {}\", vf, dev);
+    }
+}
+"@
+
+# src/plumbing/macos.rs
+W "$Root/src/plumbing/macos.rs" @"
+#[derive(Default)]
+pub struct MacosPlumbing {}
+
+impl MacosPlumbing {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn create_utun(&self, name: &str) {
+        println!(\"[macOS] Creating utun interface {} (would use /dev/utun)\", name);
+    }
+}
+"@
+
+# src/plumbing/windows.rs
+W "$Root/src/plumbing/windows.rs" @"
+#[derive(Default)]
+pub struct WindowsPlumbing {}
+
+impl WindowsPlumbing {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn create_wintun(&self, name: &str) {
+        println!(\"[Windows] Creating Wintun adapter {} (would call wintun.dll)\", name);
+    }
+
+    pub fn create_npcap(&self, name: &str) {
+        println!(\"[Windows] Creating Npcap adapter {} (would use npcap API)\", name);
+    }
+}
+"@
+
+Write-Host "Batch 8/11 complete: Plumbing subsystem created under $Root/src/plumbing"
+
 
