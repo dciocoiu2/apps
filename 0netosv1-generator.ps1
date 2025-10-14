@@ -32,7 +32,7 @@ foreach ($d in $dirs) {
   New-Item -ItemType Directory -Force -Path "$Root/$d" | Out-Null
 }
 
-Write-Host "Batch 1/11 Directory structure created under $Root"
+Write-Host "Batch 1 Directory structure created under $Root"
 param([string]$Root="netos")
 
 function W($p,$c){
@@ -228,7 +228,7 @@ Notes:
 - Ensure you have appropriate permissions for macOS utun and Windows Wintun/Npcap adapters.
 "@
 
-Write-Host "Batch 2/11 complete: top-level files created under $Root"
+Write-Host "Batch 2 complete: top-level files created under $Root"
 param([string]$Root="netos")
 
 function W($p,$c){
@@ -1870,6 +1870,101 @@ impl EvpnVxlan {
 "@
 
 Write-Host "Batch 12 complete: Switch OS subsystem created under $Root/src/devices/switch_os"
+
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/devices/lb_os/mod.rs
+W "$Root/src/devices/lb_os/mod.rs" @"
+pub mod l4_proxy;
+pub mod l7_proxy;
+pub mod tls;
+pub mod health;
+pub mod schedulers;
+
+pub use l4_proxy::L4Proxy;
+"@
+
+# src/devices/lb_os/l4_proxy.rs
+W "$Root/src/devices/lb_os/l4_proxy.rs" @"
+pub struct L4Proxy {}
+
+impl L4Proxy {
+    pub fn new() -> Self { Self {} }
+
+    pub fn listen(&self, addr: &str) {
+        println!(\"[L4Proxy] Listening on {}\", addr);
+    }
+
+    pub fn forward(&self, src: &str, dst: &str) {
+        println!(\"[L4Proxy] Forwarding {} -> {}\", src, dst);
+    }
+}
+"@
+
+# src/devices/lb_os/l7_proxy.rs
+W "$Root/src/devices/lb_os/l7_proxy.rs" @"
+pub struct L7Proxy {}
+
+impl L7Proxy {
+    pub fn new() -> Self { Self {} }
+
+    pub fn handle_request(&self, path: &str) {
+        println!(\"[L7Proxy] Handling HTTP request for {}\", path);
+    }
+}
+"@
+
+# src/devices/lb_os/tls.rs
+W "$Root/src/devices/lb_os/tls.rs" @"
+pub struct TlsTerminator {}
+
+impl TlsTerminator {
+    pub fn new() -> Self { Self {} }
+
+    pub fn terminate(&self, conn: &str) {
+        println!(\"[TLS] Terminating TLS for connection {}\", conn);
+    }
+}
+"@
+
+# src/devices/lb_os/health.rs
+W "$Root/src/devices/lb_os/health.rs" @"
+pub struct HealthChecker {}
+
+impl HealthChecker {
+    pub fn new() -> Self { Self {} }
+
+    pub fn check(&self, target: &str) -> bool {
+        println!(\"[HealthCheck] Checking {}\", target);
+        true
+    }
+}
+"@
+
+# src/devices/lb_os/schedulers.rs
+W "$Root/src/devices/lb_os/schedulers.rs" @"
+pub enum Scheduler {
+    RoundRobin,
+    LeastConnections,
+}
+
+impl Scheduler {
+    pub fn select(&self, backends: &[&str]) -> Option<&str> {
+        match self {
+            Scheduler::RoundRobin => backends.first().copied(),
+            Scheduler::LeastConnections => backends.first().copied(),
+        }
+    }
+}
+"@
+
+Write-Host "Batch 13 complete: Load Balancer OS subsystem created under $Root/src/devices/lb_os"
 
 
 
