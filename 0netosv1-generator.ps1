@@ -984,3 +984,183 @@ impl HealthMonitor {
 
 Write-Host "Batch 6/11 complete: Orchestrator subsystem created under $Root/src/orchestrator"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/hardware/mod.rs
+W "$Root/src/hardware/mod.rs" @"
+pub mod os;
+pub mod cpu;
+pub mod ram;
+pub mod gpu;
+pub mod disk;
+pub mod numa;
+pub mod nic;
+pub mod inventory;
+
+pub use inventory::Inventory;
+"@
+
+# src/hardware/os.rs
+W "$Root/src/hardware/os.rs" @"
+#[derive(Debug, Clone)]
+pub struct OsInfo {
+    pub name: String,
+    pub version: String,
+}
+
+impl OsInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        let os = std::env::consts::OS.to_string();
+        let version = std::env::consts::ARCH.to_string();
+        Ok(Self { name: os, version })
+    }
+}
+"@
+
+# src/hardware/cpu.rs
+W "$Root/src/hardware/cpu.rs" @"
+#[derive(Debug, Clone)]
+pub struct CpuInfo {
+    pub cores: usize,
+    pub arch: String,
+}
+
+impl CpuInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        let cores = num_cpus::get();
+        let arch = std::env::consts::ARCH.to_string();
+        Ok(Self { cores, arch })
+    }
+}
+"@
+
+# src/hardware/ram.rs
+W "$Root/src/hardware/ram.rs" @"
+use sysinfo::{System, SystemExt};
+
+#[derive(Debug, Clone)]
+pub struct RamInfo {
+    pub total_mb: u64,
+}
+
+impl RamInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        let total_mb = sys.total_memory() / 1024;
+        Ok(Self { total_mb })
+    }
+}
+"@
+
+# src/hardware/gpu.rs
+W "$Root/src/hardware/gpu.rs" @"
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub count: usize,
+}
+
+impl GpuInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        // Placeholder: real GPU detection would use platform APIs
+        Ok(Self { count: 0 })
+    }
+}
+"@
+
+# src/hardware/disk.rs
+W "$Root/src/hardware/disk.rs" @"
+use sysinfo::{System, SystemExt, DiskExt};
+
+#[derive(Debug, Clone)]
+pub struct DiskInfo {
+    pub total_gb: u64,
+}
+
+impl DiskInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        let mut sys = System::new_all();
+        sys.refresh_disks_list();
+        let total_bytes: u64 = sys.disks().iter().map(|d| d.total_space()).sum();
+        Ok(Self { total_gb: total_bytes / 1_000_000_000 })
+    }
+}
+"@
+
+# src/hardware/numa.rs
+W "$Root/src/hardware/numa.rs" @"
+#[derive(Debug, Clone)]
+pub struct NumaInfo {
+    pub nodes: usize,
+}
+
+impl NumaInfo {
+    pub fn detect() -> anyhow::Result<Self> {
+        // Simplified: real NUMA detection requires OS-specific APIs
+        Ok(Self { nodes: 1 })
+    }
+}
+"@
+
+# src/hardware/nic.rs
+W "$Root/src/hardware/nic.rs" @"
+use if_addrs::get_if_addrs;
+
+#[derive(Debug, Clone)]
+pub struct NicInfo {
+    pub name: String,
+    pub addr: String,
+}
+
+impl NicInfo {
+    pub fn detect_all() -> anyhow::Result<Vec<Self>> {
+        let mut nics = Vec::new();
+        for iface in get_if_addrs()? {
+            let addr = iface.addr.ip().to_string();
+            nics.push(NicInfo { name: iface.name, addr });
+        }
+        Ok(nics)
+    }
+}
+"@
+
+# src/hardware/inventory.rs
+W "$Root/src/hardware/inventory.rs" @"
+use super::{os::OsInfo, cpu::CpuInfo, ram::RamInfo, gpu::GpuInfo,
+            disk::DiskInfo, numa::NumaInfo, nic::NicInfo};
+
+#[derive(Debug, Clone)]
+pub struct Inventory {
+    pub os: OsInfo,
+    pub cpu: CpuInfo,
+    pub ram: RamInfo,
+    pub gpu: GpuInfo,
+    pub disk: DiskInfo,
+    pub numa: NumaInfo,
+    pub nics: Vec<NicInfo>,
+}
+
+impl Inventory {
+    pub fn detect() -> anyhow::Result<Self> {
+        Ok(Self {
+            os: OsInfo::detect()?,
+            cpu: CpuInfo::detect()?,
+            ram: RamInfo::detect()?,
+            gpu: GpuInfo::detect()?,
+            disk: DiskInfo::detect()?,
+            numa: NumaInfo::detect()?,
+            nics: NicInfo::detect_all()?,
+        })
+    }
+}
+"@
+
+Write-Host "Batch 7/11 complete: Hardware autodetection subsystem created under $Root/src/hardware"
+
+
