@@ -2195,6 +2195,92 @@ pub struct InventoryResponse {
 "@
 
 Write-Host "Batch 15 complete: API subsystem created under $Root/src/api"
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/topology/mod.rs
+W "$Root/src/topology/mod.rs" @"
+pub mod schema;
+pub mod loader;
+pub mod planner;
+
+pub use schema::{Topology, DeviceNode, Link};
+pub use loader::TopologyLoader;
+pub use planner::Planner;
+"@
+
+# src/topology/schema.rs
+W "$Root/src/topology/schema.rs" @"
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceNode {
+    pub id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Link {
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Topology {
+    pub devices: Vec<DeviceNode>,
+    pub links: Vec<Link>,
+}
+"@
+
+# src/topology/loader.rs
+W "$Root/src/topology/loader.rs" @"
+use crate::topology::schema::Topology;
+use std::fs;
+
+pub struct TopologyLoader {}
+
+impl TopologyLoader {
+    pub fn new() -> Self { Self {} }
+
+    pub fn from_file(path: &str) -> anyhow::Result<Topology> {
+        let data = fs::read_to_string(path)?;
+        let topo: Topology = serde_yaml::from_str(&data)?;
+        println!(\"[TopologyLoader] Loaded topology from {}\", path);
+        Ok(topo)
+    }
+}
+"@
+
+# src/topology/planner.rs
+W "$Root/src/topology/planner.rs" @"
+use crate::topology::schema::Topology;
+
+pub struct Planner {}
+
+impl Planner {
+    pub fn new() -> Self { Self {} }
+
+    pub fn plan(&self, topo: &Topology) {
+        println!(\"[Planner] Planning topology with {} devices and {} links\",
+                 topo.devices.len(), topo.links.len());
+        for d in &topo.devices {
+            println!(\"  Device {} ({})\", d.id, d.kind);
+        }
+        for l in &topo.links {
+            println!(\"  Link {} <-> {}\", l.a, l.b);
+        }
+    }
+}
+"@
+
+Write-Host "Batch 16 complete: Topology subsystem created under $Root/src/topology"
+
+
 
 
 
