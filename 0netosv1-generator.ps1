@@ -2105,5 +2105,98 @@ impl SignatureDb {
 
 Write-Host "Batch 14 complete: Firewall OS subsystem created under $Root/src/devices/firewall_os"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/api/mod.rs
+W "$Root/src/api/mod.rs" @"
+pub mod server;
+pub mod models;
+
+pub use server::ApiServer;
+"@
+
+# src/api/server.rs
+W "$Root/src/api/server.rs" @"
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
+use crate::api::models::{HealthResponse, InventoryResponse};
+use serde_json;
+
+#[derive(Clone)]
+pub struct ApiServer {
+    pub addr: String,
+}
+
+impl ApiServer {
+    pub fn new(addr: &str) -> Self {
+        Self { addr: addr.to_string() }
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        let addr = self.addr.parse().unwrap();
+        let make_svc = make_service_fn(|_conn| async {
+            Ok::<_, hyper::Error>(service_fn(Self::handle))
+        });
+
+        let server = Server::bind(&addr).serve(make_svc);
+        println!(\"[API] Listening on http://{}\", self.addr);
+        server.await?;
+        Ok(())
+    }
+
+    async fn handle(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+        match (req.method().as_str(), req.uri().path()) {
+            (\"GET\", \"/health\") => {
+                let resp = HealthResponse { status: \"ok\".to_string() };
+                let body = serde_json::to_string(&resp).unwrap();
+                Ok(Response::new(Body::from(body)))
+            }
+            (\"GET\", \"/inventory\") => {
+                let resp = InventoryResponse {
+                    os: \"linux\".to_string(),
+                    cpu: \"x86_64\".to_string(),
+                    ram_mb: 16384,
+                };
+                let body = serde_json::to_string(&resp).unwrap();
+                Ok(Response::new(Body::from(body)))
+            }
+            _ => {
+                Ok(Response::builder()
+                    .status(404)
+                    .body(Body::from(\"Not Found\"))
+                    .unwrap())
+            }
+        }
+    }
+}
+"@
+
+# src/api/models.rs
+W "$Root/src/api/models.rs" @"
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InventoryResponse {
+    pub os: String,
+    pub cpu: String,
+    pub ram_mb: u64,
+}
+"@
+
+Write-Host "Batch 15 complete: API subsystem created under $Root/src/api"
+
+
+
 
 
