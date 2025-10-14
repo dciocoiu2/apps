@@ -374,3 +374,226 @@ impl EventBus {
 "@
 
 Write-Host "Batch 3/11 complete: core application files created under $Root/src/app"
+
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/gui/mod.rs
+W "$Root/src/gui/mod.rs" @"
+pub mod window;
+pub mod topology_editor;
+pub mod device_manager;
+pub mod metrics_panel;
+pub mod logs_view;
+pub mod console;
+pub mod snapshots;
+pub mod settings;
+
+pub async fn run() -> anyhow::Result<()> {
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "netos",
+        native_options,
+        Box::new(|cc| Box::new(window::NetOsApp::new(cc))),
+    );
+    Ok(())
+}
+"@
+
+# src/gui/window.rs
+W "$Root/src/gui/window.rs" @"
+use eframe::egui;
+use crate::gui::{topology_editor::TopologyEditor, device_manager::DeviceManager,
+                 metrics_panel::MetricsPanel, logs_view::LogsView,
+                 console::ConsoleView, snapshots::SnapshotsView, settings::SettingsView};
+
+pub struct NetOsApp {
+    topology: TopologyEditor,
+    devices: DeviceManager,
+    metrics: MetricsPanel,
+    logs: LogsView,
+    console: ConsoleView,
+    snapshots: SnapshotsView,
+    settings: SettingsView,
+}
+
+impl NetOsApp {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            topology: TopologyEditor::default(),
+            devices: DeviceManager::default(),
+            metrics: MetricsPanel::default(),
+            logs: LogsView::default(),
+            console: ConsoleView::default(),
+            snapshots: SnapshotsView::default(),
+            settings: SettingsView::default(),
+        }
+    }
+}
+
+impl eframe::App for NetOsApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            ui.heading("netos");
+            if ui.button("Settings").clicked() {
+                self.settings.open = true;
+            }
+        });
+
+        egui::SidePanel::left("devices").show(ctx, |ui| {
+            self.devices.ui(ui);
+        });
+
+        egui::SidePanel::right("metrics").show(ctx, |ui| {
+            self.metrics.ui(ui);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.topology.ui(ui);
+        });
+
+        egui::Window::new("Logs").open(&mut self.logs.open).show(ctx, |ui| {
+            self.logs.ui(ui);
+        });
+
+        egui::Window::new("Console").open(&mut self.console.open).show(ctx, |ui| {
+            self.console.ui(ui);
+        });
+
+        egui::Window::new("Snapshots").open(&mut self.snapshots.open).show(ctx, |ui| {
+            self.snapshots.ui(ui);
+        });
+
+        egui::Window::new("Settings").open(&mut self.settings.open).show(ctx, |ui| {
+            self.settings.ui(ui);
+        });
+    }
+}
+"@
+
+# src/gui/topology_editor.rs
+W "$Root/src/gui/topology_editor.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct TopologyEditor {}
+
+impl TopologyEditor {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(\"Topology editor canvas (drag-and-drop devices, draw links)\");
+        ui.separator();
+        ui.label(\"[Future: interactive graph with devices and links]\");
+    }
+}
+"@
+
+# src/gui/device_manager.rs
+W "$Root/src/gui/device_manager.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct DeviceManager {}
+
+impl DeviceManager {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Devices\");
+        if ui.button(\"Add Router\").clicked() {
+            // TODO: integrate with orchestrator
+        }
+        if ui.button(\"Add Switch\").clicked() {}
+        if ui.button(\"Add Firewall\").clicked() {}
+        if ui.button(\"Add Load Balancer\").clicked() {}
+    }
+}
+"@
+
+# src/gui/metrics_panel.rs
+W "$Root/src/gui/metrics_panel.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct MetricsPanel {}
+
+impl MetricsPanel {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Metrics\");
+        ui.label(\"CPU: 0% | RAM: 0MB | NIC: 0pps\");
+    }
+}
+"@
+
+# src/gui/logs_view.rs
+W "$Root/src/gui/logs_view.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct LogsView {
+    pub open: bool,
+}
+
+impl LogsView {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Logs\");
+        ui.label(\"[Future: structured logs here]\");
+    }
+}
+"@
+
+# src/gui/console.rs
+W "$Root/src/gui/console.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct ConsoleView {
+    pub open: bool,
+}
+
+impl ConsoleView {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Console\");
+        ui.label(\"[Future: interactive CLI shell]\");
+    }
+}
+"@
+
+# src/gui/snapshots.rs
+W "$Root/src/gui/snapshots.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct SnapshotsView {
+    pub open: bool,
+}
+
+impl SnapshotsView {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Snapshots\");
+        if ui.button(\"Save Snapshot\").clicked() {}
+        if ui.button(\"Restore Snapshot\").clicked() {}
+    }
+}
+"@
+
+# src/gui/settings.rs
+W "$Root/src/gui/settings.rs" @"
+use eframe::egui;
+
+#[derive(Default)]
+pub struct SettingsView {
+    pub open: bool,
+}
+
+impl SettingsView {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(\"Settings\");
+        ui.label(\"[Future: preferences and overrides]\");
+    }
+}
+"@
+
+Write-Host "Batch 4/11 complete: GUI subsystem created under $Root/src/gui"
