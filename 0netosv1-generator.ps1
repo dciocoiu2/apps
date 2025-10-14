@@ -1966,5 +1966,144 @@ impl Scheduler {
 
 Write-Host "Batch 13 complete: Load Balancer OS subsystem created under $Root/src/devices/lb_os"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/devices/firewall_os/mod.rs
+W "$Root/src/devices/firewall_os/mod.rs" @"
+pub mod acl;
+pub mod waf;
+pub mod rules;
+pub mod signatures;
+
+pub use acl::AclEngine;
+"@
+
+# src/devices/firewall_os/acl.rs
+W "$Root/src/devices/firewall_os/acl.rs" @"
+#[derive(Debug, Clone)]
+pub struct AclRule {
+    pub src: String,
+    pub dst: String,
+    pub action: String, // \"permit\" or \"deny\"
+}
+
+#[derive(Default)]
+pub struct AclEngine {
+    pub rules: Vec<AclRule>,
+}
+
+impl AclEngine {
+    pub fn new() -> Self { Self { rules: Vec::new() } }
+
+    pub fn add_rule(&mut self, src: &str, dst: &str, action: &str) {
+        let r = AclRule { src: src.to_string(), dst: dst.to_string(), action: action.to_string() };
+        self.rules.push(r);
+        println!(\"[ACL] {} -> {} : {}\", src, dst, action);
+    }
+
+    pub fn check(&self, src: &str, dst: &str) -> bool {
+        for r in &self.rules {
+            if r.src == src && r.dst == dst {
+                return r.action == \"permit\";
+            }
+        }
+        true
+    }
+}
+"@
+
+# src/devices/firewall_os/waf.rs
+W "$Root/src/devices/firewall_os/waf.rs" @"
+#[derive(Default)]
+pub struct WafEngine {
+    pub rules: Vec<String>,
+}
+
+impl WafEngine {
+    pub fn new() -> Self { Self { rules: Vec::new() } }
+
+    pub fn add_rule(&mut self, rule: &str) {
+        self.rules.push(rule.to_string());
+        println!(\"[WAF] Added rule: {}\", rule);
+    }
+
+    pub fn inspect(&self, request: &str) -> bool {
+        for r in &self.rules {
+            if request.contains(r) {
+                println!(\"[WAF] Blocked request containing {}\", r);
+                return false;
+            }
+        }
+        true
+    }
+}
+"@
+
+# src/devices/firewall_os/rules.rs
+W "$Root/src/devices/firewall_os/rules.rs" @"
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub id: u32,
+    pub expr: String,
+}
+
+#[derive(Default)]
+pub struct RuleSet {
+    pub rules: Vec<Rule>,
+}
+
+impl RuleSet {
+    pub fn new() -> Self { Self { rules: Vec::new() } }
+
+    pub fn add(&mut self, id: u32, expr: &str) {
+        let r = Rule { id, expr: expr.to_string() };
+        self.rules.push(r);
+        println!(\"[Rules] Added rule {}: {}\", id, expr);
+    }
+}
+"@
+
+# src/devices/firewall_os/signatures.rs
+W "$Root/src/devices/firewall_os/signatures.rs" @"
+#[derive(Debug, Clone)]
+pub struct Signature {
+    pub id: u32,
+    pub pattern: String,
+}
+
+#[derive(Default)]
+pub struct SignatureDb {
+    pub sigs: Vec<Signature>,
+}
+
+impl SignatureDb {
+    pub fn new() -> Self { Self { sigs: Vec::new() } }
+
+    pub fn add(&mut self, id: u32, pattern: &str) {
+        let s = Signature { id, pattern: pattern.to_string() };
+        self.sigs.push(s);
+        println!(\"[Signatures] Added signature {}: {}\", id, pattern);
+    }
+
+    pub fn match_request(&self, req: &str) -> bool {
+        for s in &self.sigs {
+            if req.contains(&s.pattern) {
+                println!(\"[Signatures] Matched signature {}\", s.id);
+                return true;
+            }
+        }
+        false
+    }
+}
+"@
+
+Write-Host "Batch 14 complete: Firewall OS subsystem created under $Root/src/devices/firewall_os"
+
 
 
