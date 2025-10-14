@@ -2279,10 +2279,230 @@ impl Planner {
 "@
 
 Write-Host "Batch 16 complete: Topology subsystem created under $Root/src/topology"
+param([string]$Root="netos")
 
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
 
+# src/security/mod.rs
+W "$Root/src/security/mod.rs" @"
+pub mod policies;
+pub mod secrets;
+pub mod tls;
 
+pub use policies::{Policy, PolicyEngine};
+pub use secrets::SecretStore;
+pub use tls::TlsHelper;
+"@
 
+# src/security/policies.rs
+W "$Root/src/security/policies.rs" @"
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub resource: String,
+    pub action: String,
+    pub role: String,
+}
+
+pub struct PolicyEngine {
+    pub policies: Vec<Policy>,
+}
+
+impl PolicyEngine {
+    pub fn new() -> Self {
+        Self { policies: Vec::new() }
+    }
+
+    pub fn add_policy(&mut self, resource: &str, action: &str, role: &str) {
+        let p = Policy {
+            resource: resource.to_string(),
+            action: action.to_string(),
+            role: role.to_string(),
+        };
+        self.policies.push(p);
+        println!(\"[Policy] Added {}:{} for role {}\", resource, action, role);
+    }
+
+    pub fn authorize(&self, role: &str, resource: &str, action: &str) -> bool {
+        self.policies.iter().any(|p| {
+            p.role == role && p.resource == resource && p.action == action
+        })
+    }
+}
+"@
+
+# src/security/secrets.rs
+W "$Root/src/security/secrets.rs" @"
+use std::collections::HashMap;
+
+pub struct SecretStore {
+    secrets: HashMap<String, String>,
+}
+
+impl SecretStore {
+    pub fn new() -> Self {
+        Self { secrets: HashMap::new() }
+    }
+
+    pub fn put(&mut self, key: &str, value: &str) {
+        self.secrets.insert(key.to_string(), value.to_string());
+        println!(\"[Secrets] Stored secret {}\", key);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.secrets.get(key)
+    }
+}
+"@
+
+# src/security/tls.rs
+W "$Root/src/security/tls.rs" @"
+use rcgen::generate_simple_self_signed;
+use rustls::{Certificate, PrivateKey};
+
+pub struct TlsHelper {}
+
+impl TlsHelper {
+    pub fn new() -> Self { Self {} }
+
+    pub fn generate_self_signed(cert_name: &str) -> (Certificate, PrivateKey) {
+        let subject_alt_names = vec![cert_name.to_string()];
+        let cert = generate_simple_self_signed(subject_alt_names).unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let key_der = cert.serialize_private_key_der();
+        (Certificate(cert_der), PrivateKey(key_der))
+    }
+}
+"@
+
+Write-Host "Batch 17 complete: Security subsystem created under $Root/src/security"
+
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/utils/mod.rs
+W "$Root/src/utils/mod.rs" @"
+pub mod logging;
+pub mod config;
+pub mod platform;
+
+pub use logging::init_logging;
+pub use config::ConfigHelper;
+pub use platform::PlatformHelper;
+"@
+
+# src/utils/logging.rs
+W "$Root/src/utils/logging.rs" @"
+use env_logger;
+
+pub fn init_logging() {
+    env_logger::init();
+    println!(\"[Logging] Initialized env_logger\");
+}
+"@
+
+# src/utils/config.rs
+W "$Root/src/utils/config.rs" @"
+use std::fs;
+use serde::de::DeserializeOwned;
+
+pub struct ConfigHelper {}
+
+impl ConfigHelper {
+    pub fn load<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+        let data = fs::read_to_string(path)?;
+        let cfg: T = serde_yaml::from_str(&data)?;
+        println!(\"[Config] Loaded config from {}\", path);
+        Ok(cfg)
+    }
+}
+"@
+
+# src/utils/platform.rs
+W "$Root/src/utils/platform.rs" @"
+pub struct PlatformHelper {}
+
+impl PlatformHelper {
+    pub fn os() -> &'static str {
+        std::env::consts::OS
+    }
+
+    pub fn arch() -> &'static str {
+        std::env::consts::ARCH
+    }
+}
+"@
+
+Write-Host "Batch 18 complete: Utilities subsystem created under $Root/src/utils"
+
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# tests/cli_tests.rs
+W "$Root/tests/cli_tests.rs" @"
+use assert_cmd::Command;
+
+#[tokio::test]
+async fn test_cli_init() {
+    let mut cmd = Command::cargo_bin(\"netos\").unwrap();
+    cmd.arg(\"--nogui\").arg(\"init\").arg(\"--name\").arg(\"demo\");
+    cmd.assert().success();
+}
+"@
+
+# tests/api_tests.rs
+W "$Root/tests/api_tests.rs" @"
+use tokio::task;
+use reqwest;
+
+#[tokio::test]
+async fn test_api_health() {
+    task::spawn(async {
+        let server = crate::api::ApiServer::new(\"127.0.0.1:8081\");
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let resp = reqwest::get(\"http://127.0.0.1:8081/health\").await.unwrap();
+    assert!(resp.status().is_success());
+}
+"@
+
+# tests/orchestrator_tests.rs
+W "$Root/tests/orchestrator_tests.rs" @"
+use netos::orchestrator::{DeviceManager, LinkGraph};
+
+#[test]
+fn test_device_manager_add() {
+    let mut dm = DeviceManager::new();
+    dm.add_device(\"r1\", \"router\");
+    assert!(dm.start_device(\"r1\").is_some());
+}
+
+#[test]
+fn test_link_graph_add() {
+    let mut lg = LinkGraph::new();
+    lg.add_link(\"r1\", \"r2\");
+    assert_eq!(lg.links.len(), 1);
+}
+"@
+
+Write-Host " Batch 19 complete: Tests subsystem created under $Root/tests"
+Write-Host " CHECK STUBS AND REPLACE WITH REAL LOGIC"
 
 
 
