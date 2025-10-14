@@ -1731,4 +1731,145 @@ impl VrrfVrrp {
 
 Write-Host "Batch 11 complete: Router OS subsystem created under $Root/src/devices/router_os"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/devices/switch_os/mod.rs
+W "$Root/src/devices/switch_os/mod.rs" @"
+pub mod vlan;
+pub mod mac_table;
+pub mod stp_mstp;
+pub mod lacp;
+pub mod lldp;
+pub mod igmp_mld_snoop;
+pub mod evpn_vxlan;
+
+pub use vlan::VlanManager;
+"@
+
+# src/devices/switch_os/vlan.rs
+W "$Root/src/devices/switch_os/vlan.rs" @"
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct Vlan {
+    pub id: u16,
+    pub name: String,
+}
+
+#[derive(Default)]
+pub struct VlanManager {
+    pub vlans: HashMap<u16, Vlan>,
+}
+
+impl VlanManager {
+    pub fn new() -> Self { Self { vlans: HashMap::new() } }
+
+    pub fn add_vlan(&mut self, id: u16, name: &str) {
+        let v = Vlan { id, name: name.to_string() };
+        self.vlans.insert(id, v);
+        println!(\"[VLAN] Added VLAN {} ({})\", id, name);
+    }
+}
+"@
+
+# src/devices/switch_os/mac_table.rs
+W "$Root/src/devices/switch_os/mac_table.rs" @"
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct MacEntry {
+    pub mac: String,
+    pub port: String,
+}
+
+#[derive(Default)]
+pub struct MacTable {
+    pub entries: HashMap<String, MacEntry>,
+}
+
+impl MacTable {
+    pub fn new() -> Self { Self { entries: HashMap::new() } }
+
+    pub fn learn(&mut self, mac: &str, port: &str) {
+        let e = MacEntry { mac: mac.to_string(), port: port.to_string() };
+        self.entries.insert(mac.to_string(), e);
+        println!(\"[MAC] Learned {} on {}\", mac, port);
+    }
+}
+"@
+
+# src/devices/switch_os/stp_mstp.rs
+W "$Root/src/devices/switch_os/stp_mstp.rs" @"
+pub struct Stp {}
+
+impl Stp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn start(&self) {
+        println!(\"[STP] Starting spanning tree\");
+    }
+}
+"@
+
+# src/devices/switch_os/lacp.rs
+W "$Root/src/devices/switch_os/lacp.rs" @"
+pub struct Lacp {}
+
+impl Lacp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn bundle(&self, ports: Vec<&str>) {
+        println!(\"[LACP] Bundling ports: {:?}\", ports);
+    }
+}
+"@
+
+# src/devices/switch_os/lldp.rs
+W "$Root/src/devices/switch_os/lldp.rs" @"
+pub struct Lldp {}
+
+impl Lldp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn advertise(&self, port: &str) {
+        println!(\"[LLDP] Advertising on port {}\", port);
+    }
+}
+"@
+
+# src/devices/switch_os/igmp_mld_snoop.rs
+W "$Root/src/devices/switch_os/igmp_mld_snoop.rs" @"
+pub struct IgmpMldSnoop {}
+
+impl IgmpMldSnoop {
+    pub fn new() -> Self { Self {} }
+
+    pub fn snoop(&self, group: &str) {
+        println!(\"[IGMP/MLD] Snooping group {}\", group);
+    }
+}
+"@
+
+# src/devices/switch_os/evpn_vxlan.rs
+W "$Root/src/devices/switch_os/evpn_vxlan.rs" @"
+pub struct EvpnVxlan {}
+
+impl EvpnVxlan {
+    pub fn new() -> Self { Self {} }
+
+    pub fn establish(&self) {
+        println!(\"[EVPN/VXLAN] Establishing overlay\");
+    }
+}
+"@
+
+Write-Host "Batch 12 complete: Switch OS subsystem created under $Root/src/devices/switch_os"
+
+
 
