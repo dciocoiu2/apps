@@ -597,3 +597,219 @@ impl SettingsView {
 "@
 
 Write-Host "Batch 4/11 complete: GUI subsystem created under $Root/src/gui"
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/cli/mod.rs
+W "$Root/src/cli/mod.rs" @"
+use clap::{Parser, Subcommand};
+
+pub mod init;
+pub mod apply;
+pub mod show;
+pub mod nic;
+pub mod proto;
+pub mod lb;
+pub mod waf;
+pub mod hw;
+pub mod host;
+
+#[derive(Parser, Debug)]
+#[command(name = \"netos-cli\", about = \"CLI for netos\")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    Init(init::InitArgs),
+    Apply(apply::ApplyArgs),
+    Show(show::ShowArgs),
+    Nic(nic::NicArgs),
+    Proto(proto::ProtoArgs),
+    Lb(lb::LbArgs),
+    Waf(waf::WafArgs),
+    Hw(hw::HwArgs),
+    Host(host::HostArgs),
+}
+
+pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
+    let cli = Cli::parse_from(args);
+    match cli.command {
+        Commands::Init(a) => init::run(a).await,
+        Commands::Apply(a) => apply::run(a).await,
+        Commands::Show(a) => show::run(a).await,
+        Commands::Nic(a) => nic::run(a).await,
+        Commands::Proto(a) => proto::run(a).await,
+        Commands::Lb(a) => lb::run(a).await,
+        Commands::Waf(a) => waf::run(a).await,
+        Commands::Hw(a) => hw::run(a).await,
+        Commands::Host(a) => host::run(a).await,
+    }
+}
+"@
+
+# src/cli/init.rs
+W "$Root/src/cli/init.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    #[arg(short, long)]
+    pub name: Option<String>,
+}
+
+pub async fn run(args: InitArgs) -> anyhow::Result<()> {
+    println!(\"Initializing new topology: {:?}\", args.name);
+    Ok(())
+}
+"@
+
+# src/cli/apply.rs
+W "$Root/src/cli/apply.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct ApplyArgs {
+    #[arg(short, long)]
+    pub file: String,
+}
+
+pub async fn run(args: ApplyArgs) -> anyhow::Result<()> {
+    println!(\"Applying config from {}\", args.file);
+    Ok(())
+}
+"@
+
+# src/cli/show.rs
+W "$Root/src/cli/show.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    #[arg(short, long)]
+    pub what: String,
+}
+
+pub async fn run(args: ShowArgs) -> anyhow::Result<()> {
+    println!(\"Showing {}\", args.what);
+    Ok(())
+}
+"@
+
+# src/cli/nic.rs
+W "$Root/src/cli/nic.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct NicArgs {
+    #[arg(short, long)]
+    pub list: bool,
+}
+
+pub async fn run(args: NicArgs) -> anyhow::Result<()> {
+    if args.list {
+        println!(\"Listing NICs\");
+    }
+    Ok(())
+}
+"@
+
+# src/cli/proto.rs
+W "$Root/src/cli/proto.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct ProtoArgs {
+    #[arg(short, long)]
+    pub enable: Option<String>,
+}
+
+pub async fn run(args: ProtoArgs) -> anyhow::Result<()> {
+    if let Some(proto) = args.enable {
+        println!(\"Enabling protocol {}\", proto);
+    }
+    Ok(())
+}
+"@
+
+# src/cli/lb.rs
+W "$Root/src/cli/lb.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct LbArgs {
+    #[arg(short, long)]
+    pub add: Option<String>,
+}
+
+pub async fn run(args: LbArgs) -> anyhow::Result<()> {
+    if let Some(listener) = args.add {
+        println!(\"Adding LB listener {}\", listener);
+    }
+    Ok(())
+}
+"@
+
+# src/cli/waf.rs
+W "$Root/src/cli/waf.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct WafArgs {
+    #[arg(short, long)]
+    pub rule: Option<String>,
+}
+
+pub async fn run(args: WafArgs) -> anyhow::Result<()> {
+    if let Some(rule) = args.rule {
+        println!(\"Adding WAF rule {}\", rule);
+    }
+    Ok(())
+}
+"@
+
+# src/cli/hw.rs
+W "$Root/src/cli/hw.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct HwArgs {
+    #[arg(short, long)]
+    pub list: bool,
+}
+
+pub async fn run(args: HwArgs) -> anyhow::Result<()> {
+    if args.list {
+        println!(\"Listing hardware inventory\");
+    }
+    Ok(())
+}
+"@
+
+# src/cli/host.rs
+W "$Root/src/cli/host.rs" @"
+use clap::Args;
+
+#[derive(Args, Debug)]
+pub struct HostArgs {
+    #[arg(short, long)]
+    pub check: bool,
+}
+
+pub async fn run(args: HostArgs) -> anyhow::Result<()> {
+    if args.check {
+        println!(\"Running host preflight checks\");
+    }
+    Ok(())
+}
+"@
+
+Write-Host "Batch 5/11 complete: CLI subsystem created under $Root/src/cli"
+
