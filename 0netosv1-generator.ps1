@@ -1559,4 +1559,176 @@ impl PerfTuner {
 
 Write-Host "Batch 10/11 complete: Shared core subsystem created under $Root/src/shared"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/devices/router_os/mod.rs
+W "$Root/src/devices/router_os/mod.rs" @"
+pub mod rib;
+pub mod bgp;
+pub mod ospf;
+pub mod isis;
+pub mod rip;
+pub mod pim;
+pub mod mpls_ldp;
+pub mod rsvp_te;
+pub mod segment_routing;
+pub mod vrrf_vrrp;
+
+pub use rib::Rib;
+"@
+
+# src/devices/router_os/rib.rs
+W "$Root/src/devices/router_os/rib.rs" @"
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub prefix: String,
+    pub next_hop: String,
+    pub protocol: String,
+}
+
+#[derive(Default)]
+pub struct Rib {
+    pub routes: HashMap<String, Route>,
+}
+
+impl Rib {
+    pub fn new() -> Self {
+        Self { routes: HashMap::new() }
+    }
+
+    pub fn add_route(&mut self, prefix: &str, next_hop: &str, proto: &str) {
+        let r = Route { prefix: prefix.to_string(), next_hop: next_hop.to_string(), protocol: proto.to_string() };
+        self.routes.insert(prefix.to_string(), r);
+        println!(\"[RIB] Added route {} via {} ({})\", prefix, next_hop, proto);
+    }
+}
+"@
+
+# src/devices/router_os/bgp.rs
+W "$Root/src/devices/router_os/bgp.rs" @"
+pub struct Bgp {}
+
+impl Bgp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn establish_session(&self, peer: &str) {
+        println!(\"[BGP] Establishing session with {}\", peer);
+    }
+}
+"@
+
+# src/devices/router_os/ospf.rs
+W "$Root/src/devices/router_os/ospf.rs" @"
+pub struct Ospf {}
+
+impl Ospf {
+    pub fn new() -> Self { Self {} }
+
+    pub fn start(&self, area: u32) {
+        println!(\"[OSPF] Starting in area {}\", area);
+    }
+}
+"@
+
+# src/devices/router_os/isis.rs
+W "$Root/src/devices/router_os/isis.rs" @"
+pub struct Isis {}
+
+impl Isis {
+    pub fn new() -> Self { Self {} }
+
+    pub fn start(&self, level: u8) {
+        println!(\"[IS-IS] Starting at level {}\", level);
+    }
+}
+"@
+
+# src/devices/router_os/rip.rs
+W "$Root/src/devices/router_os/rip.rs" @"
+pub struct Rip {}
+
+impl Rip {
+    pub fn new() -> Self { Self {} }
+
+    pub fn start(&self) {
+        println!(\"[RIP] Starting RIP/RIPng\");
+    }
+}
+"@
+
+# src/devices/router_os/pim.rs
+W "$Root/src/devices/router_os/pim.rs" @"
+pub struct Pim {}
+
+impl Pim {
+    pub fn new() -> Self { Self {} }
+
+    pub fn join_group(&self, group: &str) {
+        println!(\"[PIM] Joining multicast group {}\", group);
+    }
+}
+"@
+
+# src/devices/router_os/mpls_ldp.rs
+W "$Root/src/devices/router_os/mpls_ldp.rs" @"
+pub struct MplsLdp {}
+
+impl MplsLdp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn advertise_label(&self, prefix: &str) {
+        println!(\"[LDP] Advertising label for {}\", prefix);
+    }
+}
+"@
+
+# src/devices/router_os/rsvp_te.rs
+W "$Root/src/devices/router_os/rsvp_te.rs" @"
+pub struct RsvpTe {}
+
+impl RsvpTe {
+    pub fn new() -> Self { Self {} }
+
+    pub fn signal_path(&self, tunnel: &str) {
+        println!(\"[RSVP-TE] Signaling path for tunnel {}\", tunnel);
+    }
+}
+"@
+
+# src/devices/router_os/segment_routing.rs
+W "$Root/src/devices/router_os/segment_routing.rs" @"
+pub struct SegmentRouting {}
+
+impl SegmentRouting {
+    pub fn new() -> Self { Self {} }
+
+    pub fn install_policy(&self, policy: &str) {
+        println!(\"[SR] Installing segment routing policy {}\", policy);
+    }
+}
+"@
+
+# src/devices/router_os/vrrf_vrrp.rs
+W "$Root/src/devices/router_os/vrrf_vrrp.rs" @"
+pub struct VrrfVrrp {}
+
+impl VrrfVrrp {
+    pub fn new() -> Self { Self {} }
+
+    pub fn start(&self, vrid: u8) {
+        println!(\"[VRRP] Starting VRRP instance {}\", vrid);
+    }
+}
+"@
+
+Write-Host "Batch 11 complete: Router OS subsystem created under $Root/src/devices/router_os"
+
 
