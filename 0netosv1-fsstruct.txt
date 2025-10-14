@@ -1,0 +1,175 @@
+netos/ - Cross-platform, single-binary Rust networking platform with GUI (VirtualBox-style), full device OSes, orchestration, transactional config, RBAC, audit, and observability.
+├── Cargo.toml - Rust manifest for one binary; includes GUI, networking, protocols, and OS adapters.
+├── Makefile - Build helpers for debug/release, packaging, and cross-compilation.
+├── README.md - Overview, capabilities, and quick start usage.
+├── LICENSE - Project license.
+├── SETUP_INSTRUCTIONS.txt - Step-by-step environment setup for Windows, macOS, Debian/Ubuntu, and RHEL/Fedora (assumes Rust not installed).
+│
+├── assets/ - GUI assets for cohesive UX.
+│   ├── icons/ - Device and app icons used in GUI.
+│   │   ├── app.png - Application icon.
+│   │   ├── router.png - Router device icon.
+│   │   ├── switch.png - Switch device icon.
+│   │   ├── firewall.png - Firewall device icon.
+│   │   └── load_balancer.png - Load balancer device icon.
+│   └── styles/ - Theming and styling assets.
+│       └── theme.css - Global GUI theme (colors, spacing).
+│
+├── configs/ - Defaults and example topologies for declarative orchestration.
+│   ├── defaults.yaml - Default runtime, GUI, and orchestrator preferences.
+│   └── examples/ - Ready-to-apply lab scenarios.
+│       ├── full_stack_lab.yaml - Router+Switch+Firewall+LB topology with links and basic configs.
+│       ├── evpn_vxlan.yaml - EVPN/VXLAN fabric sample with IRB.
+│       ├── mpls_l3vpn.yaml - MPLS L3VPN sample with LDP/RSVP-TE.
+│       └── passthrough_sriov.yaml - Passthrough lab with SR-IOV VF assignments.
+│
+└── src/ - All Rust source; compiles into a single binary.
+    ├── main.rs - Entry point; parses CLI, launches GUI, initializes observability and orchestrator.
+    │
+    ├── app/ - Application runtime and global state.
+    │   ├── mod.rs - Module exports for runtime, state, events.
+    │   ├── runtime.rs - Bootstraps app with cfg store, hardware inventory, health monitors.
+    │   ├── state.rs - Shared state: device registry, link graph, preferences.
+    │   └── events.rs - Event bus types: device lifecycle, link status, health changes.
+    │
+    ├── gui/ - Cross-platform desktop GUI (eframe/egui).
+    │   ├── mod.rs - Module exports for GUI subsystems.
+    │   ├── window.rs - Main window, menu bar, panels, status; integrates orchestrator actions.
+    │   ├── topology_editor.rs - Drag-and-drop canvas to add devices and draw links; link typing (veth/macvlan/SR-IOV).
+    │   ├── device_wizard.rs - Guided creation of router/switch/firewall/lb with protocol feature selection.
+    │   ├── settings.rs - Preferences for host overrides, performance, logging, GUI layout.
+    │   ├── metrics_panel.rs - Live counters (PPS, CPU/RAM, adjacency counts, FIB/LSDB sizes, WAF metrics).
+    │   ├── logs_view.rs - Structured logs per device and subsystem, filters, search.
+    │   ├── device_manager.rs - Inventory with start/stop/restart; per-device health/status.
+    │   ├── link_manager.rs - Link wiring editor (endpoints, types, MTU, offloads).
+    │   ├── resource_monitor.rs - Host and device resource monitoring (CPU/RAM/NIC usage).
+    │   ├── console.rs - Embedded terminal to devices (CLI shell).
+    │   └── snapshots.rs - Save and restore device or full topology snapshots.
+    │
+    ├── cli/ - CLI interface mirroring GUI capabilities.
+    │   ├── mod.rs - Subcommand dispatcher.
+    │   ├── init.rs - Interactive text wizard to define devices, links, and passthrough NICs.
+    │   ├── apply.rs - Transactional apply of topology/config files (validate, diff, commit, rollback).
+    │   ├── show.rs - Inspect hardware inventory, devices, link graph, protocol states.
+    │   ├── nic.rs - NIC operations (list, enable SR-IOV, bind IO path).
+    │   ├── proto.rs - Enable/disable routing/switching protocols and their parameters.
+    │   ├── lb.rs - Configure L4/L7 listeners, TLS, health checks, schedulers.
+    │   ├── waf.rs - Manage WAF rules/signatures and enforcement policies.
+    │   ├── hw.rs - Show host hardware and NIC capabilities (queues, offloads, PHC).
+    │   └── host.rs - Preflight checks (permissions, kernel params, driver modules).
+    │
+    ├── orchestrator/ - Master orchestration of virtual devices and networking.
+    │   ├── mod.rs - Module exports for orchestrator subsystems.
+    │   ├── device_manager.rs - Create/manage runtime device instances, lifecycle hooks, namespace binding.
+    │   ├── namespace.rs - OS-specific namespace/adapter management (netns/utun/Wintun); per-device network isolation.
+    │   ├── link_graph.rs - Build and apply link matrix (veth, bridges, macvlan/ipvlan, SR-IOV ports); path tracing.
+    │   ├── passthrough.rs - Host NIC passthrough: macvlan/ipvlan creation, SR-IOV VF discovery/attach, AF_XDP/DPDK binding.
+    │   ├── scheduler.rs - Deterministic start/stop ordering, health gating, drain-and-cutover for updates.
+    │   └── health.rs - Liveness/readiness checks, backoff, remediation, reporting to GUI/CLI.
+    │
+    ├── hardware/ - Host OS and hardware inventory.
+    │   ├── mod.rs - Module exports for hardware subsystems.
+    │   ├── os.rs - Detect OS (Windows/macOS/Linux), version, kernel build, feature gates.
+    │   ├── cpu.rs - CPU architecture (x86_64/aarch64/riscv), core/thread count, SIMD flags.
+    │   ├── ram.rs - Memory totals, hugepages presence, swap checks.
+    │   ├── gpu.rs - GPU enumeration (PCI/IOKit/WMI).
+    │   ├── disk.rs - Block devices, SSD/HDD detection, capacity.
+    │   ├── numa.rs - NUMA nodes, CPU-to-node mapping, memory locality.
+    │   ├── nic.rs - NIC capabilities (queues, RSS/RFS, offloads, SR-IOV, PHC/IEEE 1588, timestamping).
+    │   └── inventory.rs - Unified inventory struct aggregating all host characteristics.
+    │
+    ├── plumbing/ - OS adapters for networking primitives.
+    │   ├── mod.rs - Abstraction layer for platform-specific operations.
+    │   ├── linux.rs - netns creation, veth pairs, macvlan/ipvlan setup, ethtool/rtnetlink integration, SR-IOV VF handling.
+    │   ├── macos.rs - utun/TUN setup, permissions, interface management.
+    │   └── windows.rs - Wintun/Npcap adapter creation, binding, lifecycle.
+    │
+    ├── mgmt/ - Configuration, validation, RBAC, audit, observability.
+    │   ├── mod.rs - Module exports for management subsystems.
+    │   ├── cfg_store.rs - Staging/running config store, snapshots, diff, atomic commit/rollback.
+    │   ├── validator.rs - JSON/YAML schema and semantic validation of devices/links/protocol configs.
+    │   ├── rbac.rs - Role definitions and scope enforcement across devices, protocols, and ops.
+    │   ├── audit.rs - Signed change sets, attribution trails, runtime actions logging.
+    │   └── observability.rs - Prometheus metrics, OpenTelemetry tracing, structured logs integration.
+    │
+    ├── shared/ - Reusable core primitives and performance helpers.
+    │   ├── mod.rs - Shared prelude.
+    │   ├── netio.rs - IO path abstraction: kernel sockets, AF_XDP, DPDK; selection policy and feature negotiation.
+    │   ├── packet.rs - L2/L3/L4 parsers, frame/packet structs, vectorized paths gated by SIMD flags.
+    │   ├── timers.rs - Deterministic timers and scheduling for protocol FSMs.
+    │   └── perf.rs - NUMA-aware queues, core pinning, hugepages management.
+    │
+    ├── devices/ - Specialized OS implementations for virtual devices.
+    │   ├── mod.rs - Device trait, device factory, device handles (start/stop), shared device utilities.
+    │   ├── router_os/ - Router OS with full routing feature set.
+    │   │   ├── mod.rs - Router supervisor (protocol workers, RIB integration, VRFs).
+    │   │   ├── rib.rs - Unified RIB with best-path, ECMP, per-VRF contexts, route resolution.
+    │   │   ├── bgp.rs - BGP FSM, session management, path selection, communities, RR, add-path.
+    │   │   ├── ospf.rs - OSPFv2/v3 neighbor adjacency, LSDB, SPF, areas, authentication.
+    │   │   ├── isis.rs - IS-IS L1/L2, TLVs, adjacency management, SPF, wide metrics.
+    │   │   ├── rip.rs - RIP/RIPng timers, split horizon, poison reverse, route aging.
+    │   │   ├── pim.rs - PIM-SM/SSM RPF, RP (BSR/static), SPT switchover, multicast state.
+    │   │   ├── mpls_ldp.rs - LDP discovery, label distribution, retention modes, FEC handling.
+    │   │   ├── rsvp_te.rs - RSVP-TE signaling (Path/Resv), admission control, preemption.
+    │   │   ├── segment_routing.rs - SR-MPLS/SRv6 policies, steering, TI-LFA basics.
+    │   │   └── vrrf_vrrp.rs - VRF management and VRRP gateway redundancy.
+    │   ├── switch_os/ - Switch OS with complete L2 features.
+    │   │   ├── mod.rs - Switch supervisor (L2 pipeline orchestration).
+    │   │   ├── vlan.rs - VLAN/QinQ operations, tagging/untagging, SVIs.
+    │   │   ├── mac_table.rs - MAC learning, aging, forwarding, storm control.
+    │   │   ├── stp_mstp.rs - STP/RSTP/MSTP state machines and guards.
+    │   │   ├── lacp.rs - Link aggregation control protocol, bundle management, hashing policies.
+    │   │   ├── lldp.rs - LLDP neighbor discovery, TLVs, chassis/port IDs.
+    │   │   ├── igmp_mld_snoop.rs - IGMP/MLD snooping, querier behavior, multicast filtering.
+    │   │   └── evpn_vxlan.rs - EVPN control-plane, VXLAN data-plane, IRB, ARP suppression.
+    │   ├── lb_os/ - Load balancer OS (L4/L7).
+    │   │   ├── mod.rs - LB supervisor (listeners, routes, schedulers).
+    │   │   ├── l4_proxy.rs - TCP/UDP proxy, connection tracking, DSCP handling.
+    │   │   ├── l7_http_proxy.rs - HTTP reverse proxy, routing, headers, websocket support.
+    │   │   ├── tls_termination.rs - TLS termination (Rustls), SNI, certificate reload.
+    │   │   ├── health_checks.rs - Active/passive health checking, outlier detection.
+    │   │   └── schedulers.rs - Round-robin, least-connections, maglev, consistent hashing.
+    │   └── firewall_os/ - Firewall OS with ACL/WAF.
+    │       ├── mod.rs - Firewall supervisor (policy pipelines and enforcement).
+    │       ├── acl.rs - Stateless ACL engine with counters and staged decisions.
+    │       ├── waf_engine.rs - WAF engine for request/response inspection.
+    │       ├── waf_rules.rs - Rules DSL with conditions/actions for WAF policies.
+    │       └── waf_signatures.rs - Built-in signatures (e.g., OWASP patterns, size checks).
+    │
+    ├── api/ - Local management APIs for GUI/CLI.
+    │   ├── mod.rs - API facade.
+    │   ├── rest.rs - Lightweight REST server for local panels and automation.
+    │   └── model.rs - Request/response models and schema generation helpers.
+    │
+    ├── topology/ - Declarative model of devices and links.
+    │   ├── mod.rs - Topology model facade and exports.
+    │   ├── schema.rs - JSON/YAML schema and semantic validation for devices/links.
+    │   ├── loader.rs - Load/save topology files, diffs for rollback.
+    │   └── planner.rs - Compute link graph, addressing plans, ordered init for reliability.
+    │
+    ├── security/ - Operational safety and policy enforcement.
+    │   ├── mod.rs - Security module exports.
+    │   ├── rbac_guard.rs - Enforce role scopes for actions across devices and protocols.
+    │   └── audit_hooks.rs - Emit audit events on topology and device changes.
+    │
+    ├── utils/ - Shared utilities.
+    │   ├── mod.rs - Utils prelude exports.
+    │   ├── fs.rs - File/config I/O, snapshots, path resolution.
+    │   ├── logging.rs - Structured logging initialization and helpers.
+    │   └── errors.rs - Error types and helpers for robust reporting.
+    │
+    └── tests/ - Unit/integration tests for critical paths.
+        ├── mod.rs - Test harness exports.
+        ├── evpn_end_to_end.rs - EVPN+VXLAN wiring and control/data-plane validation.
+        ├── mpls_l3vpn.rs - MPLS L3VPN label stack construction and forwarding checks.
+        ├── pim_multicast.rs - PIM join/prune, RPF correctness, SPT transitions.
+        ├── lb_l4l7.rs - L4/L7 proxy behavior, schedulers, TLS termination tests.
+        └── waf_rules.rs - WAF rule engine and signatures validation.
+
+Notes:
+- All source code is in Rust and compiles to a single executable.
+- GUI provides VirtualBox-style topology editing, device management, console access, metrics, and snapshots.
+- Orchestrator supports Linux netns/veth/macvlan (with SR-IOV), macOS utun/TUN, and Windows Wintun/Npcap.
+- Device OSes implement routing (BGP/OSPF/IS-IS/RIP/PIM with MPLS/Segment Routing), switching (VLAN/STP/LACP/EVPN-VXLAN), load balancing (L4/L7 with TLS and health checks), and firewall (ACLs/WAF).
+- Management layer ensures transactional config, RBAC, audit trails, Prometheus metrics, and tracing.
+- Passthrough supports paravirtual NICs, SR-IOV VF attach, and AF_XDP/DPDK dataplane selection where available.
