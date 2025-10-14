@@ -813,3 +813,174 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
 
 Write-Host "Batch 5/11 complete: CLI subsystem created under $Root/src/cli"
 
+param([string]$Root="netos")
+
+function W($p,$c){
+  $d=Split-Path $p
+  if($d -and !(Test-Path $d)){New-Item -ItemType Directory -Force -Path $d | Out-Null}
+  Set-Content -Path $p -Value $c -Encoding UTF8
+}
+
+# src/orchestrator/mod.rs
+W "$Root/src/orchestrator/mod.rs" @"
+pub mod device_manager;
+pub mod namespace;
+pub mod link_graph;
+pub mod passthrough;
+pub mod scheduler;
+pub mod health;
+
+pub use device_manager::DeviceManager;
+pub use namespace::NamespaceManager;
+pub use link_graph::LinkGraph;
+pub use passthrough::PassthroughManager;
+pub use scheduler::Scheduler;
+pub use health::HealthMonitor;
+"@
+
+# src/orchestrator/device_manager.rs
+W "$Root/src/orchestrator/device_manager.rs" @"
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub id: String,
+    pub kind: String,
+    pub running: bool,
+}
+
+#[derive(Default)]
+pub struct DeviceManager {
+    devices: HashMap<String, Device>,
+}
+
+impl DeviceManager {
+    pub fn new() -> Self {
+        Self { devices: HashMap::new() }
+    }
+
+    pub fn add_device(&mut self, id: &str, kind: &str) {
+        let dev = Device { id: id.to_string(), kind: kind.to_string(), running: false };
+        self.devices.insert(id.to_string(), dev);
+    }
+
+    pub fn start_device(&mut self, id: &str) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.running = true;
+            println!(\"Device {} started\", id);
+        }
+    }
+
+    pub fn stop_device(&mut self, id: &str) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.running = false;
+            println!(\"Device {} stopped\", id);
+        }
+    }
+}
+"@
+
+# src/orchestrator/namespace.rs
+W "$Root/src/orchestrator/namespace.rs" @"
+#[derive(Default)]
+pub struct NamespaceManager {}
+
+impl NamespaceManager {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn create_namespace(&self, name: &str) {
+        println!(\"[Namespace] Creating namespace {} (platform-specific)\", name);
+    }
+
+    pub fn delete_namespace(&self, name: &str) {
+        println!(\"[Namespace] Deleting namespace {}\", name);
+    }
+}
+"@
+
+# src/orchestrator/link_graph.rs
+W "$Root/src/orchestrator/link_graph.rs" @"
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Default)]
+pub struct LinkGraph {
+    pub links: Vec<Link>,
+}
+
+impl LinkGraph {
+    pub fn new() -> Self {
+        Self { links: Vec::new() }
+    }
+
+    pub fn add_link(&mut self, a: &str, b: &str) {
+        self.links.push(Link { a: a.to_string(), b: b.to_string() });
+        println!(\"[LinkGraph] Added link {} <-> {}\", a, b);
+    }
+}
+"@
+
+# src/orchestrator/passthrough.rs
+W "$Root/src/orchestrator/passthrough.rs" @"
+#[derive(Default)]
+pub struct PassthroughManager {}
+
+impl PassthroughManager {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn attach_sriov(&self, dev: &str, vf: u32) {
+        println!(\"[Passthrough] Attaching SR-IOV VF {} to device {}\", vf, dev);
+    }
+
+    pub fn attach_dpdk(&self, dev: &str) {
+        println!(\"[Passthrough] Attaching DPDK to device {}\", dev);
+    }
+}
+"@
+
+# src/orchestrator/scheduler.rs
+W "$Root/src/orchestrator/scheduler.rs" @"
+#[derive(Default)]
+pub struct Scheduler {}
+
+impl Scheduler {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn start_all(&self) {
+        println!(\"[Scheduler] Starting all devices in order\");
+    }
+
+    pub fn stop_all(&self) {
+        println!(\"[Scheduler] Stopping all devices in order\");
+    }
+}
+"@
+
+# src/orchestrator/health.rs
+W "$Root/src/orchestrator/health.rs" @"
+#[derive(Default)]
+pub struct HealthMonitor {}
+
+impl HealthMonitor {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn check(&self, dev: &str) -> bool {
+        println!(\"[Health] Checking device {}\", dev);
+        true
+    }
+}
+"@
+
+Write-Host "Batch 6/11 complete: Orchestrator subsystem created under $Root/src/orchestrator"
+
