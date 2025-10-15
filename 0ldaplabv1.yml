@@ -1,0 +1,513 @@
+services:
+  ldap:
+    image: osixia/openldap:1.5.0
+    environment:
+      LDAP_ORGANISATION: "Example Org"
+      LDAP_DOMAIN: "example.org"
+      LDAP_ADMIN_PASSWORD: "admin"
+    command: >
+      bash -lc "
+        cat > /bootstrap.ldif <<'EOF'
+dn: dc=example,dc=org
+objectClass: top
+objectClass: dcObject
+objectClass: organization
+o: Example Org
+dc: example
+
+dn: ou=people,dc=example,dc=org
+objectClass: organizationalUnit
+ou: people
+
+dn: cn=admin,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+cn: admin
+sn: admin
+userPassword: admin
+
+dn: cn=user,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+cn: user
+sn: user
+userPassword: user
+
+dn: ou=groups,dc=example,dc=org
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=admins,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: admins
+member: cn=admin,ou=people,dc=example,dc=org
+
+dn: cn=users,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: users
+member: cn=user,ou=people,dc=example,dc=org
+EOF
+        slapadd -v -l /bootstrap.ldif || true
+        exec /container/run/startup.sh
+      "
+    ports:
+      - "127.0.0.1:389:389"
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: --skip-networking=0 --bind-address=0.0.0.0
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  redis:
+    image: redis:7
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  rabbitmq1:
+    image: rabbitmq:3.12-management
+    hostname: rabbitmq1
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "secretcookie"
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+
+  rabbitmq2:
+    image: rabbitmq:3.12-management
+    hostname: rabbitmq2
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "secretcookie"
+    depends_on:
+      - rabbitmq1
+
+  mongodb1:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:27017:27017"
+
+  mongodb2:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    depends_on:
+      - mongodb1
+
+  mongodb-init:
+    image: mongo:7
+    depends_on:
+      - mongodb1
+      - mongodb2
+    entrypoint: >
+      bash -lc "
+        for i in {1..30}; do mongo --host mongodb1:27017 --eval 'rs.status()' >/dev/null 2>&1 && break || sleep 1; done
+        mongo --host mongodb1:27017 --eval '
+          cfg = {_id: \"rs0\", members: [{_id:0, host: \"mongodb1:27017\"},{_id:1, host: \"mongodb2:27017\"}]};
+          try { rs.initiate(cfg) } catch(e) { print(e) }'
+        sleep 2
+        exit 0
+      "
+
+  haproxy1:
+    image: haproxy:2.9
+    command: >
+      bash -lc "
+        cat > /usr/local/etc/haproxy/haproxy.cfg <<'EOF'
+global
+  maxconn 4096
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client 50s
+  timeout server 50s
+
+frontend l4_frontend_1
+  bind 127.0.0.1:5000
+  default_backend l4_backend_1
+
+backend l4_backend_1
+  balance roundrobin
+  server redis redis:6379 check
+  server mariadb mariadb:3306 check
+EOF
+        haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      "
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      - redis
+      - mariadb
+
+  haproxy2:
+    image: haproxy:2.9
+    command: >
+      bash -lc "
+        cat > /usr/local/etc/haproxy/haproxy.cfg <<'EOF'
+global
+  maxconn 4096
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client 50s
+  timeout server 50s
+
+frontend l4_frontend_2
+  bind 127.0.0.1:5001
+  default_backend l4_backend_2
+
+backend l4_backend_2
+  balance roundrobin
+  server rabbit1 rabbitmq1:5672 check
+  server rabbit2 rabbitmq2:5672 check
+EOF
+        haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      "
+    ports:
+      - "127.0.0.1:5001:5001"
+    depends_on:
+      - rabbitmq1
+      - rabbitmq2
+
+  traefik1:
+    image: traefik:v3.0
+    command: >
+      bash -lc "
+        cat > /traefik.yml <<'EOF'
+entryPoints:
+  web:
+    address: \":80\"
+providers:
+  file:
+    filename: /dynamic.yml
+api:
+  dashboard: true
+  insecure: true
+EOF
+        cat > /dynamic.yml <<'EOF'
+http:
+  routers:
+    api-router:
+      rule: \"Host(`api.local`)\"
+      entryPoints: [\"web\"]
+      service: api-service
+  services:
+    api-service:
+      loadBalancer:
+        servers:
+          - url: \"http://127.0.0.1:3000\"
+EOF
+        traefik --configFile=/traefik.yml
+      "
+    ports:
+      - "127.0.0.1:80:80"
+    depends_on:
+      - api
+
+  traefik2:
+    image: traefik:v3.0
+    command: >
+      bash -lc "
+        cat > /traefik.yml <<'EOF'
+entryPoints:
+  web:
+    address: \":81\"
+providers:
+  file:
+    filename: /dynamic.yml
+api:
+  dashboard: true
+  insecure: true
+EOF
+        cat > /dynamic.yml <<'EOF'
+http:
+  routers:
+    portal-router:
+      rule: \"Host(`portal.local`)\"
+      entryPoints: [\"web\"]
+      service: portal-service
+  services:
+    portal-service:
+      loadBalancer:
+        servers:
+          - url
+  insecure: true
+EOF
+        cat > /dynamic.yml <<'EOF'
+http:
+  routers:
+    api-router:
+      rule: \"Host(`api.local`)\"
+      entryPoints: [\"web\"]
+      service: api-service
+  services:
+    api-service:
+      loadBalancer:
+        servers:
+          - url: \"http://127.0.0.1:3000\"
+EOF
+        traefik --configFile=/traefik.yml
+      "
+    ports:
+      - "127.0.0.1:80:80"
+    depends_on:
+      - api
+
+  traefik2:
+    image: traefik:v3.0
+    command: >
+      bash -lc "
+        cat > /traefik.yml <<'EOF'
+entryPoints:
+  web:
+    address: \":81\"
+providers:
+  file:
+    filename: /dynamic.yml
+api:
+  dashboard: true
+  insecure: true
+EOF
+        cat > /dynamic.yml <<'EOF'
+http:
+  routers:
+    portal-router:
+      rule: \"Host(`portal.local`)\"
+      entryPoints: [\"web\"]
+      service: portal-service
+  services:
+    portal-service:
+      loadBalancer:
+        servers:
+          - url: \"http://127.0.0.1:4000\"
+EOF
+        traefik --configFile=/traefik.yml
+      "
+    ports:
+      - "127.0.0.1:81:81"
+    depends_on:
+      - portal
+
+  dns1:
+    image: coredns/coredns:1.11.1
+    command: -conf /Corefile
+    entrypoint: >
+      bash -lc "
+        cat > /Corefile <<'EOF'
+.:53 {
+    forward . 8.8.8.8
+    log
+    errors
+}
+example.org:53 {
+    host example.org 127.0.0.1
+    log
+}
+EOF
+        exec /coredns
+      "
+    ports:
+      - "127.0.0.1:53:53/udp"
+      - "127.0.0.1:53:53/tcp"
+
+  dns2:
+    image: coredns/coredns:1.11.1
+    command: -conf /Corefile
+    entrypoint: >
+      bash -lc "
+        cat > /Corefile <<'EOF'
+.:53 {
+    forward . 1.1.1.1
+    log
+    errors
+}
+example.org:53 {
+    host example.org 127.0.0.1
+    log
+}
+EOF
+        exec /coredns
+      "
+    ports:
+      - "127.0.0.1:8053:53/udp"
+      - "127.0.0.1:8053:53/tcp"
+
+  dhcp1:
+    image: networkboot/dhcpd:latest
+    environment:
+      INTERFACES: eth0
+    entrypoint: >
+      bash -lc "
+        cat > /dhcpd.conf <<'EOF'
+default-lease-time 600;
+max-lease-time 7200;
+subnet 192.168.50.0 netmask 255.255.255.0 {
+  range 192.168.50.100 192.168.50.200;
+  option routers 192.168.50.1;
+  option domain-name-servers 127.0.0.1;
+}
+EOF
+        dhcpd -f -cf /dhcpd.conf eth0
+      "
+    ports:
+      - "127.0.0.1:67:67/udp"
+
+  dhcp2:
+    image: networkboot/dhcpd:latest
+    environment:
+      INTERFACES: eth0
+    entrypoint: >
+      bash -lc "
+        cat > /dhcpd.conf <<'EOF'
+default-lease-time 600;
+max-lease-time 7200;
+subnet 192.168.51.0 netmask 255.255.255.0 {
+  range 192.168.51.100 192.168.51.200;
+  option routers 192.168.51.1;
+  option domain-name-servers 127.0.0.1;
+}
+EOF
+        dhcpd -f -cf /dhcpd.conf eth0
+      "
+    ports:
+      - "127.0.0.1:8067:67/udp"
+
+  api:
+    image: node:20
+    working_dir: /app
+    entrypoint: >
+      bash -lc "
+        mkdir -p /app &&
+        cat > /app/package.json <<'EOF'
+{
+  \"name\": \"test-api\",
+  \"version\": \"1.0.0\",
+  \"main\": \"index.js\",
+  \"dependencies\": {
+    \"express\": \"^4.18.2\",
+    \"body-parser\": \"^1.20.2\",
+    \"ldapjs\": \"^2.3.3\"
+  }
+}
+EOF
+        cat > /app/index.js <<'EOF'
+const express = require('express')
+const bodyParser = require('body-parser')
+const ldap = require('ldapjs')
+const app = express()
+app.use(bodyParser.json())
+
+// Minimal RBAC using LDAP groups seeded in ldap service
+function simulateLdapBind(username, password) {
+  if (username === 'admin' && password === 'admin') return { username: 'admin', roles: ['admins'] }
+  if (username === 'user' && password === 'user') return { username: 'user', roles: ['users'] }
+  return null
+}
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body
+  const user = simulateLdapBind(username, password)
+  if (!user) return res.status(401).json({ error: 'Unauthorized' })
+  res.json({ token: Buffer.from(username+':token').toString('base64'), roles: user.roles })
+})
+
+function requireRole(role) {
+  return (req, res, next) => {
+    const roles = req.headers['x-roles'] ? req.headers['x-roles'].split(',') : []
+    if (roles.includes(role)) return next()
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+}
+
+app.get('/secure/admin', requireRole('admins'), (req, res) => {
+  res.json({ msg: 'admin access granted' })
+})
+
+app.get('/', (req, res) => res.json({ msg: 'api is live' }))
+
+app.listen(3000, '0.0.0.0')
+console.log('API listening on 3000')
+EOF
+        cd /app && npm install --no-audit --no-fund && node index.js
+      "
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - ldap
+      - mariadb
+      - redis
+
+  portal:
+    image: node:20
+    working_dir: /app
+    entrypoint: >
+      bash -lc "
+        mkdir -p /app &&
+        cat > /app/package.json <<'EOF'
+{
+  \"name\": \"portal\",
+  \"version\": \"1.0.0\",
+  \"main\": \"index.js\",
+  \"dependencies\": { \"express\": \"^4.18.2\", \"node-fetch\": \"^2.6.7\" }
+}
+EOF
+        cat > /app/index.js <<'EOF'
+const express = require('express')
+const fetch = require('node-fetch')
+const app = express()
+
+app.use(express.urlencoded({ extended: true }))
+app.get('/', (req, res) => {
+  res.send('<html><body><h2>Login Portal</h2><form method=\"post\" action=\"/login\"><input name=\"username\" placeholder=\"username\"/><input name=\"password\" type=\"password\" placeholder=\"password\"/><button>Login</button></form></body></html>')
+})
+
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body
+  try {
+    const r = await fetch('http://127.0.0.1:3000/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) })
+    const j = await r.json()
+    if (r.status !== 200) return res.status(401).send('<h3>Login failed</h3>')
+    res.send('<h3>Logged in</h3><pre>' + JSON.stringify(j) + '</pre>')
+  } catch (e) {
+    res.status(500).send('error contacting api')
+  }
+})
+
+app.listen(4000, '0.0.0.0')
+console.log('Portal listening on 4000')
+EOF
+        cd /app && npm install --no-audit --no-fund && node index.js
+      "
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      - api
+
+networks:
+  default:
+    driver: bridge
