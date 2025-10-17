@@ -1,0 +1,445 @@
+version: "3.9"
+
+services:
+  master:
+    image: ubuntu:24.04
+    container_name: diststack-master
+    # Bind all ports to localhost only
+    ports:
+      # RabbitMQ brokers (mgmt + AMQP)
+      - "127.0.0.1:15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15673:15673"
+      - "127.0.0.1:5673:5673"
+      # Redis Cluster (6 nodes)
+      - "127.0.0.1:7000:7000"
+      - "127.0.0.1:7001:7001"
+      - "127.0.0.1:7002:7002"
+      - "127.0.0.1:7003:7003"
+      - "127.0.0.1:7004:7004"
+      - "127.0.0.1:7005:7005"
+      # MariaDB Galera (3 nodes)
+      - "127.0.0.1:3306:3306"
+      - "127.0.0.1:3307:3307"
+      - "127.0.0.1:3308:3308"
+      # MongoDB sharded cluster
+      - "127.0.0.1:27017:27017" # mongos
+      # Prometheus + Grafana
+      - "127.0.0.1:9090:9090"   # Prometheus
+      - "127.0.0.1:3000:3000"   # Grafana
+      # L4 HAProxy
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8001"
+      # L7 Nginx + WAF
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+      # Sample APIs
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:5002:5002"
+    # Keep everything inside the container—no host volumes
+    volumes:
+      - type: tmpfs
+        target: /run
+      - type: tmpfs
+        target: /var/tmp
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    command: ["/bin/bash","-lc","/opt/bootstrap.sh"]
+    # Build and run entirely headless
+    stdin_open: false
+    tty: false
+    # Reasonable resources; adjust as needed
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+          cpus: '4.0'
+    # Environment for initial credentials
+    environment:
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin
+      MARIADB_ROOT_PASSWORD: supersecret
+      GRAFANA_ADMIN_PASSWORD: admin
+    # Create everything at runtime within the container
+    entrypoint: ["/bin/bash","-lc","set -euo pipefail; \
+      mkdir -p /opt/bin /opt/etc /opt/data; \
+      cat > /opt/bootstrap.sh <<'EOS' \
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf \"[%s] %s\\n\" \"$(date +%H:%M:%S)\" \"$*\"; }
+
+############################
+# Base install
+############################
+log \"Updating base system...\"
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  ca-certificates curl wget gnupg lsb-release tzdata procps iproute2 netcat \
+  supervisor jq socat openssl \
+  rabbitmq-server \
+  redis \
+  mariadb-server galera-3 rsync \
+  mongodb-org \
+  haproxy \
+  nginx libnginx-mod-http-modsecurity \
+  prometheus \
+  grafana \
+  python3 python3-pip
+
+# If mongodb-org not found (Ubuntu universe), fallback to mongodb-server
+if ! command -v mongod >/dev/null 2>&1; then
+  apt-get install -y mongodb-server
+fi
+
+pip3 install --no-cache-dir flask
+
+mkdir -p /opt/etc/supervisor/conf.d /opt/log /opt/data
+
+############################
+# RabbitMQ (2 brokers + federation)
+############################
+log \"Configuring RabbitMQ brokers...\"
+# Broker 1
+mkdir -p /opt/data/rmq1
+rabbitmq-server -detached
+rabbitmqctl await_startup
+rabbitmqctl add_user \"$RABBITMQ_USER\" \"$RABBITMQ_PASS\" || true
+rabbitmqctl set_user_tags \"$RABBITMQ_USER\" administrator
+rabbitmqctl set_permissions -p / \"$RABBITMQ_USER\" \".*\" \".*\" \".*\"
+rabbitmq-plugins enable rabbitmq_management rabbitmq_federation rabbitmq_federation_management
+rabbitmqctl set_parameter federation-upstream upstream_to_rmq2 '{\"uri\":\"amqp://'$RABBITMQ_USER':'$RABBITMQ_PASS'@127.0.0.1:5673\",\"expires\":3600000}'
+rabbitmqctl set_policy federate-all \"^\" '{\"federation-upstream\":\"upstream_to_rmq2\"}' --apply-to queues
+
+# Broker 2 on different ports via RABBITMQ_NODE_PORT / management port
+export RABBITMQ_NODE_PORT=5673
+export RABBITMQ_NODENAME=rabbit@localhost-2
+export RABBITMQ_SERVER_START_ARGS=\"-rabbitmq_management listener [{port,15673}] -rabbit tcp_listeners [{\"127.0.0.1\",5673}] -rabbitmq_management listener [{port,15673}]\"
+RABBITMQ_MNESIA_BASE=/opt/data/rmq2 rabbitmq-server -detached
+rabbitmqctl -n rabbit@localhost-2 await_startup
+rabbitmqctl -n rabbit@localhost-2 add_user \"$RABBITMQ_USER\" \"$RABBITMQ_PASS\" || true
+rabbitmqctl -n rabbit@localhost-2 set_user_tags \"$RABBITMQ_USER\" administrator
+rabbitmqctl -n rabbit@localhost-2 set_permissions -p / \"$RABBITMQ_USER\" \".*\" \".*\" \".*\"
+rabbitmq-plugins -n rabbit@localhost-2 enable rabbitmq_management rabbitmq_federation rabbitmq_federation_management
+
+############################
+# Redis Cluster (6 nodes)
+############################
+log \"Configuring Redis Cluster...\"
+mkdir -p /opt/etc/redis /opt/data/redis
+for port in 7000 7001 7002 7003 7004 7005; do
+  cat > /opt/etc/redis/${port}.conf <<CFG
+port $port
+bind 127.0.0.1
+cluster-enabled yes
+cluster-config-file nodes-${port}.conf
+cluster-node-timeout 5000
+appendonly yes
+dir /opt/data/redis/${port}
+protected-mode no
+save ""
+CFG
+  mkdir -p /opt/data/redis/${port}
+done
+
+for port in 7000 7001 7002 7003 7004 7005; do
+  redis-server /opt/etc/redis/${port}.conf &
+done
+sleep 3
+yes yes | redis-cli --cluster create \
+  127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 \
+  --cluster-replicas 1
+
+############################
+# MariaDB Galera (3 nodes)
+############################
+log \"Configuring MariaDB Galera cluster...\"
+# Base config templates
+mkdir -p /opt/etc/mysql /opt/data/mysql/{node1,node2,node3}
+cat > /opt/etc/mysql/galera.cnf <<CNF
+[mysqld]
+binlog_format=ROW
+default_storage_engine=InnoDB
+innodb_autoinc_lock_mode=2
+bind-address=127.0.0.1
+wsrep_on=ON
+wsrep_cluster_name='local-galera'
+wsrep_cluster_address='gcomm://127.0.0.1:4567,127.0.0.1:5567,127.0.0.1:6567'
+wsrep_provider=/usr/lib/galera/libgalera_smm.so
+wsrep_sst_method=rsync
+CNF
+
+# Node-specific configs
+cat > /opt/etc/mysql/node1.cnf <<CNF
+[mysqld]
+port=3306
+wsrep_node_name=node1
+wsrep_provider_options=\"gcache.size=128M\"
+CNF
+cat > /opt/etc/mysql/node2.cnf <<CNF
+[mysqld]
+port=3307
+wsrep_node_name=node2
+wsrep_provider_options=\"gcache.size=128M\"
+CNF
+cat > /opt/etc/mysql/node3.cnf <<CNF
+[mysqld]
+port=3308
+wsrep_node_name=node3
+wsrep_provider_options=\"gcache.size=128M\"
+CNF
+
+# Initialize datadirs
+for n in node1 node2 node3; do
+  mysqld --initialize-insecure --datadir=/opt/data/mysql/${n} --user=mysql
+done
+
+# Bootstrap first node
+mysqld --defaults-file=/opt/etc/mysql/galera.cnf --defaults-extra-file=/opt/etc/mysql/node1.cnf \
+  --datadir=/opt/data/mysql/node1 --user=mysql --wsrep-new-cluster &
+sleep 5
+mysql -h127.0.0.1 -P3306 -uroot -e \"ALTER USER 'root'@'localhost' IDENTIFIED BY '$MARIADB_ROOT_PASSWORD'; FLUSH PRIVILEGES;\" || true
+
+# Start other nodes
+mysqld --defaults-file=/opt/etc/mysql/galera.cnf --defaults-extra-file=/opt/etc/mysql/node2.cnf \
+  --datadir=/opt/data/mysql/node2 --user=mysql &
+mysqld --defaults-file=/opt/etc/mysql/galera.cnf --defaults-extra-file=/opt/etc/mysql/node3.cnf \
+  --datadir=/opt/data/mysql/node3 --user=mysql &
+sleep 5
+
+############################
+# MongoDB sharded cluster
+# - 3 config servers (CSRS)
+# - 2 shards (shard1, shard2), each a 3-node replica set
+# - 1 mongos router
+############################
+log \"Configuring MongoDB sharded cluster...\"
+mkdir -p /opt/data/mongo/{cfg1,cfg2,cfg3,sh1a,sh1b,sh1c,sh2a,sh2b,sh2c}
+# Config servers
+mongod --configsvr --replSet cfgRS --port 27019 --dbpath /opt/data/mongo/cfg1 --bind_ip 127.0.0.1 &
+mongod --configsvr --replSet cfgRS --port 27020 --dbpath /opt/data/mongo/cfg2 --bind_ip 127.0.0.1 &
+mongod --configsvr --replSet cfgRS --port 27021 --dbpath /opt/data/mongo/cfg3 --bind_ip 127.0.0.1 &
+sleep 3
+mongosh --port 27019 --eval \"rs.initiate({_id:'cfgRS',configsvr:true,members:[{_id:0,host:'127.0.0.1:27019'},{_id:1,host:'127.0.0.1:27020'},{_id:2,host:'127.0.0.1:27021'}]})\"
+
+# Shard 1 replica set
+mongod --shardsvr --replSet shard1 --port 27030 --dbpath /opt/data/mongo/sh1a --bind_ip 127.0.0.1 &
+mongod --shardsvr --replSet shard1 --port 27031 --dbpath /opt/data/mongo/sh1b --bind_ip 127.0.0.1 &
+mongod --shardsvr --replSet shard1 --port 27032 --dbpath /opt/data/mongo/sh1c --bind_ip 127.0.0.1 &
+sleep 3
+mongosh --port 27030 --eval \"rs.initiate({_id:'shard1',members:[{_id:0,host:'127.0.0.1:27030'},{_id:1,host:'127.0.0.1:27031'},{_id:2,host:'127.0.0.1:27032'}]})\"
+
+# Shard 2 replica set
+mongod --shardsvr --replSet shard2 --port 27033 --dbpath /opt/data/mongo/sh2a --bind_ip 127.0.0.1 &
+mongod --shardsvr --replSet shard2 --port 27034 --dbpath /opt/data/mongo/sh2b --bind_ip 127.0.0.1 &
+mongod --shardsvr --replSet shard2 --port 27035 --dbpath /opt/data/mongo/sh2c --bind_ip 127.0.0.1 &
+sleep 3
+mongosh --port 27033 --eval \"rs.initiate({_id:'shard2',members:[{_id:0,host:'127.0.0.1:27033'},{_id:1,host:'127.0.0.1:27034'},{_id:2,host:'127.0.0.1:27035'}]})\"
+
+# Mongos
+mongos --configdb cfgRS/127.0.0.1:27019,127.0.0.1:27020,127.0.0.1:27021 --port 27017 --bind_ip 127.0.0.1 &
+sleep 5
+mongosh --port 27017 --eval \"sh.addShard('shard1/127.0.0.1:27030,127.0.0.1:27031,127.0.0.1:27032'); sh.addShard('shard2/127.0.0.1:27033,127.0.0.1:27034,127.0.0.1:27035'); sh.enableSharding('appdb');\"
+
+############################
+# Prometheus
+############################
+log \"Configuring Prometheus...\"
+mkdir -p /opt/etc/prometheus
+cat > /opt/etc/prometheus/prometheus.yml <<PROM
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['127.0.0.1:15672']
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['127.0.0.1:7000','127.0.0.1:7001','127.0.0.1:7002','127.0.0.1:7003','127.0.0.1:7004','127.0.0.1:7005']
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['127.0.0.1:27017']
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['127.0.0.1:3306','127.0.0.1:3307','127.0.0.1:3308']
+PROM
+prometheus --config.file=/opt/etc/prometheus/prometheus.yml --web.listen-address=127.0.0.1:9090 &
+
+############################
+# Grafana
+############################
+log \"Configuring Grafana...\"
+mkdir -p /opt/etc/grafana
+grafana-server --homepath=/usr/share/grafana --config=/etc/grafana/grafana.ini \
+  --packaging=docker --pprof.route.enabled --port=3000 &
+
+############################
+# L4 HAProxy (2 instances)
+############################
+log \"Configuring HAProxy...\"
+mkdir -p /opt/etc/haproxy
+cat > /opt/etc/haproxy/haproxy1.cfg <<HAP
+global
+  maxconn 4096
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client  50s
+  timeout server  50s
+listen l4_redis
+  bind 127.0.0.1:8000
+  balance roundrobin
+  server r1 127.0.0.1:7000 check
+  server r2 127.0.0.1:7001 check
+  server r3 127.0.0.1:7002 check
+HAP
+cat > /opt/etc/haproxy/haproxy2.cfg <<HAP
+global
+  maxconn 4096
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client  50s
+  timeout server  50s
+listen l4_mysql
+  bind 127.0.0.1:8001
+  balance roundrobin
+  server m1 127.0.0.1:3306 check
+  server m2 127.0.0.1:3307 check
+  server m3 127.0.0.1:3308 check
+HAP
+haproxy -f /opt/etc/haproxy/haproxy1.cfg &
+haproxy -f /opt/etc/haproxy/haproxy2.cfg &
+
+############################
+# L7 Nginx with ModSecurity WAF (2 instances)
+############################
+log \"Configuring Nginx + WAF...\"
+mkdir -p /opt/etc/nginx /opt/log/nginx
+# Minimal ModSecurity rule set (paranoia 1)
+cat > /etc/modsecurity/modsecurity.conf <<MOD
+SecRuleEngine On
+Include /usr/share/modsecurity-crs/base_rules/*.conf
+MOD
+
+cat > /opt/etc/nginx/nginx1.conf <<NGX
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+  server {
+    listen 127.0.0.1:8080;
+    modsecurity on;
+    modsecurity_rules_file /etc/modsecurity/modsecurity.conf;
+    location / {
+      proxy_pass http://127.0.0.1:5001;
+    }
+  }
+}
+NGX
+cat > /opt/etc/nginx/nginx2.conf <<NGX
+worker_processes 1;
+events { worker_connections 1024; }
+http {
+  server {
+    listen 127.0.0.1:8081;
+    modsecurity on;
+    modsecurity_rules_file /etc/modsecurity/modsecurity.conf;
+    location / {
+      proxy_pass http://127.0.0.1:5002;
+    }
+  }
+}
+NGX
+nginx -c /opt/etc/nginx/nginx1.conf &
+nginx -c /opt/etc/nginx/nginx2.conf &
+
+############################
+# Sample APIs (Flask)
+############################
+log \"Starting sample APIs...\"
+cat > /opt/bin/api1.py <<PY
+from flask import Flask, jsonify
+app = Flask(__name__)
+@app.get('/health')
+def health(): return jsonify(status='ok', service='api1')
+@app.get('/hello')
+def hello(): return jsonify(message='hello from api1')
+app.run(host='127.0.0.1', port=5001)
+PY
+cat > /opt/bin/api2.py <<PY
+from flask import Flask, jsonify
+app = Flask(__name__)
+@app.get('/health')
+def health(): return jsonify(status='ok', service='api2')
+@app.get('/hello')
+def hello(): return jsonify(message='hello from api2')
+app.run(host='127.0.0.1', port=5002)
+PY
+python3 /opt/bin/api1.py &
+python3 /opt/bin/api2.py &
+
+############################
+# Supervisor to keep processes (optional for restarts)
+############################
+log \"Configuring Supervisor...\"
+cat > /opt/etc/supervisor/supervisord.conf <<SUP
+[supervisord]
+logfile=/opt/log/supervisord.log
+pidfile=/opt/supervisord.pid
+childlogdir=/opt/log
+
+[program:rabbitmq1]
+command=/usr/sbin/rabbitmq-server
+autostart=false
+autorestart=true
+
+[program:haproxy1]
+command=/usr/sbin/haproxy -f /opt/etc/haproxy/haproxy1.cfg
+autostart=true
+autorestart=true
+
+[program:haproxy2]
+command=/usr/sbin/haproxy -f /opt/etc/haproxy/haproxy2.cfg
+autostart=true
+autorestart=true
+
+[program:nginx1]
+command=/usr/sbin/nginx -c /opt/etc/nginx/nginx1.conf
+autostart=true
+autorestart=true
+
+[program:nginx2]
+command=/usr/sbin/nginx -c /opt/etc/nginx/nginx2.conf
+autostart=true
+autorestart=true
+
+[program:prometheus]
+command=/usr/bin/prometheus --config.file=/opt/etc/prometheus/prometheus.yml --web.listen-address=127.0.0.1:9090
+autostart=true
+autorestart=true
+
+[program:grafana]
+command=/usr/sbin/grafana-server --homepath=/usr/share/grafana --config=/etc/grafana/grafana.ini --port=3000
+autostart=true
+autorestart=true
+SUP
+
+supervisord -c /opt/etc/supervisor/supervisord.conf
+
+log \"Bootstrap complete. Tail -f to keep container alive...\"
+tail -f /dev/null
+EOS
+      chmod +x /opt/bootstrap.sh; /opt/bootstrap.sh"]
+    # Security posture: localhost-only; drop capabilities you don’t need
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
