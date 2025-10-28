@@ -1,0 +1,49 @@
+{
+  "portfolio_profile": {
+    "name": "starter_portfolio",
+    "description": "Sample backtest profile combining common plugins",
+    "data": {
+      "plugin": "embedded_csv_sample",
+      "config": {
+        "type": "embedded_csv",
+        "csv": "timestamp,open,high,low,close,volume\n2024-01-02 09:30:00,100,101,99,100.5,10000\n2024-01-03 09:30:00,100.5,102,100,101.8,12000\n2024-01-04 09:30:00,101.8,103,101,102.5,15000\n2024-01-05 09:30:00,102.5,104,102,103.7,18000"
+      }
+    },
+    "strategy": {
+      "plugin": "moving_average_crossover",
+      "config": {
+        "type": "rule_chain",
+        "params": { "fast": 20, "slow": 100 },
+        "rules": [
+          { "if": "sma(close,fast)>sma(close,slow)", "do": "BUY", "qty": 100 },
+          { "if": "sma(close,fast)<sma(close,slow)", "do": "SELL_ALL" }
+        ]
+      }
+    },
+    "execution": {
+      "plugin": "twap_exec",
+      "config": {
+        "twap": { "enabled": true, "slices": 20, "duration_ms": 1800000 },
+        "vwap": { "enabled": false, "window": 50 },
+        "pov": { "enabled": false, "participation": 0.1 }
+      }
+    },
+    "risk": {
+      "plugin": "risk_management_bundle",
+      "config": {
+        "limits": {
+          "max_position": 1000000,
+          "max_notional": 100000000,
+          "max_drawdown": 0.2,
+          "daily_loss_limit": 5000000,
+          "per_trade_loss_limit": 1000000
+        },
+        "kill_switch": {
+          "enabled": true,
+          "trigger_on_error": true,
+          "trigger_on_limit_breach": true
+        }
+      }
+    }
+  }
+}
