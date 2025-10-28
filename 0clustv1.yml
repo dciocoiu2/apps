@@ -1,0 +1,741 @@
+services:
+  vault:
+    image: "hashicorp/vault:1.14.3"
+    container_name: vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root-token"
+      VAULT_ADDR: "http://0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    command: "server -dev -dev-root-token-id=root-token -dev-listen-address=0.0.0.0:8200"
+    ports:
+      - "127.0.0.1:8200:8200"
+    tmpfs:
+      - /vault/file
+    networks:
+      - stack
+
+  vault-ui:
+    image: "djenriquez/vault-ui:0.3.8"
+    container_name: vault-ui
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_SKIP_VERIFY: "true"
+    ports:
+      - "127.0.0.1:8201:80"
+    networks:
+      - stack
+    depends_on:
+      - vault
+
+  rabbitmq1:
+    image: "rabbitmq:3.13-management"
+    container_name: rabbitmq1
+    environment:
+      RABBITMQ_DEFAULT_USER: "admin"
+      RABBITMQ_DEFAULT_PASS: "changeme" 
+    ports:
+      - "127.0.0.1:15672:15672"
+      - "127.0.0.1:5672:5672"
+    networks:
+      - stack
+
+  rabbitmq2:
+    image: "rabbitmq:3.13-management"
+    container_name: rabbitmq2
+    environment:
+      RABBITMQ_DEFAULT_USER: "admin"
+      RABBITMQ_DEFAULT_PASS: "changeme"
+    ports:
+      - "127.0.0.1:15673:15672"
+      - "127.0.0.1:5673:5672"
+    networks:
+      - stack
+    depends_on:
+      - rabbitmq1
+
+  rabbitmq-federation-init:
+    image: "curlimages/curl:8.10.1"
+    container_name: rabbitmq-federation-init
+    command: |
+      sh -lc "
+      sleep 12 &&
+      curl -s -u admin:changeme -H 'content-type:application/json' -X PUT http://rabbitmq1:15672/api/parameters/federation/%2F/upstream_to_rmq2 -d '{\"value\":{\"uri\":\"amqp://admin:changeme@rabbitmq2:5672\",\"expires\":3600000}}' &&
+      curl -s -u admin:changeme -H 'content-type:application/json' -X PUT http://rabbitmq1:15672/api/policies/%2F/federate-all -d '{\"pattern\":\"^\",\"apply-to\":\"queues\",\"definition\":{\"federation-upstream\":\"upstream_to_rmq2\"}}'
+      "
+    networks:
+      - stack
+    depends_on:
+      - rabbitmq1
+      - rabbitmq2
+
+  redis-7000:
+    image: "redis:7.2"
+    container_name: redis-7000
+    command: ["redis-server","--port","7000","--cluster-enabled","yes","--cluster-config-file","nodes-7000.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7000:7000"
+    networks:
+      - stack
+
+  redis-7001:
+    image: "redis:7.2"
+    container_name: redis-7001
+    command: ["redis-server","--port","7001","--cluster-enabled","yes","--cluster-config-file","nodes-7001.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7001:7001"
+    networks:
+      - stack
+
+  redis-7002:
+    image: "redis:7.2"
+    container_name: redis-7002
+    command: ["redis-server","--port","7002","--cluster-enabled","yes","--cluster-config-file","nodes-7002.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7002:7002"
+    networks:
+      - stack
+
+  redis-7003:
+    image: "redis:7.2"
+    container_name: redis-7003
+    command: ["redis-server","--port","7003","--cluster-enabled","yes","--cluster-config-file","nodes-7003.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7003:7003"
+    networks:
+      - stack
+
+  redis-7004:
+    image: "redis:7.2"
+    container_name: redis-7004
+    command: ["redis-server","--port","7004","--cluster-enabled","yes","--cluster-config-file","nodes-7004.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7004:7004"
+    networks:
+      - stack
+
+  redis-7005:
+    image: "redis:7.2"
+    container_name: redis-7005
+    command: ["redis-server","--port","7005","--cluster-enabled","yes","--cluster-config-file","nodes-7005.conf","--cluster-node-timeout","5000","--appendonly","yes","--save",""]
+    ports:
+      - "127.0.0.1:7005:7005"
+    networks:
+      - stack
+
+  redis-cluster-init:
+    image: "redis:7.2"
+    container_name: redis-cluster-init
+    command: |
+      sh -lc "
+      sleep 8 &&
+      yes yes | redis-cli --cluster create \
+      redis-7000:7000 redis-7001:7001 redis-7002:7002 \
+      redis-7003:7003 redis-7004:7004 redis-7005:7005 \
+      --cluster-replicas 1
+      "
+    networks:
+      - stack
+    depends_on:
+      - redis-7000
+      - redis-7001
+      - redis-7002
+      - redis-7003
+      - redis-7004
+      - redis-7005
+
+  redis-commander:
+    image: "rediscommander/redis-commander:latest"
+    container_name: redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis-7000:7000
+    ports:
+      - "127.0.0.1:8085:8081"
+    networks:
+      - stack
+    depends_on:
+      - redis-7000
+
+  mariadb-node1:
+    image: "mariadb:11.4"
+    container_name: mariadb-node1
+    environment:
+      MYSQL_ROOT_PASSWORD: "changeme"
+      MARIADB_AUTO_UPGRADE: "1"
+    command: >
+      mysqld --bind-address=0.0.0.0 --wsrep_on=ON --wsrep_cluster_name=local-galera --wsrep_cluster_address=gcomm://mariadb-node1,mariadb-node2,mariadb-node3 --wsrep_node_name=node1 --wsrep_sst_method=rsync
+    ports:
+      - "127.0.0.1:3306:3306"
+    networks:
+      - stack
+
+  mariadb-node2:
+    image: "mariadb:11.4"
+    container_name: mariadb-node2
+    environment:
+      MYSQL_ROOT_PASSWORD: "changeme"
+      MARIADB_AUTO_UPGRADE: "1"
+    command: >
+      mysqld --bind-address=0.0.0.0 --wsrep_on=ON --wsrep_cluster_name=local-galera --wsrep_cluster_address=gcomm://mariadb-node1,mariadb-node2,mariadb-node3 --wsrep_node_name=node2 --wsrep_sst_method=rsync --port=3307
+    ports:
+      - "127.0.0.1:3307:3307"
+    networks:
+      - stack
+    depends_on:
+      - mariadb-node1
+
+  mariadb-node3:
+    image: "mariadb:11.4"
+    container_name: mariadb-node3
+    environment:
+      MYSQL_ROOT_PASSWORD: "changeme"
+      MARIADB_AUTO_UPGRADE: "1"
+    command: >
+      mysqld --bind-address=0.0.0.0 --wsrep_on=ON --wsrep_cluster_name=local-galera --wsrep_cluster_address=gcomm://mariadb-node1,mariadb-node2,mariadb-node3 --wsrep_node_name=node3 --wsrep_sst_method=rsync --port=3308
+    ports:
+      - "127.0.0.1:3308:3308"
+    networks:
+      - stack
+    depends_on:
+      - mariadb-node1
+
+  adminer:
+    image: "adminer:4.8.1"
+    container_name: adminer
+    environment:
+      ADMINER_DEFAULT_DB_DRIVER: "server"
+    ports:
+      - "127.0.0.1:8083:8080"
+    networks:
+      - stack
+    depends_on:
+      - mariadb-node1
+
+  mariadb-auth-seed:
+    image: "mariadb:11.4"
+    container_name: mariadb-auth-seed
+    command: |
+      sh -lc "
+      sleep 12 &&
+      mariadb -hmariadb-node1 -uroot -pchangeme -e \"
+      CREATE DATABASE IF NOT EXISTS appdb;
+      CREATE TABLE IF NOT EXISTS appdb.app_authorizations (username VARCHAR(128), resource VARCHAR(128));
+      INSERT IGNORE INTO appdb.app_authorizations (username,resource) VALUES ('alice','api1:section:a'),('bob','api2:section:x');
+      \"
+      "
+    networks:
+      - stack
+    depends_on:
+      - mariadb-node1
+
+  mongo-cfg1:
+    image: "mongo:7.0"
+    container_name: mongo-cfg1
+    command: ["mongod","--configsvr","--replSet","cfgRS","--port","27019","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-cfg2:
+    image: "mongo:7.0"
+    container_name: mongo-cfg2
+    command: ["mongod","--configsvr","--replSet","cfgRS","--port","27020","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-cfg3:
+    image: "mongo:7.0"
+    container_name: mongo-cfg3
+    command: ["mongod","--configsvr","--replSet","cfgRS","--port","27021","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-cfg-init:
+    image: "mongo:7.0"
+    container_name: mongo-cfg-init
+    command: |
+      sh -lc "
+      sleep 8 &&
+      mongosh --host mongo-cfg1 --port 27019 --eval \"rs.initiate({_id:'cfgRS',configsvr:true,members:[{_id:0,host:'mongo-cfg1:27019'},{_id:1,host:'mongo-cfg2:27020'},{_id:2,host:'mongo-cfg3:27021'}]})\"
+      "
+    networks:
+      - stack
+    depends_on:
+      - mongo-cfg1
+      - mongo-cfg2
+      - mongo-cfg3
+
+  mongo-shard1a:
+    image: "mongo:7.0"
+    container_name: mongo-shard1a
+    command: ["mongod","--shardsvr","--replSet","shard1","--port","27030","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard1b:
+    image: "mongo:7.0"
+    container_name: mongo-shard1b
+    command: ["mongod","--shardsvr","--replSet","shard1","--port","27031","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard1c:
+    image: "mongo:7.0"
+    container_name: mongo-shard1c
+    command: ["mongod","--shardsvr","--replSet","shard1","--port","27032","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard1-init:
+    image: "mongo:7.0"
+    container_name: mongo-shard1-init
+    command: |
+      sh -lc "
+      sleep 8 &&
+      mongosh --host mongo-shard1a --port 27030 --eval \"rs.initiate({_id:'shard1',members:[{_id:0,host:'mongo-shard1a:27030'},{_id:1,host:'mongo-shard1b:27031'},{_id:2,host:'mongo-shard1c:27032'}]})\"
+      "
+    networks:
+      - stack
+    depends_on:
+      - mongo-shard1a
+      - mongo-shard1b
+      - mongo-shard1c
+
+  mongo-shard2a:
+    image: "mongo:7.0"
+    container_name: mongo-shard2a
+    command: ["mongod","--shardsvr","--replSet","shard2","--port","27033","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard2b:
+    image: "mongo:7.0"
+    container_name: mongo-shard2b
+    command: ["mongod","--shardsvr","--replSet","shard2","--port","27034","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard2c:
+    image: "mongo:7.0"
+    container_name: mongo-shard2c
+    command: ["mongod","--shardsvr","--replSet","shard2","--port","27035","--bind_ip","0.0.0.0"]
+    networks:
+      - stack
+
+  mongo-shard2-init:
+    image: "mongo:7.0"
+    container_name: mongo-shard2-init
+    command: |
+      sh -lc "
+      sleep 8 &&
+      mongosh --host mongo-shard2a --port 27033 --eval \"rs.initiate({_id:'shard2',members:[{_id:0,host:'mongo-shard2a:27033'},{_id:1,host:'mongo-shard2b:27034'},{_id:2,host:'mongo-shard2c:27035'}]})\"
+      "
+    networks:
+      - stack
+    depends_on:
+      - mongo-shard2a
+      - mongo-shard2b
+      - mongo-shard2c
+
+  mongos:
+    image: "mongo:7.0"
+    container_name: mongos
+    command: ["mongos","--configdb","cfgRS/mongo-cfg1:27019,mongo-cfg2:27020,mongo-cfg3:27021","--port","27017","--bind_ip","0.0.0.0"]
+    ports:
+      - "127.0.0.1:27017:27017"
+    networks:
+      - stack
+    depends_on:
+      - mongo-cfg-init
+      - mongo-shard1-init
+      - mongo-shard2-init
+
+  mongos-init:
+    image: "mongo:7.0"
+    container_name: mongos-init
+    command: |
+      sh -lc "
+      sleep 12 &&
+      mongosh --host mongos --port 27017 --eval \"sh.addShard('shard1/mongo-shard1a:27030,mongo-shard1b:27031,mongo-shard1c:27032'); sh.addShard('shard2/mongo-shard2a:27033,mongo-shard2b:27034,mongo-shard2c:27035'); sh.enableSharding('appdb');\"
+      "
+    networks:
+      - stack
+    depends_on:
+      - mongos
+
+  mongo-express:
+    image: "mongo-express:1.0.0"
+    container_name: mongo-express
+    environment:
+      ME_CONFIG_MONGODB_SERVER: "mongos"
+    ports:
+      - "127.0.0.1:8084:8081"
+    networks:
+      - stack
+    depends_on:
+      - mongos
+
+  haproxy-l4a:
+    image: "haproxy:2.9"
+    container_name: haproxy-l4a
+    command: |
+      sh -lc "
+      cat >/usr/local/etc/haproxy/haproxy.cfg <<'HAP'
+      global
+        maxconn 4096
+      defaults
+        mode tcp
+        timeout connect 5s
+        timeout client 50s
+        timeout server 50s
+      listen l4_redis
+        bind 0.0.0.0:8000
+        balance roundrobin
+        server r1 redis-7000:7000 check
+        server r2 redis-7001:7001 check
+        server r3 redis-7002:7002 check
+      HAP
+      haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      "
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - stack
+    depends_on:
+      - redis-7000
+      - redis-7001
+      - redis-7002
+
+  haproxy-l4b:
+    image: "haproxy:2.9"
+    container_name: haproxy-l4b
+    command: |
+      sh -lc "
+      cat >/usr/local/etc/haproxy/haproxy.cfg <<'HAP'
+      global
+        maxconn 4096
+      defaults
+        mode tcp
+        timeout connect 5s
+        timeout client 50s
+        timeout server 50s
+      listen l4_mysql
+        bind 0.0.0.0:8001
+        balance roundrobin
+        server m1 mariadb-node1:3306 check
+        server m2 mariadb-node2:3307 check
+        server m3 mariadb-node3:3308 check
+      HAP
+      haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      "
+    ports:
+      - "127.0.0.1:8001:8001"
+    networks:
+      - stack
+    depends_on:
+      - mariadb-node1
+      - mariadb-node2
+      - mariadb-node3
+
+  dirsrv:
+    image: "quay.io/389ds/dirsrv:1.4.6"
+    container_name: dirsrv
+    environment:
+      DS_DM_PASSWORD: "changeme"
+      DS_SUFFIX: "dc=example,dc=org"
+      DS_INSTANCE_NAME: "ldap"
+    ports:
+      - "127.0.0.1:1389:3389"
+      - "127.0.0.1:1636:3636"
+    networks:
+      - stack
+
+  phpldapadmin:
+    image: "osixia/phpldapadmin:0.9.0"
+    container_name: phpldapadmin
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: "dirsrv"
+      PHPLDAPADMIN_HTTPS: "false"
+    ports:
+      - "127.0.0.1:8082:80"
+    networks:
+      - stack
+    depends_on:
+      - dirsrv
+
+  prometheus:
+    image: "prom/prometheus:v2.54.1"
+    container_name: prometheus
+    command: |
+      sh -lc "
+      cat >/etc/prometheus/prometheus.yml <<'PROM'
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: rabbitmq
+          static_configs:
+            - targets: ['rabbitmq1:15672','rabbitmq2:15672']
+        - job_name: redis
+          static_configs:
+            - targets: ['redis-7000:7000','redis-7001:7001','redis-7002:7002','redis-7003:7003','redis-7004:7004','redis-7005:7005']
+        - job_name: mongodb
+          static_configs:
+            - targets: ['mongos:27017']
+        - job_name: mariadb
+          static_configs:
+            - targets: ['mariadb-node1:3306','mariadb-node2:3307','mariadb-node3:3308']
+      PROM
+      prometheus --config.file=/etc/prometheus/prometheus.yml --web.listen-address=0.0.0.0:9090
+      "
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - stack
+    depends_on:
+      - rabbitmq1
+      - redis-7000
+      - mongos
+      - mariadb-node1
+
+  grafana:
+    image: "grafana/grafana:11.2.2"
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "changeme"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - stack
+    depends_on:
+      - prometheus
+
+  waf1:
+    image: "owasp/modsecurity:apache"
+    container_name: waf1
+    command: |
+      sh -lc "
+      a2enmod proxy proxy_http ssl &&
+      printf '%s\n' '
+      ServerName localhost
+      Listen 8080
+      <VirtualHost *:8080>
+        ProxyPreserveHost On
+        ProxyPass / http://api1:8000/
+        ProxyPassReverse / http://api1:8000/
+        SecRuleEngine On
+        Include /etc/modsecurity/crs/crs-setup.conf
+        Include /etc/modsecurity/crs/rules/*.conf
+      </VirtualHost>
+      ' >/etc/apache2/sites-available/000-default.conf &&
+      service apache2 start && tail -f /var/log/apache2/access.log
+      "
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - stack
+    depends_on:
+      - api1
+
+  waf2:
+    image: "owasp/modsecurity:apache"
+    container_name: waf2
+    command: |
+      sh -lc "
+      a2enmod proxy proxy_http ssl &&
+      printf '%s\n' '
+      ServerName localhost
+      Listen 8081
+      <VirtualHost *:8081>
+        ProxyPreserveHost On
+        ProxyPass / http://api2:8000/
+        ProxyPassReverse / http://api2:8000/
+        SecRuleEngine On
+        Include /etc/modsecurity/crs/crs-setup.conf
+        Include /etc/modsecurity/crs/rules/*.conf
+      </VirtualHost>
+      ' >/etc/apache2/sites-available/000-default.conf &&
+      service apache2 start && tail -f /var/log/apache2/access.log
+      "
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks:
+      - stack
+    depends_on:
+      - api2
+
+  api1:
+    image: "python:3.12-slim"
+    container_name: api1
+    environment:
+      FLASK_ENV: "production"
+      LDAP_HOST: "dirsrv"
+      LDAP_BASE_DN: "dc=example,dc=org"
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-token"
+    command: |
+      sh -lc "
+      pip install --no-cache-dir flask gunicorn flask-ldap3-login pymysql hvac &&
+      cat >/app.py <<'PY'
+      from flask import Flask, request, jsonify, abort
+      from flask_ldap3_login import LDAP3LoginManager
+      from flask_ldap3_login import AuthenticationResponseStatus
+      import pymysql, os, hvac
+      app = Flask(__name__)
+      vault_addr = os.environ.get('VAULT_ADDR','http://vault:8200')
+      vault_token = os.environ.get('VAULT_TOKEN')
+      client = hvac.Client(url=vault_addr, token=vault_token)
+      secrets = client.secrets.kv.v2.read_secret_version(path='app/api1')
+      db_user = secrets['data']['data'].get('db_user','root')
+      db_pass = secrets['data']['data'].get('db_pass','changeme')
+      ldap_bind_pass = secrets['data']['data'].get('ldap_bind_pass','changeme')
+      app.config['LDAP_HOST'] = os.environ.get('LDAP_HOST','dirsrv')
+      app.config['LDAP_BASE_DN'] = os.environ.get('LDAP_BASE_DN','dc=example,dc=org')
+      app.config['LDAP_USER_DN'] = 'ou=People'
+      app.config['LDAP_GROUP_DN'] = 'ou=Groups'
+      app.config['LDAP_BIND_USER_DN'] = 'cn=Directory Manager'
+      app.config['LDAP_BIND_USER_PASSWORD'] = ldap_bind_pass
+      app.config['LDAP_USER_RDN_ATTR'] = 'uid'
+      app.config['LDAP_USER_LOGIN_ATTR'] = 'uid'
+      app.config['LDAP_GROUP_MEMBER_ATTR'] = 'member'
+      ldap_manager = LDAP3LoginManager(app)
+      def db():
+          return pymysql.connect(host='mariadb-node1',user=db_user,password=db_pass,db='appdb',cursorclass=pymysql.cursors.DictCursor)
+      @app.post('/login')
+      def login():
+          data = request.get_json() or {}
+          username = data.get('username'); password = data.get('password')
+          if not username or not password: abort(400)
+          r = ldap_manager.authenticate(username, password)
+          if r.status == AuthenticationResponseStatus.success:
+              return jsonify(message='authenticated'), 200
+          abort(401)
+      def authorized(username, resource):
+          conn = db()
+          with conn.cursor() as cur:
+              cur.execute(\"SELECT 1 FROM app_authorizations WHERE username=%s AND resource=%s\", (username, resource))
+              a = cur.fetchone()
+          conn.close()
+          return bool(a)
+      @app.get('/section/a')
+      def section_a():
+          username = request.headers.get('X-User')
+          if not username or not authorized(username, 'api1:section:a'): abort(403)
+          return jsonify(section='a', content='api1 section a')
+      @app.get('/section/b')
+      def section_b():
+          username = request.headers.get('X-User')
+          if not username or not authorized(username, 'api1:section:b'): abort(403)
+          return jsonify(section='b', content='api1 section b')
+      @app.get('/health')
+      def health():
+          return jsonify(status='ok', service='api1')
+      if __name__ == '__main__':
+          app.run(host='0.0.0.0', port=8000)
+      PY
+      exec gunicorn -w 2 -b 0.0.0.0:8000 app:app
+      "
+    networks:
+      - stack
+    depends_on:
+      - dirsrv
+      - mariadb-auth-seed
+      - mariadb-node1
+      - vault
+
+  api2:
+    image: "python:3.12-slim"
+    container_name: api2
+    environment:
+      FLASK_ENV: "production"
+      LDAP_HOST: "dirsrv"
+      LDAP_BASE_DN: "dc=example,dc=org"
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-token"
+    command: |
+      sh -lc "
+      pip install --no-cache-dir flask gunicorn flask-ldap3-login pymysql hvac &&
+      cat >/app.py <<'PY'
+      from flask import Flask, request, jsonify, abort
+      from flask_ldap3_login import LDAP3LoginManager
+      from flask_ldap3_login import AuthenticationResponseStatus
+      import pymysql, os, hvac
+      app = Flask(__name__)
+      vault_addr = os.environ.get('VAULT_ADDR','http://vault:8200')
+      vault_token = os.environ.get('VAULT_TOKEN')
+      client = hvac.Client(url=vault_addr, token=vault_token)
+      secrets = client.secrets.kv.v2.read_secret_version(path='app/api2')
+      db_user = secrets['data']['data'].get('db_user','root')
+      db_pass = secrets['data']['data'].get('db_pass','changeme')
+      ldap_bind_pass = secrets['data']['data'].get('ldap_bind_pass','changeme')
+      app.config['LDAP_HOST'] = os.environ.get('LDAP_HOST','dirsrv')
+      app.config['LDAP_BASE_DN'] = os.environ.get('LDAP_BASE_DN','dc=example,dc=org')
+      app.config['LDAP_USER_DN'] = 'ou=People'
+      app.config['LDAP_GROUP_DN'] = 'ou=Groups'
+      app.config['LDAP_BIND_USER_DN'] = 'cn=Directory Manager'
+      app.config['LDAP_BIND_USER_PASSWORD'] = ldap_bind_pass
+      app.config['LDAP_USER_RDN_ATTR'] = 'uid'
+      app.config['LDAP_USER_LOGIN_ATTR'] = 'uid'
+      app.config['LDAP_GROUP_MEMBER_ATTR'] = 'member'
+      ldap_manager = LDAP3LoginManager(app)
+      def db():
+          return pymysql.connect(host='mariadb-node1',user=db_user,password=db_pass,db='appdb',cursorclass=pymysql.cursors.DictCursor)
+      @app.post('/login')
+      def login():
+          data = request.get_json() or {}
+          username = data.get('username'); password = data.get('password')
+          if not username or not password: abort(400)
+          r = ldap_manager.authenticate(username, password)
+          if r.status == AuthenticationResponseStatus.success:
+              return jsonify(message='authenticated'), 200
+          abort(401)
+      def authorized(username, resource):
+          conn = db()
+          with conn.cursor() as cur:
+              cur.execute(\"SELECT 1 FROM app_authorizations WHERE username=%s AND resource=%s\", (username, resource))
+              a = cur.fetchone()
+          conn.close()
+          return bool(a)
+      @app.get('/section/x')
+      def section_x():
+          username = request.headers.get('X-User')
+          if not username or not authorized(username, 'api2:section:x'): abort(403)
+          return jsonify(section='x', content='api2 section x')
+      @app.get('/section/y')
+      def section_y():
+          username = request.headers.get('X-User')
+          if not username or not authorized(username, 'api2:section:y'): abort(403)
+          return jsonify(section='y', content='api2 section y')
+      @app.get('/health')
+      def health():
+          return jsonify(status='ok', service='api2')
+      if __name__ == '__main__':
+          app.run(host='0.0.0.0', port=8000)
+      PY
+      exec gunicorn -w 2 -b 0.0.0.0:8000 app:app
+      "
+    networks:
+      - stack
+    depends_on:
+      - dirsrv
+      - mariadb-auth-seed
+      - mariadb-node1
+      - vault
+
+  redis-commander-init:
+    image: "rediscommander/redis-commander:latest"
+    container_name: redis-commander-init
+    entrypoint: ["sh","-c","sleep 5 && exit 0"]
+    networks:
+      - stack
+    depends_on:
+      - redis-7000
+
+  prometheus-exporter:
+    image: "prom/node-exporter:v1.8.2"
+    container_name: node-exporter
+    networks:
+      - stack
+
+networks:
+  stack:
+    driver: bridge
