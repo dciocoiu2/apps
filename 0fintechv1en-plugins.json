@@ -1,0 +1,98 @@
+{
+  "data_plugins": {
+    "embedded_csv_sample": {
+      "type": "embedded_csv",
+      "csv": "timestamp,open,high,low,close,volume\n2024-01-02 09:30:00,100,101,99,100.5,10000\n2024-01-03 09:30:00,100.5,102,100,101.8,12000\n2024-01-04 09:30:00,101.8,103,101,102.5,15000\n2024-01-05 09:30:00,102.5,104,102,103.7,18000"
+    },
+    "http_csv_feed": {
+      "type": "http_text",
+      "url": "https://example.com/marketdata.csv",
+      "format": "csv"
+    },
+    "json_schema_feed": {
+      "type": "json_schema",
+      "data": [
+        { "ts": "2024-01-02 09:30:00", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10000 },
+        { "ts": "2024-01-03 09:30:00", "open": 100.5, "high": 102, "low": 100, "close": 101.8, "volume": 12000 }
+      ]
+    }
+  },
+  "strategy_plugins": {
+    "rsi_mean_reversion": {
+      "type": "rule_chain",
+      "params": { "rsiw": 14 },
+      "rules": [
+        { "if": "rsi(close,rsiw)<30", "do": "BUY", "qty": 500 },
+        { "if": "rsi(close,rsiw)>70", "do": "SELL_ALL" }
+      ]
+    },
+    "moving_average_crossover": {
+      "type": "rule_chain",
+      "params": { "fast": 20, "slow": 100 },
+      "rules": [
+        { "if": "sma(close,fast)>sma(close,slow)", "do": "BUY", "qty": 100 },
+        { "if": "sma(close,fast)<sma(close,slow)", "do": "SELL_ALL" }
+      ]
+    },
+    "pairs_trading": {
+      "type": "rule_chain",
+      "params": { "spread": 5 },
+      "rules": [
+        { "if": "sma(close,20)-sma(close,20)>spread", "do": "BUY", "qty": 100 },
+        { "if": "sma(close,20)-sma(close,20)<-spread", "do": "SELL_ALL" }
+      ]
+    },
+    "momentum_breakout": {
+      "type": "rule_chain",
+      "params": { "lookback": 50 },
+      "rules": [
+        { "if": "close>max(close,lookback)", "do": "BUY", "qty": 200 },
+        { "if": "close<min(close,lookback)", "do": "SELL_ALL" }
+      ]
+    }
+  },
+  "execution_plugins": {
+    "twap_exec": {
+      "twap": { "enabled": true, "slices": 20, "duration_ms": 1800000 },
+      "vwap": { "enabled": false, "window": 50 },
+      "pov": { "enabled": false, "participation": 0.1 }
+    },
+    "vwap_exec": {
+      "vwap": { "enabled": true, "window": 100 },
+      "twap": { "enabled": false, "slices": 10, "duration_ms": 600000 },
+      "pov": { "enabled": false, "participation": 0.1 }
+    },
+    "pov_exec": {
+      "pov": { "enabled": true, "participation": 0.2 },
+      "twap": { "enabled": false, "slices": 10, "duration_ms": 600000 },
+      "vwap": { "enabled": false, "window": 50 }
+    },
+    "iceberg_exec": {
+      "iceberg": { "enabled": true, "child_size": 1000 },
+      "twap": { "enabled": false, "slices": 10, "duration_ms": 600000 },
+      "vwap": { "enabled": false, "window": 50 },
+      "pov": { "enabled": false, "participation": 0.1 }
+    }
+  },
+  "risk_plugins": {
+    "risk_management_bundle": {
+      "limits": {
+        "max_position": 1000000,
+        "max_notional": 100000000,
+        "max_drawdown": 0.2,
+        "daily_loss_limit": 5000000,
+        "per_trade_loss_limit": 1000000
+      },
+      "kill_switch": {
+        "enabled": true,
+        "trigger_on_error": true,
+        "trigger_on_limit_breach": true
+      },
+      "rbac_overrides": {
+        "admin": ["config.write","run.execute","module.load","data.ingest","stream.manage","export.files"],
+        "ops": ["run.execute","data.ingest","stream.manage","export.files"],
+        "viewer": ["export.files"]
+      }
+    }
+  }
+}
