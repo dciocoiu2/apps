@@ -1,0 +1,49 @@
+{
+  "portfolio_profile": {
+    "name": "rsi_vwap_portfolio",
+    "description": "RSI mean reversion strategy with VWAP execution and strict risk controls",
+    "data": {
+      "plugin": "embedded_csv_sample",
+      "config": {
+        "type": "embedded_csv",
+        "csv": "timestamp,open,high,low,close,volume\n2024-01-02 09:30:00,100,101,99,100.5,10000\n2024-01-03 09:30:00,100.5,102,100,101.8,12000\n2024-01-04 09:30:00,101.8,103,101,102.5,15000\n2024-01-05 09:30:00,102.5,104,102,103.7,18000"
+      }
+    },
+    "strategy": {
+      "plugin": "rsi_mean_reversion",
+      "config": {
+        "type": "rule_chain",
+        "params": { "rsiw": 14 },
+        "rules": [
+          { "if": "rsi(close,rsiw)<30", "do": "BUY", "qty": 500 },
+          { "if": "rsi(close,rsiw)>70", "do": "SELL_ALL" }
+        ]
+      }
+    },
+    "execution": {
+      "plugin": "vwap_exec",
+      "config": {
+        "vwap": { "enabled": true, "window": 100 },
+        "twap": { "enabled": false, "slices": 10, "duration_ms": 600000 },
+        "pov": { "enabled": false, "participation": 0.1 }
+      }
+    },
+    "risk": {
+      "plugin": "risk_management_bundle_strict",
+      "config": {
+        "limits": {
+          "max_position": 500000,
+          "max_notional": 50000000,
+          "max_drawdown": 0.1,
+          "daily_loss_limit": 2000000,
+          "per_trade_loss_limit": 500000
+        },
+        "kill_switch": {
+          "enabled": true,
+          "trigger_on_error": true,
+          "trigger_on_limit_breach": true
+        }
+      }
+    }
+  }
+}
