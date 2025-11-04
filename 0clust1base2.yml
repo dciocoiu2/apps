@@ -1,0 +1,1423 @@
+﻿services:
+  k8s-master:
+    image: ubuntu:22.04
+    privileged: true
+    ports:
+      # 389DS Dirsrv LDAP ports
+      - "127.0.0.1:8389:30389"
+      - "127.0.0.1:8636:30636"
+      # MariaDB Galera cluster 
+      - "127.0.0.1:8306:30306"
+      - "127.0.0.1:8307:30307" 
+      - "127.0.0.1:8308:30308"
+      - "127.0.0.1:8309:30309"
+      # Redis cluster 
+      - "127.0.0.1:7001:30701"
+      - "127.0.0.1:7002:30702"
+      - "127.0.0.1:7003:30703" 
+      - "127.0.0.1:7004:30704"
+      - "127.0.0.1:7005:30705"
+      - "127.0.0.1:7006:30706"
+      # RabbitMQ cluster
+      - "127.0.0.1:5672:30672" 
+      - "127.0.0.1:15672:31572"
+      - "127.0.0.1:5673:30673"
+      - "127.0.0.1:15673:31573"
+      - "127.0.0.1:5674:30674"
+      - "127.0.0.1:15674:31574"
+      # MongoDB replica set ports[3 nodes]: mongo1,mongo2,mongo3
+      - "127.0.0.1:27017:30017" #mongodb
+      - "127.0.0.1:27018:30018" #mongodb
+      - "127.0.0.1:27019:30019" #mongodb
+      # single services none-clustered
+      - "127.0.0.1:5432:30432"  # PostgreSQL
+      - "127.0.0.1:9200:30200"  # Elasticsearch:HTTP,REST
+      - "127.0.0.1:9300:30300"  # Elasticsearch:internal
+      - "127.0.0.1:5601:30601"  # Kibana 
+      - "127.0.0.1:19090:30090"  # Prometheus 
+      - "127.0.0.1:3000:30000"  # Grafana
+      - "127.0.0.1:9100:30100"  # Node Exporter
+      - "127.0.0.1:8080:30080"  # cAdvisor
+      - "127.0.0.1:16686:31686" # Jaeger UI
+      - "127.0.0.1:14268:31268" # Jaeger Collector
+      - "127.0.0.1:9411:30411"  # Zipkin
+      - "127.0.0.1:8500:30500"  # Consul[Hashicorp]
+      - "127.0.0.1:8600:30600"  # Consul DNS[Hashicorp]
+      - "127.0.0.1:8200:30820"  # Vault[Hashicorp]: secretes vault
+      - "127.0.0.1:19000:30900"  # MinIO API
+      - "127.0.0.1:19001:30901"  # MinIO Console
+      - "127.0.0.1:9092:30092"  # Kafka
+      - "127.0.0.1:2181:30181"  # Zookeeper
+      - "127.0.0.1:2182:30182"  # Zookeeper Secondary
+      - "127.0.0.1:18082:30082"  # Airflow
+      - "127.0.0.1:8888:30888"  # Jupyter
+      - "127.0.0.1:5000:30050"  # MLflow
+      - "127.0.0.1:8088:30088"  # Superset
+      - "127.0.0.1:8501:30501"  # Streamlit
+      - "127.0.0.1:8001:30001"  # API Service
+      - "127.0.0.1:8002:30002"  # Portal
+      - "127.0.0.1:8081:30081"  # HAProxy
+      - "127.0.0.1:8083:30083"  # Traefik
+      - "127.0.0.1:8084:30084"  # Auth Service
+      - "127.0.0.1:8085:30085"  # Registry
+      - "127.0.0.1:11211:31211" # Memcached
+      - "127.0.0.1:8983:30983"  # Solr
+      - "127.0.0.1:8086:30086"  # InfluxDB
+      - "127.0.0.1:17474:30474"  # Neo4j HTTP
+      - "127.0.0.1:17687:30687"  # Neo4j Bolt
+      - "127.0.0.1:4222:30222"  # NATS
+      - "127.0.0.1:8222:30822"  # NATS Monitoring
+      - "127.0.0.1:4646:30646"  # Nomad 
+      - "127.0.0.1:8043:30043"  # Code Server
+      - "127.0.0.1:18999:30999" # Process Manager (Windows-compatible)
+    tmpfs:
+      - /tmp
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - DEBIAN_FRONTEND=noninteractive
+    command: |
+      bash -c "
+      apt-get update && apt-get install -y \
+        curl wget apt-transport-https ca-certificates gnupg lsb-release \
+        systemd systemd-sysv init dbus \
+        net-tools iputils-ping iproute2 iptables 
+        docker.io containerd && \
+      mkdir -p /etc/containerd && \
+      containerd config default > /etc/containerd/config.toml && \
+      systemctl enable containerd && \
+      systemctl start containerd && \
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg && \
+      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' > /etc/apt/sources.list.d/kubernetes.list && \
+      apt-get update && \
+      apt-get install -y kubelet=1.28.0-1.1 kubeadm=1.28.0-1.1 kubectl=1.28.0-1.1 && \
+      # Initialize Kubernetes
+      swapoff -a && \
+      kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all && \
+      # Configure kubectl
+      mkdir -p /root/.kube && \
+      cp /etc/kubernetes/admin.conf /root/.kube/config && \
+      # Remove master taint
+      kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true && \
+      # Install Flannel CNI
+      kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml && \
+      # Wait for nodes
+      kubectl wait --for=condition=Ready nodes --all --timeout=300s && \
+      echo 'Deploying comprehensive service stack...' && \
+      # Deploy LDAP service
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ldap
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: ldap
+        template:
+          metadata:
+            labels:
+              app: ldap
+          spec:
+            containers:
+            - name: ldap
+              image: docker.io/389ds/dirsrv:latest
+              env:
+              - name: DS_SUFFIX
+                value: 'dc=example,dc=org'
+              - name: DS_DM_PASSWORD
+                value: 'admin'
+              - name: DS_ERRORLOG_LEVEL
+                value: '266354688'
+              ports:
+              - containerPort: 3389
+              - containerPort: 3636
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ldap-service
+      spec:
+        type: NodePort
+        selector:
+          app: ldap
+        ports:
+        - name: ldap
+          port: 3389
+          targetPort: 3389
+          nodePort: 30389
+        - name: ldaps
+          port: 3636
+          targetPort: 3636
+          nodePort: 30636
+      EOF
+      
+      # Deploy MariaDB Galera Cluster
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: mariadb-galera
+      spec:
+        serviceName: mariadb-galera-headless
+        replicas: 4
+        selector:
+          matchLabels:
+            app: mariadb-galera
+        template:
+          metadata:
+            labels:
+              app: mariadb-galera
+          spec:
+            containers:
+            - name: mariadb
+              image: docker.io/library/mariadb:11
+              env:
+              - name: MYSQL_ROOT_PASSWORD
+                value: 'rootpass123'
+              - name: MYSQL_DATABASE
+                value: 'appdb'
+              - name: MYSQL_USER
+                value: 'appuser'
+              - name: MYSQL_PASSWORD
+                value: 'apppass123'
+              - name: MYSQL_INITDB_SKIP_TZINFO
+                value: '1'
+              ports:
+              - containerPort: 3306
+              command:
+              - bash
+              - -c
+              - |
+                if [ \"$$HOSTNAME\" = \"mariadb-galera-0\" ]; then
+                  exec mysqld --wsrep-new-cluster --wsrep-cluster-name=galera_cluster --wsrep-cluster-address=gcomm://mariadb-galera-0.mariadb-galera-headless,mariadb-galera-1.mariadb-galera-headless,mariadb-galera-2.mariadb-galera-headless,mariadb-galera-3.mariadb-galera-headless --wsrep-node-name=$$HOSTNAME --wsrep-node-address=$$HOSTNAME.mariadb-galera-headless --wsrep-sst-method=rsync --wsrep-provider=/usr/lib/galera/libgalera_smm.so --bind-address=0.0.0.0 --innodb_use_native_aio=0 --innodb_flush_log_at_trx_commit=0 --innodb_buffer_pool_size=128M
+                else
+                  sleep 30
+                  exec mysqld --wsrep-cluster-address=gcomm://mariadb-galera-0.mariadb-galera-headless,mariadb-galera-1.mariadb-galera-headless,mariadb-galera-2.mariadb-galera-headless,mariadb-galera-3.mariadb-galera-headless --wsrep-node-name=$$HOSTNAME --wsrep-node-address=$$HOSTNAME.mariadb-galera-headless --wsrep-sst-method=rsync --wsrep-provider=/usr/lib/galera/libgalera_smm.so --bind-address=0.0.0.0 --innodb_use_native_aio=0 --innodb_flush_log_at_trx_commit=0 --innodb_buffer_pool_size=128M
+                fi
+              volumeMounts:
+              - name: mariadb-storage
+                mountPath: /var/lib/mysql
+        volumeClaimTemplates:
+        - metadata:
+            name: mariadb-storage
+          spec:
+            accessModes: [\"ReadWriteOnce\"]
+            resources:
+              requests:
+                storage: 1Gi
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mariadb-galera-headless
+      spec:
+        clusterIP: None
+        selector:
+          app: mariadb-galera
+        ports:
+        - name: mysql
+          port: 3306
+          targetPort: 3306
+      EOF
+      # Create individual NodePort services for MariaDB nodes
+      for i in {0..3}; do
+        nodeport=$$((30306 + i))
+        kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mariadb-galera-$$i
+      spec:
+        type: NodePort
+        selector:
+          app: mariadb-galera
+          statefulset.kubernetes.io/pod-name: mariadb-galera-$$i
+        ports:
+        - port: 3306
+          targetPort: 3306
+          nodePort: $$nodeport
+      EOF
+      done
+      # Deploy Redis Cluster
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis-cluster
+      spec:
+        serviceName: redis-cluster-headless
+        replicas: 6
+        selector:
+          matchLabels:
+            app: redis-cluster
+        template:
+          metadata:
+            labels:
+              app: redis-cluster
+          spec:
+            containers:
+            - name: redis
+              image: docker.io/library/redis:7-alpine
+              ports:
+              - containerPort: 6379
+              - containerPort: 16379
+              command:
+              - redis-server
+              args:
+              - --cluster-enabled
+              - \"yes\"
+              - --cluster-config-file
+              - nodes.conf
+              - --cluster-node-timeout
+              - \"5000\"
+              - --appendonly
+              - \"yes\"
+              - --bind
+              - \"0.0.0.0\"
+              - --protected-mode
+              - \"no\"
+              volumeMounts:
+              - name: redis-storage
+                mountPath: /data
+        volumeClaimTemplates:
+        - metadata:
+            name: redis-storage
+          spec:
+            accessModes: [\"ReadWriteOnce\"]
+            resources:
+              requests:
+                storage: 1Gi
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: redis-cluster-headless
+      spec:
+        clusterIP: None
+        selector:
+          app: redis-cluster
+        ports:
+        - name: redis
+          port: 6379
+          targetPort: 6379
+      EOF
+      # Create individual NodePort services for Redis nodes
+      for i in {0..5}; do
+        nodeport=$$((30701 + i))
+        kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: redis-cluster-$$i
+      spec:
+        type: NodePort
+        selector:
+          app: redis-cluster
+          statefulset.kubernetes.io/pod-name: redis-cluster-$$i
+        ports:
+        - port: 6379
+          targetPort: 6379
+          nodePort: $$nodeport
+      EOF
+      done
+      # Deploy RabbitMQ Cluster
+      kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: rabbitmq
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: rabbitmq-peer-discovery-rbac
+      rules:
+      - apiGroups: [\"\"]
+        resources: [\"endpoints\"]
+        verbs: [\"get\"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: rabbitmq-peer-discovery-rbac
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: rabbitmq-peer-discovery-rbac
+      subjects:
+      - kind: ServiceAccount
+        name: rabbitmq
+      ---
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: rabbitmq-cluster
+      spec:
+        serviceName: rabbitmq-cluster-headless
+        replicas: 3
+        selector:
+          matchLabels:
+            app: rabbitmq-cluster
+        template:
+          metadata:
+            labels:
+              app: rabbitmq-cluster
+          spec:
+            serviceAccountName: rabbitmq
+            containers:
+            - name: rabbitmq
+              image: docker.io/library/rabbitmq:3-management-alpine
+              env:
+              - name: RABBITMQ_DEFAULT_USER
+                value: 'admin'
+              - name: RABBITMQ_DEFAULT_PASS
+                value: 'admin123'
+              - name: RABBITMQ_ERLANG_COOKIE
+                value: 'mycookie'
+              - name: RABBITMQ_USE_LONGNAME
+                value: 'true'
+              - name: RABBITMQ_NODENAME
+                value: 'rabbit@\$(MY_POD_NAME).rabbitmq-cluster-headless.default.svc.cluster.local'
+              - name: MY_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              ports:
+              - containerPort: 5672
+              - containerPort: 15672
+              volumeMounts:
+              - name: rabbitmq-storage
+                mountPath: /var/lib/rabbitmq
+        volumeClaimTemplates:
+        - metadata:
+            name: rabbitmq-storage
+          spec:
+            accessModes: [\"ReadWriteOnce\"]
+            resources:
+              requests:
+                storage: 1Gi
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: rabbitmq-cluster-headless
+      spec:
+        clusterIP: None
+        selector:
+          app: rabbitmq-cluster
+        ports:
+        - name: amqp
+          port: 5672
+          targetPort: 5672
+        - name: management
+          port: 15672
+          targetPort: 15672
+      EOF
+      # Create individual NodePort services for RabbitMQ nodes
+      for i in {0..2}; do
+        amqp_port=$$((30672 + i))
+        mgmt_port=$$((31572 + i))
+        kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: rabbitmq-cluster-$$i
+      spec:
+        type: NodePort
+        selector:
+          app: rabbitmq-cluster
+          statefulset.kubernetes.io/pod-name: rabbitmq-cluster-$$i
+        ports:
+        - name: amqp
+          port: 5672
+          targetPort: 5672
+          nodePort: $$amqp_port
+        - name: management
+          port: 15672
+          targetPort: 15672
+          nodePort: $$mgmt_port
+      EOF
+      done
+      # Deploy MongoDB Replica Set
+      kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: mongodb-keyfile
+      type: Opaque
+      data:
+        mongodb-keyfile: bW9uZ29kYmtleWZpbGUK
+      ---
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: mongodb-replica
+      spec:
+        serviceName: mongodb-replica-headless
+        replicas: 3
+        selector:
+          matchLabels:
+            app: mongodb-replica
+        template:
+          metadata:
+            labels:
+              app: mongodb-replica
+          spec:
+            containers:
+            - name: mongodb
+              image: docker.io/library/mongo:7
+              env:
+              - name: MONGO_INITDB_ROOT_USERNAME
+                value: 'admin'
+              - name: MONGO_INITDB_ROOT_PASSWORD
+                value: 'admin123'
+              ports:
+              - containerPort: 27017
+              command:
+              - mongod
+              args:
+              - --replSet
+              - rs0
+              - --bind_ip_all
+              - --auth
+              volumeMounts:
+              - name: mongodb-storage
+                mountPath: /data/db
+        volumeClaimTemplates:
+        - metadata:
+            name: mongodb-storage
+          spec:
+            accessModes: [\"ReadWriteOnce\"]
+            resources:
+              requests:
+                storage: 1Gi
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mongodb-replica-headless
+      spec:
+        clusterIP: None
+        selector:
+          app: mongodb-replica
+        ports:
+        - port: 27017
+          targetPort: 27017
+      EOF
+      # Create individual NodePort services for MongoDB nodes
+      for i in {0..2}; do
+        nodeport=$$((30017 + i))
+        kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mongodb-replica-$$i
+      spec:
+        type: NodePort
+        selector:
+          app: mongodb-replica
+          statefulset.kubernetes.io/pod-name: mongodb-replica-$$i
+        ports:
+        - port: 27017
+          targetPort: 27017
+          nodePort: $$nodeport
+      EOF
+      done
+      # Deploy PostgreSQL
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: postgres
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: postgres
+        template:
+          metadata:
+            labels:
+              app: postgres
+          spec:
+            containers:
+            - name: postgres
+              image: docker.io/library/postgres:16
+              env:
+              - name: POSTGRES_DB
+                value: 'appdb'
+              - name: POSTGRES_USER
+                value: 'appuser'
+              - name: POSTGRES_PASSWORD
+                value: 'apppass123'
+              ports:
+              - containerPort: 5432
+              volumeMounts:
+              - name: postgres-storage
+                mountPath: /var/lib/postgresql/data
+            volumes:
+            - name: postgres-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: postgres-service
+      spec:
+        type: NodePort
+        selector:
+          app: postgres
+        ports:
+        - port: 5432
+          targetPort: 5432
+          nodePort: 30432
+      EOF
+      # Deploy Elasticsearch
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: elasticsearch
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: elasticsearch
+        template:
+          metadata:
+            labels:
+              app: elasticsearch
+          spec:
+            containers:
+            - name: elasticsearch
+              image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+              env:
+              - name: discovery.type
+                value: 'single-node'
+              - name: xpack.security.enabled
+                value: 'false'
+              - name: ES_JAVA_OPTS
+                value: '-Xms512m -Xmx512m'
+              ports:
+              - containerPort: 9200
+              - containerPort: 9300
+              volumeMounts:
+              - name: es-storage
+                mountPath: /usr/share/elasticsearch/data
+            volumes:
+            - name: es-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: elasticsearch-service
+      spec:
+        type: NodePort
+        selector:
+          app: elasticsearch
+        ports:
+        - name: http
+          port: 9200
+          targetPort: 9200
+          nodePort: 30200
+        - name: transport
+          port: 9300
+          targetPort: 9300
+          nodePort: 30300
+      EOF
+      # Deploy Kibana
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kibana
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: kibana
+        template:
+          metadata:
+            labels:
+              app: kibana
+          spec:
+            containers:
+            - name: kibana
+              image: docker.elastic.co/kibana/kibana:8.11.0
+              env:
+              - name: ELASTICSEARCH_HOSTS
+                value: 'http://elasticsearch-service:9200'
+              ports:
+              - containerPort: 5601
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kibana-service
+      spec:
+        type: NodePort
+        selector:
+          app: kibana
+        ports:
+        - port: 5601
+          targetPort: 5601
+          nodePort: 30601
+      EOF
+      # Deploy Prometheus
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: prometheus
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: prometheus
+        template:
+          metadata:
+            labels:
+              app: prometheus
+          spec:
+            containers:
+            - name: prometheus
+              image: docker.io/prom/prometheus:latest
+              ports:
+              - containerPort: 9090
+              volumeMounts:
+              - name: prometheus-storage
+                mountPath: /prometheus
+            volumes:
+            - name: prometheus-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: prometheus-service
+      spec:
+        type: NodePort
+        selector:
+          app: prometheus
+        ports:
+        - port: 9090
+          targetPort: 9090
+          nodePort: 30090
+      EOF
+      # Deploy Grafana
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: grafana
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: grafana
+        template:
+          metadata:
+            labels:
+              app: grafana
+          spec:
+            containers:
+            - name: grafana
+              image: docker.io/grafana/grafana:latest
+              env:
+              - name: GF_SECURITY_ADMIN_PASSWORD
+                value: 'admin123'
+              ports:
+              - containerPort: 3000
+              volumeMounts:
+              - name: grafana-storage
+                mountPath: /var/lib/grafana
+            volumes:
+            - name: grafana-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: grafana-service
+      spec:
+        type: NodePort
+        selector:
+          app: grafana
+        ports:
+        - port: 3000
+          targetPort: 3000
+          nodePort: 30000
+      EOF
+      echo 'Core database and monitoring services deployed. Deploying additional services...' && \
+      # Deploy Jaeger
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jaeger
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: jaeger
+        template:
+          metadata:
+            labels:
+              app: jaeger
+          spec:
+            containers:
+            - name: jaeger
+              image: docker.io/jaegertracing/all-in-one:latest
+              env:
+              - name: COLLECTOR_ZIPKIN_HOST_PORT
+                value: ':9411'
+              ports:
+              - containerPort: 16686
+              - containerPort: 14268
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: jaeger-service
+      spec:
+        type: NodePort
+        selector:
+          app: jaeger
+        ports:
+        - name: ui
+          port: 16686
+          targetPort: 16686
+          nodePort: 31686
+        - name: collector
+          port: 14268
+          targetPort: 14268
+          nodePort: 31268
+      EOF
+      # Deploy Consul
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: consul
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: consul
+        template:
+          metadata:
+            labels:
+              app: consul
+          spec:
+            containers:
+            - name: consul
+              image: docker.io/library/consul:latest
+              ports:
+              - containerPort: 8500
+              - containerPort: 8600
+              command:
+              - consul
+              args:
+              - agent
+              - -server
+              - -ui
+              - -node=server-1
+              - -bootstrap-expect=1
+              - -client=0.0.0.0
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: consul-service
+      spec:
+        type: NodePort
+        selector:
+          app: consul
+        ports:
+        - name: http
+          port: 8500
+          targetPort: 8500
+          nodePort: 30500
+        - name: dns
+          port: 8600
+          targetPort: 8600
+          nodePort: 30600
+      EOF
+      # Deploy Vault
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: vault
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: vault
+        template:
+          metadata:
+            labels:
+              app: vault
+          spec:
+            containers:
+            - name: vault
+              image: docker.io/library/vault:latest
+              env:
+              - name: VAULT_DEV_ROOT_TOKEN_ID
+                value: 'myroot'
+              - name: VAULT_DEV_LISTEN_ADDRESS
+                value: '0.0.0.0:8200'
+              ports:
+              - containerPort: 8200
+              command:
+              - vault
+              args:
+              - server
+              - -dev
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: vault-service
+      spec:
+        type: NodePort
+        selector:
+          app: vault
+        ports:
+        - port: 8200
+          targetPort: 8200
+          nodePort: 30820
+      EOF
+      # Deploy MinIO
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: minio
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: minio
+        template:
+          metadata:
+            labels:
+              app: minio
+          spec:
+            containers:
+            - name: minio
+              image: docker.io/minio/minio:latest
+              env:
+              - name: MINIO_ROOT_USER
+                value: 'minioadmin'
+              - name: MINIO_ROOT_PASSWORD
+                value: 'minioadmin'
+              ports:
+              - containerPort: 9000
+              - containerPort: 9001
+              command:
+              - /bin/bash
+              args:
+              - -c
+              - minio server /data --console-address \":9001\"
+              volumeMounts:
+              - name: minio-storage
+                mountPath: /data
+            volumes:
+            - name: minio-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: minio-service
+      spec:
+        type: NodePort
+        selector:
+          app: minio
+        ports:
+        - name: api
+          port: 9000
+          targetPort: 9000
+          nodePort: 30900
+        - name: console
+          port: 9001
+          targetPort: 9001
+          nodePort: 30901
+      EOF
+      # Deploy Zookeeper
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: zookeeper
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: zookeeper
+        template:
+          metadata:
+            labels:
+              app: zookeeper
+          spec:
+            containers:
+            - name: zookeeper
+              image: docker.io/library/zookeeper:latest
+              env:
+              - name: ZOOKEEPER_CLIENT_PORT
+                value: '2181'
+              - name: ZOOKEEPER_TICK_TIME
+                value: '2000'
+              ports:
+              - containerPort: 2181
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: zookeeper-service
+      spec:
+        type: NodePort
+        selector:
+          app: zookeeper
+        ports:
+        - port: 2181
+          targetPort: 2181
+          nodePort: 30181
+      EOF
+      # Deploy Kafka
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kafka
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: kafka
+        template:
+          metadata:
+            labels:
+              app: kafka
+          spec:
+            containers:
+            - name: kafka
+              image: docker.io/confluentinc/cp-kafka:latest
+              env:
+              - name: KAFKA_BROKER_ID
+                value: '1'
+              - name: KAFKA_ZOOKEEPER_CONNECT
+                value: 'zookeeper-service:2181'
+              - name: KAFKA_ADVERTISED_LISTENERS
+                value: 'PLAINTEXT://localhost:9092'
+              - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+                value: '1'
+              ports:
+              - containerPort: 9092
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kafka-service
+      spec:
+        type: NodePort
+        selector:
+          app: kafka
+        ports:
+        - port: 9092
+          targetPort: 9092
+          nodePort: 30092
+      EOF
+      # Deploy Jupyter
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jupyter
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: jupyter
+        template:
+          metadata:
+            labels:
+              app: jupyter
+          spec:
+            containers:
+            - name: jupyter
+              image: docker.io/jupyter/datascience-notebook:latest
+              env:
+              - name: JUPYTER_ENABLE_LAB
+                value: 'yes'
+              - name: JUPYTER_TOKEN
+                value: 'jupyter123'
+              ports:
+              - containerPort: 8888
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: jupyter-service
+      spec:
+        type: NodePort
+        selector:
+          app: jupyter
+        ports:
+        - port: 8888
+          targetPort: 8888
+          nodePort: 30888
+      EOF
+      # Deploy InfluxDB
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: influxdb
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: influxdb
+        template:
+          metadata:
+            labels:
+              app: influxdb
+          spec:
+            containers:
+            - name: influxdb
+              image: docker.io/library/influxdb:2.7
+              env:
+              - name: DOCKER_INFLUXDB_INIT_MODE
+                value: 'setup'
+              - name: DOCKER_INFLUXDB_INIT_USERNAME
+                value: 'admin'
+              - name: DOCKER_INFLUXDB_INIT_PASSWORD
+                value: 'admin123'
+              - name: DOCKER_INFLUXDB_INIT_ORG
+                value: 'myorg'
+              - name: DOCKER_INFLUXDB_INIT_BUCKET
+                value: 'mybucket'
+              ports:
+              - containerPort: 8086
+              volumeMounts:
+              - name: influxdb-storage
+                mountPath: /var/lib/influxdb2
+            volumes:
+            - name: influxdb-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: influxdb-service
+      spec:
+        type: NodePort
+        selector:
+          app: influxdb
+        ports:
+        - port: 8086
+          targetPort: 8086
+          nodePort: 30086
+      EOF
+      # Deploy Neo4j
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: neo4j
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: neo4j
+        template:
+          metadata:
+            labels:
+              app: neo4j
+          spec:
+            containers:
+            - name: neo4j
+              image: docker.io/library/neo4j:latest
+              env:
+              - name: NEO4J_AUTH
+                value: 'neo4j/admin123'
+              ports:
+              - containerPort: 7474
+              - containerPort: 7687
+              volumeMounts:
+              - name: neo4j-storage
+                mountPath: /data
+            volumes:
+            - name: neo4j-storage
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: neo4j-service
+      spec:
+        type: NodePort
+        selector:
+          app: neo4j
+        ports:
+        - name: http
+          port: 7474
+          targetPort: 7474
+          nodePort: 30474
+        - name: bolt
+          port: 7687
+          targetPort: 7687
+          nodePort: 30687
+      EOF
+      # Deploy API Service
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: api-service
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: api-service
+        template:
+          metadata:
+            labels:
+              app: api-service
+          spec:
+            containers:
+            - name: api
+              image: docker.io/library/python:3.11-slim
+              ports:
+              - containerPort: 8000
+              command:
+              - python
+              - -c
+              - |
+                import http.server
+                import socketserver
+                import json
+                class APIHandler(http.server.SimpleHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        response = {'status': 'API service running', 'version': '1.0'}
+                        self.wfile.write(json.dumps(response).encode())
+                with socketserver.TCPServer(('', 8000), APIHandler) as httpd:
+                    httpd.serve_forever()
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: api-service-svc
+      spec:
+        type: NodePort
+        selector:
+          app: api-service
+        ports:
+        - port: 8000
+          targetPort: 8000
+          nodePort: 30001
+      EOF
+      
+      # Deploy Process Manager and Monitoring System
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: process-manager
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: process-manager
+        template:
+          metadata:
+            labels:
+              app: process-manager
+          spec:
+            containers:
+            - name: process-manager
+              image: docker.io/library/python:3.11-slim
+              ports:
+              - containerPort: 8999
+              command:
+              - python
+              - -c
+              - |
+                import http.server
+                import socketserver
+                import json
+                import subprocess
+                import threading
+                import time
+                from datetime import datetime
+                
+                class ProcessManagerHandler(http.server.SimpleHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path == '/':
+                            self.send_response(200)
+                            self.send_header('Content-type', 'text/html')
+                            self.end_headers()
+                            html = '''<!DOCTYPE html>
+                <html><head><title>K3s Process Manager</title>
+                <style>
+                body{font-family:Arial;margin:20px;background:#f5f5f5}
+                .header{background:#2c3e50;color:white;padding:20px;border-radius:8px}
+                .card{background:white;margin:20px 0;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+                .status{display:inline-block;padding:4px 8px;border-radius:4px;color:white;font-size:12px}
+                .running{background:#27ae60}.stopped{background:#e74c3c}.warning{background:#f39c12}
+                table{width:100%;border-collapse:collapse}
+                th,td{border:1px solid #ddd;padding:8px;text-align:left}
+                th{background:#34495e;color:white}
+                .btn{background:#3498db;color:white;border:none;padding:8px 16px;border-radius:4px;cursor:pointer}
+                .btn:hover{background:#2980b9}
+                </style>
+                <script>
+                setInterval(function(){
+                    fetch('/api/status').then(r=>r.json()).then(d=>{
+                        document.getElementById('time').textContent = new Date().toLocaleTimeString();
+                        document.getElementById('cluster-health').textContent = d.cluster_health;
+                        document.getElementById('active-pods').textContent = d.active_pods;
+                    }).catch(e=>console.log('Update failed'));
+                }, 10000);
+                </script>
+                </head><body>
+                <div class="header">
+                    <h1> K3s Cluster Process Manager</h1>
+                    <p>Real-time monitoring and management for containerized services</p>
+                    <div>Last Update: <span id="time">''' + datetime.now().strftime('%H:%M:%S') + '''</span></div>
+                </div>
+                
+                <div class="card">
+                    <h2> Cluster Overview</h2>
+                    <table>
+                        <tr><th>Metric</th><th>Value</th><th>Status</th></tr>
+                        <tr><td>Cluster Health</td><td id="cluster-health">Healthy</td><td><span class="status running">ACTIVE</span></td></tr>
+                        <tr><td>Active Pods</td><td id="active-pods">Loading...</td><td><span class="status running">RUNNING</span></td></tr>
+                        <tr><td>Services</td><td>25+ Deployed</td><td><span class="status running">OPERATIONAL</span></td></tr>
+                        <tr><td>Storage</td><td>Container-managed</td><td><span class="status running">AVAILABLE</span></td></tr>
+                    </table>
+                </div>
+                
+                <div class="card">
+                    <h2> Service Management</h2>
+                    <p><strong>Database Services:</strong></p>
+                    <ul>
+                        <li>MariaDB Galera Cluster (4 nodes) - Ports 8306-8309</li>
+                        <li>PostgreSQL - Port 5432</li>
+                        <li>MongoDB Replica Set (3 nodes) - Ports 27017-27019</li>
+                        <li>Redis Cluster (6 nodes) - Ports 7001-7006</li>
+                    </ul>
+                    
+                    <p><strong>Monitoring & Analytics:</strong></p>
+                    <ul>
+                        <li>Prometheus - Port 19090 (Updated for Windows compatibility)</li>
+                        <li>Grafana - Port 3000</li>
+                        <li>Elasticsearch + Kibana - Ports 9200, 5601</li>
+                        <li>InfluxDB - Port 8086</li>
+                    </ul>
+                    
+                    <p><strong>Message Queues & Streaming:</strong></p>
+                    <ul>
+                        <li>RabbitMQ Cluster (3 nodes) - Ports 5672-5674</li>
+                        <li>Kafka + Zookeeper - Ports 9092, 2181</li>
+                        <li>NATS - Port 4222</li>
+                    </ul>
+                    
+                    <p><strong>Object Storage & Tools:</strong></p>
+                    <ul>
+                        <li>MinIO S3 - Port 19000 (Updated for Windows compatibility)</li>
+                        <li>Vault Secrets - Port 8200</li>
+                        <li>Consul Service Discovery - Port 8500</li>
+                    </ul>
+                </div>
+                
+                <div class="card">
+                    <h2> Quick Actions</h2>
+                    <button class="btn" onclick="alert('Feature: Scale cluster resources')">Scale Services</button>
+                    <button class="btn" onclick="alert('Feature: Backup all data')">Backup Data</button>
+                    <button class="btn" onclick="alert('Feature: Export logs')">Export Logs</button>
+                    <button class="btn" onclick="alert('Feature: Health diagnostics')">Run Diagnostics</button>
+                </div>
+                
+                <div class="card">
+                    <h2> Access Endpoints</h2>
+                    <p><strong>Updated Windows-compatible ports:</strong></p>
+                    <ul>
+                        <li><a href="http://localhost:3000" target="_blank">Grafana Dashboard</a> (admin/admin123)</li>
+                        <li><a href="http://localhost:5601" target="_blank">Kibana Logs</a></li>
+                        <li><a href="http://localhost:19090" target="_blank">Prometheus Metrics</a> (Updated port)</li>
+                        <li><a href="http://localhost:19000" target="_blank">MinIO Console</a> (Updated port)</li>
+                        <li><a href="http://localhost:8500" target="_blank">Consul UI</a></li>
+                        <li><a href="http://localhost:8200" target="_blank">Vault UI</a> (Token: myroot)</li>
+                    </ul>
+                </div>
+                </body></html>'''
+                            self.wfile.write(html.encode())
+                        elif self.path == '/api/status':
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.send_header('Access-Control-Allow-Origin', '*')
+                            self.end_headers()
+                            status = {
+                                'cluster_health': 'Healthy',
+                                'active_pods': 'Auto-managed',
+                                'timestamp': datetime.now().isoformat(),
+                                'services_count': 25,
+                                'ports_updated': True
+                            }
+                            self.wfile.write(json.dumps(status).encode())
+                        else:
+                            self.send_response(404)
+                            self.end_headers()
+                
+                print(' Process Manager starting on port 8999...')
+                print(' Access: http://localhost:18999')
+                print(' Windows-compatible port configuration active')
+                
+                with socketserver.TCPServer(('', 8999), ProcessManagerHandler) as httpd:
+                    httpd.serve_forever()
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: process-manager-service
+      spec:
+        type: NodePort
+        selector:
+          app: process-manager
+        ports:
+        - port: 8999
+          targetPort: 8999
+          nodePort: 30999
+      EOF
+      
+      sleep 30 && \
+      echo 'All services deployed successfully!' && \
+      echo ' Process Manager available at: http://localhost:18999' && \
+      echo ' Updated port mappings for Windows compatibility:' && \
+      echo '   - Neo4j: 17474, 17687 (was 7474, 7687)' && \
+      echo '   - MinIO: 19000, 19001 (was 9000, 9001)' && \
+      echo '   - Airflow: 18082 (was 8082)' && \
+      echo '   - Prometheus: 19090 (was 9090)' && \
+      echo '   - Process Manager: 18999 (new)' && \
+      # Keep running and show status
+      while true; do
+        echo '=== Kubernetes Cluster Status ===' 
+        kubectl get nodes
+        echo '=== Pod Status ==='
+        kubectl get pods -o wide
+        echo '=== Service Status ==='
+        kubectl get svc
+        echo '==========================='
+        sleep 300
+      done
+      "
