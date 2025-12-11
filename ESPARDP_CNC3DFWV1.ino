@@ -1,4 +1,5 @@
 #include <Arduino.h>
+/*firmware for esp32 and rpi pico for cnc and 3d printer*/ 
 
 #if defined(ARDUINO_RASPBERRY_PI_PICO) || defined(ARDUINO_RASPBERRY_PI_PICO_W) || defined(ARDUINO_RASPBERRY_PI_PICO2) || defined(ARDUINO_RASPBERRY_PI_PICO2W)
   #define BOARD_FAM_RPXX
