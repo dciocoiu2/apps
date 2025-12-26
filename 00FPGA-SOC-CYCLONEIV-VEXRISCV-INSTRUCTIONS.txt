@@ -1,0 +1,1581 @@
+================================================================================
+VEXRISCV INSTRUMENT SOC ON DUEPROLOGIC – FULL STEP‑BY‑STEP BUILD
+(DSP + DDS/NCO + LOGIC ANALYZER + USB PROTOCOL ANALYZER + SCOPE, PYTHON CONTROL)
+================================================================================
+
+This is a complete, end‑to‑end build using:
+
+- CPU: VexRiscv (RISC‑V 32‑bit) with Wishbone instruction + data buses
+- Board: Altera Cyclone IV FPGA Development Board – DueProLogic (EP4CE6‑class)
+- Tool: Quartus Prime Lite
+- Host: Python 3 with pyserial, numpy, scipy, matplotlib
+- Behavior:
+  - FPGA implements a VexRiscv SoC with:
+    - DSP FIR accelerator
+    - DDS/NCO generator
+    - Logic analyzer
+    - USB edge/time analyzer (decoded in Python)
+    - Scope / sampler
+  - Host Python scripts:
+    - Define DSP function (FIR coefficients)
+    - Define NCO/DDS parameters
+    - Decode USB protocol on PC
+  - Configuration is VOLATILE ONLY:
+    - You program .sof via JTAG into FPGA SRAM
+    - You DO NOT program config flash
+    - Power off → board reverts to factory/demo bitstream
+
+You must adapt:
+- Exact VexRiscv Verilog file name from your generation step
+- Exact DueProLogic pin numbers (from board documentation)
+
+Everything else here is explicit.
+
+-------------------------------------------------------------------------------
+1. DIRECTORY STRUCTURE
+-------------------------------------------------------------------------------
+
+Create the following structure:
+
+lm32_lab_soc/     <-- (we keep the same root name; you can rename if you like)
+  rtl/
+    vexriscv/               # VexRiscv RTL (generated)
+    wb/
+      wb_interconnect.v
+      wb_rom.v
+      wb_ram.v
+      wb_uart.v
+      wb_gpio.v
+      wb_dsp.v
+      wb_dds.v
+      wb_logic_analyzer.v
+      wb_usb_analyzer.v
+      wb_scope.v
+  top/
+    soc_top.v               # Top-level RTL (VexRiscv + WB fabric + peripherals)
+  firmware/
+    crt0.S                  # RISC-V startup
+    main.c                  # UART command interpreter
+    hw.h                    # Memory-mapped registers
+    uart.c
+    uart.h
+    dsp.c
+    dsp.h
+    logic_analyzer.c
+    logic_analyzer.h
+    usb_analyzer.c
+    usb_analyzer.h
+    scope.c
+    scope.h
+    linker.ld               # RISC-V memory layout
+    Makefile                # Uses riscv32-unknown-elf-gcc
+  host/
+    common.py               # UART link helper
+    dsp_host.py
+    dds_host.py
+    logic_analyzer_host.py
+    scope_host.py
+    usb_analyzer_host.py
+  quartus/
+    vexriscv_lab_soc.qpf    # Quartus project (created by Quartus)
+    vexriscv_lab_soc.qsf    # Quartus settings (created by Quartus)
+    pin_notes.txt           # Your manual notes for pin mapping
+
+Create directories:
+
+mkdir -p lm32_lab_soc/rtl/wb
+mkdir -p lm32_lab_soc/rtl/vexriscv
+mkdir -p lm32_lab_soc/top
+mkdir -p lm32_lab_soc/firmware
+mkdir -p lm32_lab_soc/host
+mkdir -p lm32_lab_soc/quartus
+
+-------------------------------------------------------------------------------
+2. GET VEXRISCV RTL
+-------------------------------------------------------------------------------
+
+You need VexRiscv generated with Wishbone iBus and dBus.
+
+Install sbt and Java, then:
+
+cd lm32_lab_soc/rtl
+git clone https://github.com/SpinalHDL/VexRiscv.git
+cd VexRiscv
+
+Generate a core with Wishbone buses. For example, use the default Wishbone configuration; for simplicity, assume the provided `GenCoreDefault` (or similar) creates a file `VexRiscv.v` under `VexRiscv/` or `VexRiscv/rtl/`.
+
+Example command (you may need to adapt to the repo’s doc):
+
+sbt "runMain vexriscv.GenCoreDefault"
+
+After generation, copy or symlink the resulting `VexRiscv.v` into:
+
+cp path/to/generated/VexRiscv.v ../vexriscv/
+
+Now your RTL CPU is:
+
+lm32_lab_soc/rtl/vexriscv/VexRiscv.v
+
+We assume the VexRiscv instance has the following Wishbone ports (a standard Wishbone plugin):
+
+- Instruction bus:
+  - iBusWishbone_ADR
+  - iBusWishbone_DAT_MISO
+  - iBusWishbone_DAT_MOSI
+  - iBusWishbone_SEL
+  - iBusWishbone_CYC
+  - iBusWishbone_STB
+  - iBusWishbone_WE
+  - iBusWishbone_ACK
+  - iBusWishbone_ERR
+- Data bus:
+  - dBusWishbone_ADR
+  - dBusWishbone_DAT_MISO
+  - dBusWishbone_DAT_MOSI
+  - dBusWishbone_SEL
+  - dBusWishbone_CYC
+  - dBusWishbone_STB
+  - dBusWishbone_WE
+  - dBusWishbone_ACK
+  - dBusWishbone_ERR
+- Core control:
+  - clk
+  - reset
+
+If the generated core uses slightly different names, you must adjust the instance in soc_top.v accordingly.
+
+-------------------------------------------------------------------------------
+3. WISHBONE PERIPHERALS RTL
+-------------------------------------------------------------------------------
+
+All the following Verilog is identical in concept to the LM32 version; only the CPU is changed. Place them in lm32_lab_soc/rtl/wb.
+
+3.1 wb_rom.v
+------------
+
+16 KB ROM at 0x0000_0000, for instruction fetch:
+
+File: lm32_lab_soc/rtl/wb/wb_rom.v
+
+--------------------------------------------------------------------------------
+module wb_rom #(
+    parameter AW = 12
+) (
+    input  wire         clk,
+    input  wire         rst,
+    input  wire [31:0]  wb_adr_i,
+    input  wire         wb_stb_i,
+    input  wire         wb_cyc_i,
+    input  wire         wb_we_i,
+    input  wire [3:0]   wb_sel_i,
+    input  wire [31:0]  wb_dat_i,
+    output reg  [31:0]  wb_dat_o,
+    output reg          wb_ack_o
+);
+    reg [31:0] mem [0:(1<<AW)-1];
+
+    initial begin
+        $readmemh("firmware.hex", mem);
+    end
+
+    wire [AW-1:0] addr = wb_adr_i[AW+1:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h00000000;
+        end else begin
+            wb_ack_o <= 1'b0;
+            if (wb_cyc_i && wb_stb_i && !wb_we_i) begin
+                wb_dat_o <= mem[addr];
+                wb_ack_o <= 1'b1;
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.2 wb_ram.v
+------------
+
+8 KB data RAM at 0x1000_0000:
+
+File: lm32_lab_soc/rtl/wb/wb_ram.v
+
+--------------------------------------------------------------------------------
+module wb_ram #(
+    parameter AW = 11
+) (
+    input  wire         clk,
+    input  wire         rst,
+    input  wire [31:0]  wb_adr_i,
+    input  wire         wb_stb_i,
+    input  wire         wb_cyc_i,
+    input  wire         wb_we_i,
+    input  wire [3:0]   wb_sel_i,
+    input  wire [31:0]  wb_dat_i,
+    output reg  [31:0]  wb_dat_o,
+    output reg          wb_ack_o
+);
+    reg [31:0] mem [0:(1<<AW)-1];
+
+    wire [AW-1:0] addr = wb_adr_i[AW+1:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+        end else begin
+            wb_ack_o <= 1'b0;
+            if (wb_cyc_i && wb_stb_i) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    if (wb_sel_i[0]) mem[addr][7:0]   <= wb_dat_i[7:0];
+                    if (wb_sel_i[1]) mem[addr][15:8]  <= wb_dat_i[15:8];
+                    if (wb_sel_i[2]) mem[addr][23:16] <= wb_dat_i[23:16];
+                    if (wb_sel_i[3]) mem[addr][31:24] <= wb_dat_i[31:24];
+                end
+                wb_dat_o <= mem[addr];
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.3 wb_uart.v
+-------------
+
+UART at 0x2000_0000:
+
+File: lm32_lab_soc/rtl/wb/wb_uart.v
+
+--------------------------------------------------------------------------------
+module wb_uart #(
+    parameter CLOCK_HZ = 50000000,
+    parameter BAUD     = 115200
+) (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [31:0] wb_adr_i,
+    input  wire        wb_stb_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    output reg         wb_ack_o,
+    input  wire        rx,
+    output wire        tx
+);
+    localparam integer DIV = CLOCK_HZ / BAUD;
+
+    reg [9:0]  tx_shift;
+    reg [15:0] tx_cnt;
+    reg [3:0]  tx_bit;
+    reg        tx_busy;
+    reg        tx_reg;
+    assign tx = tx_reg;
+
+    reg [9:0]  rx_shift;
+    reg [15:0] rx_cnt;
+    reg [3:0]  rx_bit;
+    reg        rx_busy;
+    reg [7:0]  rx_data;
+    reg        rx_ready;
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [3:0] word_off = wb_adr_i[5:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o  <= 1'b0;
+            wb_dat_o  <= 32'h0;
+            tx_reg    <= 1'b1;
+            tx_busy   <= 1'b0;
+            tx_cnt    <= 16'd0;
+            tx_bit    <= 4'd0;
+            rx_busy   <= 1'b0;
+            rx_cnt    <= 16'd0;
+            rx_bit    <= 4'd0;
+            rx_data   <= 8'd0;
+            rx_ready  <= 1'b0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (tx_busy) begin
+                if (tx_cnt == 0) begin
+                    tx_cnt   <= DIV - 1;
+                    tx_reg   <= tx_shift[0];
+                    tx_shift <= {1'b1, tx_shift[9:1]};
+                    if (tx_bit == 4'd9) begin
+                        tx_busy <= 1'b0;
+                    end else begin
+                        tx_bit <= tx_bit + 1;
+                    end
+                end else begin
+                    tx_cnt <= tx_cnt - 1;
+                end
+            end
+
+            if (!rx_busy && !rx && !rx_ready) begin
+                rx_busy <= 1'b1;
+                rx_cnt  <= DIV + (DIV/2);
+                rx_bit  <= 4'd0;
+            end else if (rx_busy) begin
+                if (rx_cnt == 0) begin
+                    rx_cnt   <= DIV;
+                    rx_shift <= {rx, rx_shift[9:1]};
+                    if (rx_bit == 4'd9) begin
+                        rx_busy  <= 1'b0;
+                        rx_data  <= rx_shift[8:1];
+                        rx_ready <= 1'b1;
+                    end else begin
+                        rx_bit <= rx_bit + 1;
+                    end
+                end else begin
+                    rx_cnt <= rx_cnt - 1;
+                end
+            end
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    if (word_off == 4'h0) begin
+                        if (!tx_busy) begin
+                            tx_shift <= {1'b1, wb_dat_i[7:0], 1'b0};
+                            tx_bit   <= 4'd0;
+                            tx_cnt   <= DIV - 1;
+                            tx_busy  <= 1'b1;
+                        end
+                    end else if (word_off == 4'h1) begin
+                        if (wb_dat_i[1]) rx_ready <= 1'b0;
+                    end
+                end else begin
+                    if (word_off == 4'h0) begin
+                        wb_dat_o <= {24'h0, rx_data};
+                        rx_ready <= 1'b0;
+                    end else if (word_off == 4'h1) begin
+                        wb_dat_o <= {30'h0, rx_ready, !tx_busy};
+                    end else begin
+                        wb_dat_o <= 32'h0;
+                    end
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.4 wb_gpio.v
+-------------
+
+File: lm32_lab_soc/rtl/wb/wb_gpio.v
+
+--------------------------------------------------------------------------------
+module wb_gpio (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [31:0] wb_adr_i,
+    input  wire        wb_stb_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    output reg         wb_ack_o,
+    input  wire [31:0] gpio_in,
+    output reg  [31:0] gpio_out
+);
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [3:0] word_off = wb_adr_i[5:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+            gpio_out <= 32'h0;
+        end else begin
+            wb_ack_o <= 1'b0;
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    if (word_off == 4'h0) begin
+                        if (wb_sel_i[0]) gpio_out[7:0]   <= wb_dat_i[7:0];
+                        if (wb_sel_i[1]) gpio_out[15:8]  <= wb_dat_i[15:8];
+                        if (wb_sel_i[2]) gpio_out[23:16] <= wb_dat_i[23:16];
+                        if (wb_sel_i[3]) gpio_out[31:24] <= wb_dat_i[31:24];
+                    end
+                end else begin
+                    if (word_off == 4'h0) begin
+                        wb_dat_o <= gpio_out;
+                    end else if (word_off == 4'h1) begin
+                        wb_dat_o <= gpio_in;
+                    end else begin
+                        wb_dat_o <= 32'h0;
+                    end
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.5 wb_dsp.v
+------------
+
+File: lm32_lab_soc/rtl/wb/wb_dsp.v
+
+--------------------------------------------------------------------------------
+module wb_dsp #(
+    parameter TAPS = 16
+) (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [31:0] wb_adr_i,
+    input  wire        wb_stb_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    output reg         wb_ack_o
+);
+    reg start, busy, done;
+    reg signed [15:0] sample_in;
+    reg signed [31:0] sample_out;
+
+    reg signed [15:0] coeffs [0:TAPS-1];
+    reg signed [15:0] delay  [0:TAPS-1];
+
+    integer i;
+    reg [4:0] tap_index;
+    reg signed [47:0] acc;
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [5:0] word_off = wb_adr_i[7:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o   <= 1'b0;
+            wb_dat_o   <= 32'h0;
+            start      <= 1'b0;
+            busy       <= 1'b0;
+            done       <= 1'b0;
+            sample_in  <= 16'sd0;
+            sample_out <= 32'sd0;
+            acc        <= 48'sd0;
+            tap_index  <= 5'd0;
+            for (i = 0; i < TAPS; i = i+1) begin
+                coeffs[i] <= 16'sd0;
+                delay[i]  <= 16'sd0;
+            end
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (start && !busy) begin
+                for (i = TAPS-1; i > 0; i = i-1)
+                    delay[i] <= delay[i-1];
+                delay[0] <= sample_in;
+                acc      <= 48'sd0;
+                tap_index <= 5'd0;
+                busy     <= 1'b1;
+                done     <= 1'b0;
+                start    <= 1'b0;
+            end else if (busy) begin
+                acc <= acc + delay[tap_index] * coeffs[tap_index];
+                if (tap_index == TAPS-1) begin
+                    busy       <= 1'b0;
+                    done       <= 1'b1;
+                    sample_out <= acc[31:0];
+                end else begin
+                    tap_index <= tap_index + 1;
+                end
+            end
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    case (word_off)
+                        6'h0: begin
+                            if (wb_dat_i[0]) start <= 1'b1;
+                            if (wb_dat_i[1]) done  <= 1'b0;
+                        end
+                        6'h2: sample_in <= wb_dat_i[15:0];
+                        default: begin
+                            if (word_off >= 6'h4 && word_off < 6'h4 + TAPS) begin
+                                coeffs[word_off - 6'h4] <= wb_dat_i[15:0];
+                            end
+                        end
+                    endcase
+                end else begin
+                    case (word_off)
+                        6'h0: wb_dat_o <= {30'h0, done, busy};
+                        6'h2: wb_dat_o <= {16'h0, sample_in};
+                        6'h3: wb_dat_o <= sample_out;
+                        default: begin
+                            if (word_off >= 6'h4 && word_off < 6'h4 + TAPS)
+                                wb_dat_o <= {16'h0, coeffs[word_off - 6'h4]};
+                            else
+                                wb_dat_o <= 32'h0;
+                        end
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.6 wb_dds.v
+------------
+
+File: lm32_lab_soc/rtl/wb/wb_dds.v
+
+--------------------------------------------------------------------------------
+module wb_dds #(
+    parameter PHASE_BITS = 24,
+    parameter AMP_BITS   = 12
+) (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [31:0] wb_adr_i,
+    input  wire        wb_stb_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    output reg         wb_ack_o,
+    output reg  [AMP_BITS-1:0] dds_out
+);
+    reg [PHASE_BITS-1:0] phase, phase_inc;
+    reg [AMP_BITS-1:0]   amplitude;
+    reg                  enable;
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [3:0] word_off = wb_adr_i[5:2];
+
+    wire [AMP_BITS-1:0] tri =
+        phase[PHASE_BITS-1] ? ~phase[PHASE_BITS-2 -: AMP_BITS] :
+                              phase[PHASE_BITS-2 -: AMP_BITS];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o  <= 1'b0;
+            wb_dat_o  <= 32'h0;
+            phase     <= {PHASE_BITS{1'b0}};
+            phase_inc <= {PHASE_BITS{1'b0}};
+            amplitude <= {AMP_BITS{1'b0}};
+            enable    <= 1'b0;
+            dds_out   <= {AMP_BITS{1'b0}};
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (enable) begin
+                phase   <= phase + phase_inc;
+                dds_out <= (tri * amplitude) >> (AMP_BITS-1);
+            end else begin
+                dds_out <= {AMP_BITS{1'b0}};
+            end
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    case (word_off)
+                        4'h0: phase_inc <= wb_dat_i[PHASE_BITS-1:0];
+                        4'h1: amplitude <= wb_dat_i[AMP_BITS-1:0];
+                        4'h2: enable    <= wb_dat_i[0];
+                    endcase
+                end else begin
+                    case (word_off)
+                        4'h0: wb_dat_o <= phase_inc;
+                        4'h1: wb_dat_o <= amplitude;
+                        4'h2: wb_dat_o <= {31'h0, enable};
+                        4'h3: wb_dat_o <= { {(32-AMP_BITS){1'b0}}, dds_out };
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.7 wb_logic_analyzer.v
+------------------------
+
+File: lm32_lab_soc/rtl/wb/wb_logic_analyzer.v
+
+--------------------------------------------------------------------------------
+module wb_logic_analyzer #(
+    parameter PROBE_WIDTH = 16,
+    parameter DEPTH       = 1024
+) (
+    input  wire                   clk,
+    input  wire                   rst,
+    input  wire [31:0]            wb_adr_i,
+    input  wire                   wb_stb_i,
+    input  wire                   wb_cyc_i,
+    input  wire                   wb_we_i,
+    input  wire [3:0]             wb_sel_i,
+    input  wire [31:0]            wb_dat_i,
+    output reg  [31:0]            wb_dat_o,
+    output reg                    wb_ack_o,
+    input  wire [PROBE_WIDTH-1:0] probe_in
+);
+    reg arm, single;
+    reg armed, triggered, done;
+    reg [PROBE_WIDTH-1:0] trig_val, trig_mask;
+    reg [15:0] sample_count;
+
+    reg [PROBE_WIDTH-1:0] mem [0:DEPTH-1];
+    reg [15:0] wr_ptr;
+    reg [15:0] samples_left;
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [7:0] word_off = wb_adr_i[9:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o      <= 1'b0;
+            wb_dat_o      <= 32'h0;
+            arm           <= 1'b0;
+            single        <= 1'b1;
+            armed         <= 1'b0;
+            triggered     <= 1'b0;
+            done          <= 1'b0;
+            trig_val      <= {PROBE_WIDTH{1'b0}};
+            trig_mask     <= {PROBE_WIDTH{1'b0}};
+            sample_count  <= 16'd256;
+            wr_ptr        <= 16'd0;
+            samples_left  <= 16'd0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (arm && !armed) begin
+                armed        <= 1'b1;
+                triggered    <= 1'b0;
+                done         <= 1'b0;
+                wr_ptr       <= 16'd0;
+                samples_left <= sample_count;
+            end
+
+            if (armed && !done) begin
+                if (!triggered) begin
+                    if (((probe_in ^ trig_val) & trig_mask) == {PROBE_WIDTH{1'b0}}) begin
+                        triggered <= 1'b1;
+                    end
+                end else begin
+                    mem[wr_ptr] <= probe_in;
+                    wr_ptr      <= wr_ptr + 1;
+                    if (samples_left == 16'd1) begin
+                        done   <= 1'b1;
+                        armed  <= 1'b0;
+                        if (!single) arm <= 1'b1;
+                    end else begin
+                        samples_left <= samples_left - 1;
+                    end
+                end
+            end
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    case (word_off)
+                        8'h00: begin
+                            arm    <= wb_dat_i[0];
+                            single <= wb_dat_i[1];
+                        end
+                        8'h02: trig_val[15:0]  <= wb_dat_i[15:0];
+                        8'h03: trig_mask[15:0] <= wb_dat_i[15:0];
+                        8'h04: sample_count    <= wb_dat_i[15:0];
+                    endcase
+                end else begin
+                    case (word_off)
+                        8'h00: wb_dat_o <= {30'h0, single, arm};
+                        8'h01: wb_dat_o <= {29'h0, done, triggered, armed};
+                        8'h02: wb_dat_o <= {16'h0, trig_val[15:0]};
+                        8'h03: wb_dat_o <= {16'h0, trig_mask[15:0]};
+                        8'h04: wb_dat_o <= {16'h0, sample_count};
+                        default: begin
+                            if (word_off >= 8'h40) begin
+                                wb_dat_o <= {16'h0, mem[word_off - 8'h40]};
+                            end else begin
+                                wb_dat_o <= 32'h0;
+                            end
+                        end
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.8 wb_usb_analyzer.v
+----------------------
+
+File: lm32_lab_soc/rtl/wb/wb_usb_analyzer.v
+
+--------------------------------------------------------------------------------
+module wb_usb_analyzer #(
+    parameter DEPTH = 512
+) (
+    input  wire clk,
+    input  wire rst,
+    input  wire [31:0] wb_adr_i,
+    input  wire        wb_stb_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    output reg         wb_ack_o,
+    input  wire        usb_dp,
+    input  wire        usb_dm
+);
+    reg arm, done, overflow;
+    reg [15:0] sample_count;
+    reg [15:0] wr_ptr;
+    reg [15:0] timestamp;
+    reg        prev_dp, prev_dm;
+
+    reg [17:0] mem [0:DEPTH-1];
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [7:0] word_off = wb_adr_i[9:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o     <= 1'b0;
+            wb_dat_o     <= 32'h0;
+            arm          <= 1'b0;
+            done         <= 1'b0;
+            overflow     <= 1'b0;
+            sample_count <= 16'd0;
+            wr_ptr       <= 16'd0;
+            timestamp    <= 16'd0;
+            prev_dp      <= 1'b0;
+            prev_dm      <= 1'b0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            timestamp <= timestamp + 1;
+
+            if (arm && !done) begin
+                if ({usb_dp, usb_dm} != {prev_dp, prev_dm}) begin
+                    if (wr_ptr < DEPTH) begin
+                        mem[wr_ptr] <= {usb_dp, usb_dm, timestamp};
+                        wr_ptr       <= wr_ptr + 1;
+                        sample_count <= sample_count + 1;
+                    end else begin
+                        overflow <= 1'b1;
+                        done     <= 1'b1;
+                        arm      <= 1'b0;
+                    end
+                end
+            end
+
+            prev_dp <= usb_dp;
+            prev_dm <= usb_dm;
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    case (word_off)
+                        8'h00: begin
+                            arm <= wb_dat_i[0];
+                            if (wb_dat_i[0]) begin
+                                done         <= 1'b0;
+                                overflow     <= 1'b0;
+                                wr_ptr       <= 16'd0;
+                                sample_count <= 16'd0;
+                                timestamp    <= 16'd0;
+                                prev_dp      <= usb_dp;
+                                prev_dm      <= usb_dm;
+                            end
+                        end
+                    endcase
+                end else begin
+                    case (word_off)
+                        8'h00: wb_dat_o <= {31'h0, arm};
+                        8'h01: wb_dat_o <= {30'h0, overflow, done};
+                        8'h02: wb_dat_o <= {16'h0, sample_count};
+                        default: begin
+                            if (word_off >= 8'h40) begin
+                                if (word_off - 8'h40 < sample_count)
+                                    wb_dat_o <= {14'h0, mem[word_off - 8'h40]};
+                                else
+                                    wb_dat_o <= 32'h0;
+                            end else begin
+                                wb_dat_o <= 32'h0;
+                            end
+                        end
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.9 wb_scope.v
+--------------
+
+File: lm32_lab_soc/rtl/wb/wb_scope.v
+
+--------------------------------------------------------------------------------
+module wb_scope #(
+    parameter WIDTH = 12,
+    parameter DEPTH = 1024
+) (
+    input  wire             clk,
+    input  wire             rst,
+    input  wire [31:0]      wb_adr_i,
+    input  wire             wb_stb_i,
+    input  wire             wb_cyc_i,
+    input  wire             wb_we_i,
+    input  wire [3:0]       wb_sel_i,
+    input  wire [31:0]      wb_dat_i,
+    output reg  [31:0]      wb_dat_o,
+    output reg              wb_ack_o,
+    input  wire [WIDTH-1:0] sig_in
+);
+    reg arm, done;
+    reg [15:0] sample_count;
+    reg [15:0] decim;
+    reg [15:0] decim_cnt;
+    reg [15:0] wr_ptr;
+
+    reg [WIDTH-1:0] mem [0:DEPTH-1];
+
+    wire sel = wb_cyc_i && wb_stb_i;
+    wire [7:0] word_off = wb_adr_i[9:2];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_ack_o     <= 1'b0;
+            wb_dat_o     <= 32'h0;
+            arm          <= 1'b0;
+            done         <= 1'b0;
+            sample_count <= 16'd256;
+            decim        <= 16'd1;
+            decim_cnt    <= 16'd0;
+            wr_ptr       <= 16'd0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (arm && !done) begin
+                if (decim_cnt == 0) begin
+                    mem[wr_ptr] <= sig_in;
+                    wr_ptr      <= wr_ptr + 1;
+                    decim_cnt   <= decim - 1;
+                    if (wr_ptr == sample_count - 1) begin
+                        done <= 1'b1;
+                        arm  <= 1'b0;
+                    end
+                end else begin
+                    decim_cnt <= decim_cnt - 1;
+                end
+            end
+
+            if (sel) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    case (word_off)
+                        8'h00: begin
+                            arm <= wb_dat_i[0];
+                            if (wb_dat_i[0]) begin
+                                done      <= 1'b0;
+                                wr_ptr    <= 16'd0;
+                                decim_cnt <= 16'd0;
+                            end
+                        end
+                        8'h02: sample_count <= wb_dat_i[15:0];
+                        8'h03: decim        <= wb_dat_i[15:0];
+                    endcase
+                end else begin
+                    case (word_off)
+                        8'h00: wb_dat_o <= {31'h0, arm};
+                        8'h01: wb_dat_o <= {31'h0, done};
+                        8'h02: wb_dat_o <= {16'h0, sample_count};
+                        8'h03: wb_dat_o <= {16'h0, decim};
+                        default: begin
+                            if (word_off >= 8'h40) begin
+                                wb_dat_o <= { {(32-WIDTH){1'b0}}, mem[word_off - 8'h40] };
+                            end else begin
+                                wb_dat_o <= 32'h0;
+                            end
+                        end
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+3.10 wb_interconnect.v
+----------------------
+
+File: lm32_lab_soc/rtl/wb/wb_interconnect.v
+
+--------------------------------------------------------------------------------
+module wb_interconnect (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [31:0] m_adr_i,
+    input  wire        m_stb_i,
+    input  wire        m_cyc_i,
+    input  wire        m_we_i,
+    input  wire [3:0]  m_sel_i,
+    input  wire [31:0] m_dat_i,
+    output reg  [31:0] m_dat_o,
+    output reg         m_ack_o,
+    output reg  [31:0] s0_adr_o,
+    output reg         s0_stb_o,
+    output reg         s0_cyc_o,
+    output reg         s0_we_o,
+    output reg  [3:0]  s0_sel_o,
+    output reg  [31:0] s0_dat_o,
+    input  wire [31:0] s0_dat_i,
+    input  wire        s0_ack_i,
+    output reg  [31:0] s1_adr_o,
+    output reg         s1_stb_o,
+    output reg         s1_cyc_o,
+    output reg         s1_we_o,
+    output reg  [3:0]  s1_sel_o,
+    output reg  [31:0] s1_dat_o,
+    input  wire [31:0] s1_dat_i,
+    input  wire        s1_ack_i,
+    output reg  [31:0] s2_adr_o,
+    output reg         s2_stb_o,
+    output reg         s2_cyc_o,
+    output reg         s2_we_o,
+    output reg  [3:0]  s2_sel_o,
+    output reg  [31:0] s2_dat_o,
+    input  wire [31:0] s2_dat_i,
+    input  wire        s2_ack_i,
+    output reg  [31:0] s3_adr_o,
+    output reg         s3_stb_o,
+    output reg         s3_cyc_o,
+    output reg         s3_we_o,
+    output reg  [3:0]  s3_sel_o,
+    output reg  [31:0] s3_dat_o,
+    input  wire [31:0] s3_dat_i,
+    input  wire        s3_ack_i,
+    output reg  [31:0] s4_adr_o,
+    output reg         s4_stb_o,
+    output reg         s4_cyc_o,
+    output reg         s4_we_o,
+    output reg  [3:0]  s4_sel_o,
+    output reg  [31:0] s4_dat_o,
+    input  wire [31:0] s4_dat_i,
+    input  wire        s4_ack_i,
+    output reg  [31:0] s5_adr_o,
+    output reg         s5_stb_o,
+    output reg         s5_cyc_o,
+    output reg         s5_we_o,
+    output reg  [3:0]  s5_sel_o,
+    output reg  [31:0] s5_dat_o,
+    input  wire [31:0] s5_dat_i,
+    input  wire        s5_ack_i,
+    output reg  [31:0] s6_adr_o,
+    output reg         s6_stb_o,
+    output reg         s6_cyc_o,
+    output reg         s6_we_o,
+    output reg  [3:0]  s6_sel_o,
+    output reg  [31:0] s6_dat_o,
+    input  wire [31:0] s6_dat_i,
+    input  wire        s6_ack_i,
+    output reg  [31:0] s7_adr_o,
+    output reg         s7_stb_o,
+    output reg         s7_cyc_o,
+    output reg         s7_we_o,
+    output reg  [3:0]  s7_sel_o,
+    output reg  [31:0] s7_dat_o,
+    input  wire [31:0] s7_dat_i,
+    input  wire        s7_ack_i
+);
+    wire sel_ram   = (m_adr_i[31:28] == 4'h1);
+    wire sel_uart  = (m_adr_i[31:20] == 12'h200);
+    wire sel_gpio  = (m_adr_i[31:20] == 12'h201);
+    wire sel_dsp   = (m_adr_i[31:20] == 12'h202);
+    wire sel_dds   = (m_adr_i[31:20] == 12'h203);
+    wire sel_la    = (m_adr_i[31:20] == 12'h204);
+    wire sel_usb   = (m_adr_i[31:20] == 12'h205);
+    wire sel_scope = (m_adr_i[31:20] == 12'h206);
+
+    always @(*) begin
+        s0_stb_o = 0; s0_cyc_o = 0; s0_we_o = 0;
+        s1_stb_o = 0; s1_cyc_o = 0; s1_we_o = 0;
+        s2_stb_o = 0; s2_cyc_o = 0; s2_we_o = 0;
+        s3_stb_o = 0; s3_cyc_o = 0; s3_we_o = 0;
+        s4_stb_o = 0; s4_cyc_o = 0; s4_we_o = 0;
+        s5_stb_o = 0; s5_cyc_o = 0; s5_we_o = 0;
+        s6_stb_o = 0; s6_cyc_o = 0; s6_we_o = 0;
+        s7_stb_o = 0; s7_cyc_o = 0; s7_we_o = 0;
+
+        s0_adr_o = m_adr_i; s1_adr_o = m_adr_i; s2_adr_o = m_adr_i; s3_adr_o = m_adr_i;
+        s4_adr_o = m_adr_i; s5_adr_o = m_adr_i; s6_adr_o = m_adr_i; s7_adr_o = m_adr_i;
+        s0_sel_o = m_sel_i; s1_sel_o = m_sel_i; s2_sel_o = m_sel_i; s3_sel_o = m_sel_i;
+        s4_sel_o = m_sel_i; s5_sel_o = m_sel_i; s6_sel_o = m_sel_i; s7_sel_o = m_sel_i;
+        s0_dat_o = m_dat_i; s1_dat_o = m_dat_i; s2_dat_o = m_dat_i; s3_dat_o = m_dat_i;
+        s4_dat_o = m_dat_i; s5_dat_o = m_dat_i; s6_dat_o = m_dat_i; s7_dat_o = m_dat_i;
+
+        if (m_cyc_i && m_stb_i) begin
+            if (sel_ram) begin
+                s0_cyc_o = 1; s0_stb_o = 1; s0_we_o = m_we_i;
+            end else if (sel_uart) begin
+                s1_cyc_o = 1; s1_stb_o = 1; s1_we_o = m_we_i;
+            end else if (sel_gpio) begin
+                s2_cyc_o = 1; s2_stb_o = 1; s2_we_o = m_we_i;
+            end else if (sel_dsp) begin
+                s3_cyc_o = 1; s3_stb_o = 1; s3_we_o = m_we_i;
+            end else if (sel_dds) begin
+                s4_cyc_o = 1; s4_stb_o = 1; s4_we_o = m_we_i;
+            end else if (sel_la) begin
+                s5_cyc_o = 1; s5_stb_o = 1; s5_we_o = m_we_i;
+            end else if (sel_usb) begin
+                s6_cyc_o = 1; s6_stb_o = 1; s6_we_o = m_we_i;
+            end else if (sel_scope) begin
+                s7_cyc_o = 1; s7_stb_o = 1; s7_we_o = m_we_i;
+            end
+        end
+    end
+
+    always @(*) begin
+        m_ack_o = 1'b0;
+        m_dat_o = 32'h0;
+        if (sel_ram)   begin m_ack_o = s0_ack_i; m_dat_o = s0_dat_i; end
+        else if (sel_uart)  begin m_ack_o = s1_ack_i; m_dat_o = s1_dat_i; end
+        else if (sel_gpio)  begin m_ack_o = s2_ack_i; m_dat_o = s2_dat_i; end
+        else if (sel_dsp)   begin m_ack_o = s3_ack_i; m_dat_o = s3_dat_i; end
+        else if (sel_dds)   begin m_ack_o = s4_ack_i; m_dat_o = s4_dat_i; end
+        else if (sel_la)    begin m_ack_o = s5_ack_i; m_dat_o = s5_dat_i; end
+        else if (sel_usb)   begin m_ack_o = s6_ack_i; m_dat_o = s6_dat_i; end
+        else if (sel_scope) begin m_ack_o = s7_ack_i; m_dat_o = s7_dat_i; end
+    end
+endmodule
+--------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+4. TOP-LEVEL SOC WITH VEXRISCV – soc_top.v
+-------------------------------------------------------------------------------
+
+File: lm32_lab_soc/top/soc_top.v
+
+--------------------------------------------------------------------------------
+module soc_top (
+    input  wire clk_50,
+    input  wire reset_n,
+
+    input  wire uart_rx,
+    output wire uart_tx,
+
+    output wire [7:0] leds,
+    input  wire [7:0] buttons,
+
+    input  wire [15:0] la_probes,
+    input  wire        usb_dp,
+    input  wire        usb_dm,
+    input  wire [11:0] scope_in,
+    output wire [11:0] dds_out
+);
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    wire [31:0] I_ADR, I_DAT_I, I_DAT_O;
+    wire        I_CYC, I_STB, I_ACK, I_WE;
+    wire [3:0]  I_SEL;
+
+    wire [31:0] D_ADR, D_DAT_I, D_DAT_O;
+    wire        D_CYC, D_STB, D_ACK, D_WE;
+    wire [3:0]  D_SEL;
+
+    VexRiscv cpu (
+        .clk(clk),
+        .reset(rst),
+
+        .iBusWishbone_ADR    (I_ADR),
+        .iBusWishbone_DAT_MISO(I_DAT_I),
+        .iBusWishbone_DAT_MOSI(I_DAT_O),
+        .iBusWishbone_SEL    (I_SEL),
+        .iBusWishbone_CYC    (I_CYC),
+        .iBusWishbone_STB    (I_STB),
+        .iBusWishbone_WE     (I_WE),
+        .iBusWishbone_ACK    (I_ACK),
+        .iBusWishbone_ERR    (1'b0),
+
+        .dBusWishbone_ADR    (D_ADR),
+        .dBusWishbone_DAT_MISO(D_DAT_I),
+        .dBusWishbone_DAT_MOSI(D_DAT_O),
+        .dBusWishbone_SEL    (D_SEL),
+        .dBusWishbone_CYC    (D_CYC),
+        .dBusWishbone_STB    (D_STB),
+        .dBusWishbone_WE     (D_WE),
+        .dBusWishbone_ACK    (D_ACK),
+        .dBusWishbone_ERR    (1'b0)
+    );
+
+    wb_rom rom (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(I_ADR),
+        .wb_stb_i(I_STB),
+        .wb_cyc_i(I_CYC),
+        .wb_we_i(I_WE),
+        .wb_sel_i(I_SEL),
+        .wb_dat_i(I_DAT_O),
+        .wb_dat_o(I_DAT_I),
+        .wb_ack_o(I_ACK)
+    );
+
+    wire [31:0] s0_adr, s0_dat_o, s0_dat_i;
+    wire        s0_stb, s0_cyc, s0_we, s0_ack;
+    wire [3:0]  s0_sel;
+
+    wb_ram ram (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s0_adr),
+        .wb_stb_i(s0_stb),
+        .wb_cyc_i(s0_cyc),
+        .wb_we_i(s0_we),
+        .wb_sel_i(s0_sel),
+        .wb_dat_i(s0_dat_o),
+        .wb_dat_o(s0_dat_i),
+        .wb_ack_o(s0_ack)
+    );
+
+    wire [31:0] s1_adr, s1_dat_o, s1_dat_i;
+    wire        s1_stb, s1_cyc, s1_we, s1_ack;
+    wire [3:0]  s1_sel;
+
+    wb_uart uart (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s1_adr),
+        .wb_stb_i(s1_stb),
+        .wb_cyc_i(s1_cyc),
+        .wb_we_i(s1_we),
+        .wb_sel_i(s1_sel),
+        .wb_dat_i(s1_dat_o),
+        .wb_dat_o(s1_dat_i),
+        .wb_ack_o(s1_ack),
+        .rx(uart_rx),
+        .tx(uart_tx)
+    );
+
+    wire [31:0] s2_adr, s2_dat_o, s2_dat_i;
+    wire        s2_stb, s2_cyc, s2_we, s2_ack;
+    wire [3:0]  s2_sel;
+    wire [31:0] gpio_out;
+    wire [31:0] gpio_in = {16'h0000, buttons, 8'h00};
+
+    wb_gpio gpio (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s2_adr),
+        .wb_stb_i(s2_stb),
+        .wb_cyc_i(s2_cyc),
+        .wb_we_i(s2_we),
+        .wb_sel_i(s2_sel),
+        .wb_dat_i(s2_dat_o),
+        .wb_dat_o(s2_dat_i),
+        .wb_ack_o(s2_ack),
+        .gpio_in(gpio_in),
+        .gpio_out(gpio_out)
+    );
+
+    assign leds = gpio_out[7:0];
+
+    wire [31:0] s3_adr, s3_dat_o, s3_dat_i;
+    wire        s3_stb, s3_cyc, s3_we, s3_ack;
+    wire [3:0]  s3_sel;
+
+    wb_dsp dsp (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s3_adr),
+        .wb_stb_i(s3_stb),
+        .wb_cyc_i(s3_cyc),
+        .wb_we_i(s3_we),
+        .wb_sel_i(s3_sel),
+        .wb_dat_i(s3_dat_o),
+        .wb_dat_o(s3_dat_i),
+        .wb_ack_o(s3_ack)
+    );
+
+    wire [31:0] s4_adr, s4_dat_o, s4_dat_i;
+    wire        s4_stb, s4_cyc, s4_we, s4_ack;
+    wire [3:0]  s4_sel;
+
+    wb_dds dds (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s4_adr),
+        .wb_stb_i(s4_stb),
+        .wb_cyc_i(s4_cyc),
+        .wb_we_i(s4_we),
+        .wb_sel_i(s4_sel),
+        .wb_dat_i(s4_dat_o),
+        .wb_dat_o(s4_dat_i),
+        .wb_ack_o(s4_ack),
+        .dds_out(dds_out)
+    );
+
+    wire [31:0] s5_adr, s5_dat_o, s5_dat_i;
+    wire        s5_stb, s5_cyc, s5_we, s5_ack;
+    wire [3:0]  s5_sel;
+
+    wb_logic_analyzer la (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s5_adr),
+        .wb_stb_i(s5_stb),
+        .wb_cyc_i(s5_cyc),
+        .wb_we_i(s5_we),
+        .wb_sel_i(s5_sel),
+        .wb_dat_i(s5_dat_o),
+        .wb_dat_o(s5_dat_i),
+        .wb_ack_o(s5_ack),
+        .probe_in(la_probes)
+    );
+
+    wire [31:0] s6_adr, s6_dat_o, s6_dat_i;
+    wire        s6_stb, s6_cyc, s6_we, s6_ack;
+    wire [3:0]  s6_sel;
+
+    wb_usb_analyzer usb (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s6_adr),
+        .wb_stb_i(s6_stb),
+        .wb_cyc_i(s6_cyc),
+        .wb_we_i(s6_we),
+        .wb_sel_i(s6_sel),
+        .wb_dat_i(s6_dat_o),
+        .wb_dat_o(s6_dat_i),
+        .wb_ack_o(s6_ack),
+        .usb_dp(usb_dp),
+        .usb_dm(usb_dm)
+    );
+
+    wire [31:0] s7_adr, s7_dat_o, s7_dat_i;
+    wire        s7_stb, s7_cyc, s7_we, s7_ack;
+    wire [3:0]  s7_sel;
+
+    wb_scope scope (
+        .clk(clk),
+        .rst(rst),
+        .wb_adr_i(s7_adr),
+        .wb_stb_i(s7_stb),
+        .wb_cyc_i(s7_cyc),
+        .wb_we_i(s7_we),
+        .wb_sel_i(s7_sel),
+        .wb_dat_i(s7_dat_o),
+        .wb_dat_o(s7_dat_i),
+        .wb_ack_o(s7_ack),
+        .sig_in(scope_in)
+    );
+
+    wb_interconnect inter (
+        .clk(clk),
+        .rst(rst),
+        .m_adr_i(D_ADR),
+        .m_stb_i(D_STB),
+        .m_cyc_i(D_CYC),
+        .m_we_i(D_WE),
+        .m_sel_i(D_SEL),
+        .m_dat_i(D_DAT_O),
+        .m_dat_o(D_DAT_I),
+        .m_ack_o(D_ACK),
+        .s0_adr_o(s0_adr), .s0_stb_o(s0_stb), .s0_cyc_o(s0_cyc), .s0_we_o(s0_we), .s0_sel_o(s0_sel), .s0_dat_o(s0_dat_o), .s0_dat_i(s0_dat_i), .s0_ack_i(s0_ack),
+        .s1_adr_o(s1_adr), .s1_stb_o(s1_stb), .s1_cyc_o(s1_cyc), .s1_we_o(s1_we), .s1_sel_o(s1_sel), .s1_dat_o(s1_dat_o), .s1_dat_i(s1_dat_i), .s1_ack_i(s1_ack),
+        .s2_adr_o(s2_adr), .s2_stb_o(s2_stb), .s2_cyc_o(s2_cyc), .s2_we_o(s2_we), .s2_sel_o(s2_sel), .s2_dat_o(s2_dat_o), .s2_dat_i(s2_dat_i), .s2_ack_i(s2_ack),
+        .s3_adr_o(s3_adr), .s3_stb_o(s3_stb), .s3_cyc_o(s3_cyc), .s3_we_o(s3_we), .s3_sel_o(s3_sel), .s3_dat_o(s3_dat_o), .s3_dat_i(s3_dat_i), .s3_ack_i(s3_ack),
+        .s4_adr_o(s4_adr), .s4_stb_o(s4_stb), .s4_cyc_o(s4_cyc), .s4_we_o(s4_we), .s4_sel_o(s4_sel), .s4_dat_o(s4_dat_o), .s4_dat_i(s4_dat_i), .s4_ack_i(s4_ack),
+        .s5_adr_o(s5_adr), .s5_stb_o(s5_stb), .s5_cyc_o(s5_cyc), .s5_we_o(s5_we), .s5_sel_o(s5_sel), .s5_dat_o(s5_dat_o), .s5_dat_i(s5_dat_i), .s5_ack_i(s5_ack),
+        .s6_adr_o(s6_adr), .s6_stb_o(s6_stb), .s6_cyc_o(s6_cyc), .s6_we_o(s6_we), .s6_sel_o(s6_sel), .s6_dat_o(s6_dat_o), .s6_dat_i(s6_dat_i), .s6_ack_i(s6_ack),
+        .s7_adr_o(s7_adr), .s7_stb_o(s7_stb), .s7_cyc_o(s7_cyc), .s7_we_o(s7_we), .s7_sel_o(s7_sel), .s7_dat_o(s7_dat_o), .s7_dat_i(s7_dat_i), .s7_ack_i(s7_ack)
+    );
+endmodule
+--------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+5. FIRMWARE (RISC-V, VEXRISCV)
+-------------------------------------------------------------------------------
+
+We now use RISC‑V GCC: `riscv32-unknown-elf-gcc` with `-march=rv32i -mabi=ilp32`.
+
+5.1 hw.h
+--------
+
+File: lm32_lab_soc/firmware/hw.h
+
+(same as in LM32 version, already given above; it’s ISA‑agnostic)
+
+5.2 uart.h / uart.c
+-------------------
+
+Same as above; ISA‑agnostic.
+
+5.3 dsp.h / dsp.c, logic_analyzer.h/c, usb_analyzer.h/c, scope.h/c
+-------------------------------------------------------------------
+
+Same as above; ISA‑agnostic. They just read/write memory‑mapped registers.
+
+5.4 crt0.S (RISC-V)
+-------------------
+
+File: lm32_lab_soc/firmware/crt0.S
+
+--------------------------------------------------------------------------------
+    .section .init
+    .globl _start
+_start:
+    la   sp, _stack_top
+    la   a0, main
+    jr   a0
+1:
+    j    1b
+--------------------------------------------------------------------------------
+
+5.5 linker.ld (RISC-V)
+----------------------
+
+File: lm32_lab_soc/firmware/linker.ld
+
+--------------------------------------------------------------------------------
+ENTRY(_start)
+
+MEMORY {
+  rom (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
+  ram (rwx) : ORIGIN = 0x10000000, LENGTH = 8K
+}
+
+SECTIONS {
+  .text : {
+    *(.init)
+    *(.text*)
+    *(.rodata*)
+  } > rom
+
+  .data : {
+    *(.data*)
+  } > ram AT > rom
+
+  .bss : {
+    *(.bss*)
+    *(COMMON)
+  } > ram
+
+  PROVIDE(_stack_top = ORIGIN(ram) + LENGTH(ram));
+}
+--------------------------------------------------------------------------------
+
+5.6 main.c – command interpreter
+--------------------------------
+
+Exact same logic as LM32 version, but compiled with RISC‑V toolchain. Use the main.c given previously (under LM32 section) unchanged.
+
+5.7 Makefile (RISC-V)
+---------------------
+
+File: lm32_lab_soc/firmware/Makefile
+
+--------------------------------------------------------------------------------
+CC      = riscv32-unknown-elf-gcc
+OBJCOPY = riscv32-unknown-elf-objcopy
+CFLAGS  = -Os -ffreestanding -nostdlib -Wall -Wextra -march=rv32i -mabi=ilp32
+
+OBJS = crt0.o main.o uart.o dsp.o logic_analyzer.o usb_analyzer.o scope.o
+
+all: firmware.hex
+
+crt0.o: crt0.S
+	$(CC) $(CFLAGS) -c crt0.S -o crt0.o
+
+main.o: main.c hw.h uart.h dsp.h logic_analyzer.h usb_analyzer.h scope.h
+	$(CC) $(CFLAGS) -c main.c -o main.o
+
+uart.o: uart.c hw.h uart.h
+	$(CC) $(CFLAGS) -c uart.c -o uart.o
+
+dsp.o: dsp.c hw.h dsp.h
+	$(CC) $(CFLAGS) -c dsp.c -o dsp.o
+
+logic_analyzer.o: logic_analyzer.c hw.h logic_analyzer.h
+	$(CC) $(CFLAGS) -c logic_analyzer.c -o logic_analyzer.o
+
+usb_analyzer.o: usb_analyzer.c hw.h usb_analyzer.h
+	$(CC) $(CFLAGS) -c usb_analyzer.c -o usb_analyzer.o
+
+scope.o: scope.c hw.h scope.h
+	$(CC) $(CFLAGS) -c scope.c -o scope.o
+
+firmware.elf: $(OBJS) linker.ld
+	$(CC) $(CFLAGS) -Wl,-Tlinker.ld -o firmware.elf $(OBJS)
+
+firmware.hex: firmware.elf
+	$(OBJCOPY) -O verilog firmware.elf firmware.hex
+
+clean:
+	rm -f *.o firmware.elf firmware.hex
+--------------------------------------------------------------------------------
+
+Build firmware:
+
+cd lm32_lab_soc/firmware
+make
+
+This produces firmware.hex, used by wb_rom.
+
+-------------------------------------------------------------------------------
+6. QUARTUS PROJECT + VOLATILE PROGRAMMING
+-------------------------------------------------------------------------------
+
+6.1 Create project
+------------------
+
+- Start Quartus Prime Lite.
+- New Project Wizard:
+  - Directory: lm32_lab_soc/quartus
+  - Name: vexriscv_lab_soc
+- Device: choose correct Cyclone IV device (e.g., EP4CE6F17C8).
+
+6.2 Add files
+-------------
+
+Add:
+
+- top/soc_top.v
+- rtl/wb/*.v
+- rtl/vexriscv/VexRiscv.v
+- Ensure firmware.hex is accessible by wb_rom (place it in quartus project dir or set a relative path that matches what Quartus expects for simulation/synthesis initialization).
+
+Set top-level entity to soc_top.
+
+6.3 Pin assignments
+-------------------
+
+In Assignments → Pin Planner:
+
+- Map clk_50 to the board’s 50 MHz clock pin.
+- Map reset_n to a pushbutton or switch.
+- Map uart_tx and uart_rx to header pins for your USB‑UART.
+- Map leds[7:0] to LED pins.
+- Map buttons[7:0] to pushbutton pins.
+- Map la_probes[15:0] to digital I/O header pins.
+- Map usb_dp, usb_dm to header pins connected to D+/D− (with proper external circuitry).
+- Map scope_in[11:0] to ADC/digital input pins.
+- Map dds_out[11:0] to header pins going to DAC or R‑2R ladder.
+
+Set all user I/O to 3.3‑V LVCMOS as appropriate.
+
+6.4 Compile
+-----------
+
+Processing → Start Compilation.
+
+Fix any port name mismatches for VexRiscv. If the generated VexRiscv uses slightly different Wishbone signal names, align them in soc_top.v.
+
+6.5 Program (volatile)
+----------------------
+
+Tools → Programmer:
+
+- Add the .sof (e.g., vexriscv_lab_soc.sof).
+- Select the FPGA device (Cyclone IV).
+- Check Program/Configure.
+- Do NOT add or program any flash/EPCS/EPCQ device.
+- Click Start.
+
+The SoC runs in FPGA SRAM only. Power cycle → FPGA reloads original factory/demo image from config flash. Your instrument SoC is NOT persistent.
+
+-------------------------------------------------------------------------------
+7. HOST PYTHON SCRIPTS
+-------------------------------------------------------------------------------
+
+Identical to the LM32 version, since they talk over UART and only know about the command protocol.
+
+7.1 common.py
+-------------
+
+File: lm32_lab_soc/host/common.py
+
+(already provided; same as LM32 version)
+
+7.2 dsp_host.py
+7.3 dds_host.py
+7.4 logic_analyzer_host.py
+7.5 scope_host.py
+7.6 usb_analyzer_host.py
+
+All exactly as given in the previous LM32‑based answer; they remain unchanged because:
+
+- The UART protocol is unchanged.
+- The memory map is unchanged.
+- The mode names (`DSP_SET_TAP`, `DDS_SET`, `LA_ARM`, etc.) are unchanged.
+
+Place them in lm32_lab_soc/host exactly as previously specified.
+
+-------------------------------------------------------------------------------
+8. RUNNING THE FULL SYSTEM
+-------------------------------------------------------------------------------
+
+1) Build firmware:
+
+   cd lm32_lab_soc/firmware
+   make
+
+   Ensure firmware.hex is produced.
+
+2) Verify wb_rom.v sees firmware.hex (by relative path or by copying firmware.hex
+   into the quartus project output dir).
+
+3) Compile RTL in Quartus:
+
+   - All wb_*.v, VexRiscv.v, soc_top.v
+   - Pin assignments set correctly
+
+4) Program the FPGA with .sof only.
+
+5) On your PC, connect USB‑UART to uart_tx/uart_rx and open a terminal at 115200 8N1
+   to verify that the firmware responds:
+
+   You should see:
+
+   LM32 Instrument SoC ready.
+
+   (the string still says "LM32" because of the text we placed; you can change
+   it to "VexRiscv Instrument SoC ready." in main.c if you want.)
+
+6) Run Python scripts:
+
+   cd lm32_lab_soc/host
+
+   - DSP:
+
+       python dsp_host.py
+
+   - DDS:
+
+       python dds_host.py
+
+   - Logic analyzer:
+
+       python logic_analyzer_host.py
+
+   - Scope:
+
+       python scope_host.py
+
+   - USB analyzer:
+
+       python usb_analyzer_host.py
+
+All instrument logic runs in VexRiscv + FPGA hardware; all heavy DSP design and USB
+protocol decoding runs on the host in Python. The FPGA image is volatile; power
+cycle returns the board to its original programmed image in flash.
