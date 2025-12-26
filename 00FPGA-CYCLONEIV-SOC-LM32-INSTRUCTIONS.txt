@@ -2,6 +2,8 @@
 LM32 INSTRUMENT SOC ON DUEPROLOGIC – FULL STEP‑BY‑STEP BUILD (DSP + DDS/NCO +
 LOGIC ANALYZER + USB PROTOCOL ANALYZER + SCOPE, PYTHON‑CONTROLLED, VOLATILE)
 ================================================================================
+*** needs lm32-gcc
+see 00fpga-build.sh to build lm32gcc
 
 This is a complete, end‑to‑end set of instructions and code you can copy/paste
 and adapt. It assumes:
