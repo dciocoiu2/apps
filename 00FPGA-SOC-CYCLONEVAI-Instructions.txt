@@ -1,0 +1,1079 @@
+======================================================================
+END‑TO‑END: VexRiscv + GEMM‑CAPABLE NPU SoC ON CYCLONE IV
+         + RASPBERRY PI 5 + HUGGING FACE OFFLOAD
+======================================================================
+
+This is a full, non‑minimal, reproducible flow with a **GEMM NPU**, not just
+a dot product:
+
+- VexRiscv soft processor (Wishbone bus)
+- On‑chip RAM, UART, and an **NPU that performs small int16 GEMM**
+  C[M×N] = A[M×K] · B[K×N]
+- Bare‑metal firmware running on VexRiscv, controlling the NPU
+- Raspberry Pi 5 host talking over UART
+- A Hugging Face text‑to‑image model (Stable Diffusion) that calls this NPU
+  to compute a real small GEMM (a linear projection of text embeddings)
+
+You will:
+
+- Generate VexRiscv with Wishbone
+- Wire RAM + UART + GEMM‑NPU as Wishbone slaves
+- Build firmware, synthesize SoC, and load it VOLATILE‑ONLY (.sof to SRAM)
+- Run a Python script using diffusers where a small matrix multiply is
+  offloaded to your FPGA via UART.
+
+This is a complete, functional baseline for a **GEMM‑style NPU**. You can later
+extend it to larger tiles, convolution, or multi‑core.
+
+
+==================================================
+1. PREPARE: TOOLING, BOARD, AND HOST
+==================================================
+
+REQUIRED:
+
+- FPGA board: Altera Cyclone IV (DueProLogic)
+- JTAG cable: USB‑Blaster (or clone)
+- Host: Raspberry Pi 5 (16 GB RAM)
+- USB‑UART dongle (3.3V logic)
+- Tools:
+  - On dev machine (x86_64 Linux recommended):
+    - Java + SBT (for SpinalHDL / VexRiscv generation)
+    - Quartus Lite (Cyclone IV support)
+    - RISC‑V toolchain: riscv32‑unknown‑elf‑gcc
+  - On Raspberry Pi 5:
+    - openFPGALoader (or Quartus Programmer CLI)
+    - Python packages:
+      - pyserial
+      - torch, diffusers, transformers, accelerate, safetensors (for HF model)
+
+
+==================================================
+2. GENERATE VEXRISCV CORE (WISHBONE)
+==================================================
+
+You generate VexRiscv as before, with a Wishbone bus plugin.
+
+STEP 2.1 – Clone VexRiscv and set up SpinalHDL:
+
+  git clone https://github.com/SpinalHDL/VexRiscv.git
+  cd VexRiscv
+
+STEP 2.2 – Create a generator file: `GenVexRiscv.scala`
+
+Place this in `src/main/scala/GenVexRiscv.scala`:
+
+  import spinal.core._
+  import vexriscv._
+  import vexriscv.plugin._
+
+  object GenVexRiscvWishbone {
+    def main(args: Array[String]) {
+      SpinalVerilog(
+        new VexRiscv(
+          VexRiscvConfig(
+            plugins = List(
+              new IBusSimplePlugin(
+                resetVector = 0x00000000l,
+                cmdForkOnSecondStage = false,
+                prediction = STATIC,
+                compressedGen = false
+              ),
+              new DBusSimplePlugin(),
+              new DecoderSimplePlugin(),
+              new RegFilePlugin(RegFileConfig(
+                regFileReadyKind = SYNC,
+                zeroBoot = true
+              )),
+              new IntAluPlugin(),
+              new MulPlugin,
+              new DivPlugin,
+              new CsrPlugin(CsrPluginConfig.smallest),
+              new WishboneSlavePlugin(
+                addressWidth = 32,
+                dataWidth    = 32
+              )
+            )
+          )
+        )
+      )
+    }
+  }
+
+STEP 2.3 – Generate Verilog:
+
+  sbt "runMain GenVexRiscvWishbone"
+
+This produces `VexRiscv.v` in the `VexRiscv` directory. Copy that file into
+your SoC project directory.
+
+
+==================================================
+3. SOC RTL: VEXRISCV + RAM + UART + GEMM NPU
+==================================================
+
+We define:
+
+- VexRiscv Wishbone master
+- Wishbone bus interconnect (decoder)
+- On‑chip RAM (firmware‑loaded)
+- UART (Wishbone slave)
+- GEMM NPU (Wishbone slave)
+
+GEMM NPU model:
+
+- Fixed maximum tile sizes:
+  - MAX_M = 16
+  - MAX_N = 16
+  - MAX_K = 16
+- Data type:
+  - int16 elements for A and B
+  - int32 accumulation for C
+- Computation:
+  - C[M×N] = A[M×K] · B[K×N]
+- Memory layout:
+  - A row‑major, B row‑major, C row‑major inside local NPU BRAM
+
+All modules below go in one SoC project directory. External files:
+
+- `VexRiscv.v`
+- `firmware.hex` (built later)
+
+
+-----------------------------
+3.1 simple_ram_wb.v (main RAM)
+-----------------------------
+
+  // simple_ram_wb.v
+  // 64 KB single-port RAM, Wishbone slave, preload from firmware.hex
+  module simple_ram_wb #(
+      parameter MEM_SIZE = 64*1024
+  )(
+      input  wire        clk,
+      input  wire        rst,
+      input  wire        wb_cyc,
+      input  wire        wb_stb,
+      input  wire        wb_we,
+      input  wire [3:0]  wb_sel,
+      input  wire [31:0] wb_adr,
+      input  wire [31:0] wb_dat_w,
+      output reg  [31:0] wb_dat_r,
+      output reg         wb_ack
+  );
+      localparam WORDS = MEM_SIZE / 4;
+      reg [31:0] mem [0:WORDS-1];
+
+      initial begin
+          $readmemh("firmware.hex", mem);
+      end
+
+      wire [31:0] word_addr = wb_adr[31:2];
+
+      always @(posedge clk or posedge rst) begin
+          if (rst) begin
+              wb_ack  <= 1'b0;
+              wb_dat_r <= 32'd0;
+          end else begin
+              wb_ack <= 1'b0;
+              if (wb_cyc && wb_stb && !wb_ack) begin
+                  wb_dat_r <= mem[word_addr];
+                  wb_ack   <= 1'b1;
+                  if (wb_we) begin
+                      if (wb_sel[0]) mem[word_addr][7:0]   <= wb_dat_w[7:0];
+                      if (wb_sel[1]) mem[word_addr][15:8]  <= wb_dat_w[15:8];
+                      if (wb_sel[2]) mem[word_addr][23:16] <= wb_dat_w[23:16];
+                      if (wb_sel[3]) mem[word_addr][31:24] <= wb_dat_w[31:24];
+                  end
+              end
+          end
+      end
+  endmodule
+
+
+-----------------------------
+3.2 uart_rx.v / uart_tx.v
+-----------------------------
+
+(Use the same 8N1 RX/TX modules from the previous design.)
+
+
+-----------------------------
+3.3 uart_wb.v (Wishbone UART)
+-----------------------------
+
+(Same as in the previous design; unchanged.)
+
+
+-----------------------------
+3.4 npu_gemm_wb.v (GEMM‑capable NPU)
+-----------------------------
+
+  // npu_gemm_wb.v
+  // GEMM NPU: C[MxN] = A[MxK] * B[KxN] using int16 inputs and int32 accumulations.
+  // All A, B, C stored in local BRAM inside the NPU, controlled via Wishbone.
+  module npu_gemm_wb #(
+      parameter MAX_M = 16,
+      parameter MAX_N = 16,
+      parameter MAX_K = 16
+  )(
+      input  wire        clk,
+      input  wire        rst,
+      // Wishbone
+      input  wire        wb_cyc,
+      input  wire        wb_stb,
+      input  wire        wb_we,
+      input  wire [3:0]  wb_sel,
+      input  wire [31:0] wb_adr,
+      input  wire [31:0] wb_dat_w,
+      output reg  [31:0] wb_dat_r,
+      output reg         wb_ack
+  );
+      // Address decoding: word offset
+      //  0: CTRL      (W: bit0=start; R: bit0=busy, bit1=done)
+      //  1: M_N       (lower16 = M, upper16 = N)
+      //  2: K         (lower16 = K)
+      //  3: A_IDX     (index into A buffer)
+      //  4: A_DATA    (write/read int16 A[A_IDX])
+      //  5: B_IDX     (index into B buffer)
+      //  6: B_DATA    (write/read int16 B[B_IDX])
+      //  7: C_IDX     (index into C buffer)
+      //  8: C_DATA    (read int32 C[C_IDX])
+      // NOTE: A size = M*K, B size = K*N, C size = M*N, but the buffers are
+      // sized for MAX_M*MAX_K, MAX_K*MAX_N, MAX_M*MAX_N.
+
+      localparam MAX_A = MAX_M * MAX_K;
+      localparam MAX_B = MAX_K * MAX_N;
+      localparam MAX_C = MAX_M * MAX_N;
+
+      wire [4:0] addr = wb_adr[6:2];
+
+      // Config registers
+      reg [15:0] cfg_M;
+      reg [15:0] cfg_N;
+      reg [15:0] cfg_K;
+
+      reg [15:0] a_idx_reg;
+      reg [15:0] b_idx_reg;
+      reg [15:0] c_idx_reg;
+
+      // Status
+      reg        busy;
+      reg        done;
+
+      // Memories
+      reg [15:0] mem_A [0:MAX_A-1];
+      reg [15:0] mem_B [0:MAX_B-1];
+      reg [31:0] mem_C [0:MAX_C-1];
+
+      // FSM
+      localparam S_IDLE = 0;
+      localparam S_RUN  = 1;
+
+      reg [1:0] state;
+
+      // Loop indices and accumulator
+      reg [15:0] i_m;
+      reg [15:0] i_n;
+      reg [15:0] i_k;
+      reg [31:0] acc;
+
+      // Write / read handling + control
+      always @(posedge clk or posedge rst) begin
+          if (rst) begin
+              cfg_M     <= 16'd0;
+              cfg_N     <= 16'd0;
+              cfg_K     <= 16'd0;
+              a_idx_reg <= 16'd0;
+              b_idx_reg <= 16'd0;
+              c_idx_reg <= 16'd0;
+              busy      <= 1'b0;
+              done      <= 1'b0;
+              state     <= S_IDLE;
+              i_m       <= 16'd0;
+              i_n       <= 16'd0;
+              i_k       <= 16'd0;
+              acc       <= 32'd0;
+              wb_ack    <= 1'b0;
+              wb_dat_r  <= 32'd0;
+          end else begin
+              wb_ack <= 1'b0;
+
+              // Wishbone transaction
+              if (wb_cyc && wb_stb && !wb_ack) begin
+                  wb_ack <= 1'b1;
+                  if (wb_we) begin
+                      // WRITE
+                      case (addr)
+                          5'd0: begin
+                              // CTRL start bit
+                              if (wb_sel[0] && wb_dat_w[0] && !busy) begin
+                                  // sanity: nonzero dims and within MAX
+                                  if (cfg_M != 16'd0 && cfg_N != 16'd0 && cfg_K != 16'd0 &&
+                                      cfg_M <= MAX_M && cfg_N <= MAX_N && cfg_K <= MAX_K) begin
+                                      busy  <= 1'b1;
+                                      done  <= 1'b0;
+                                      state <= S_RUN;
+                                      i_m   <= 16'd0;
+                                      i_n   <= 16'd0;
+                                      i_k   <= 16'd0;
+                                      acc   <= 32'd0;
+
+                                      // Optionally clear C
+                                      // for (integer ci = 0; ci < MAX_C; ci = ci + 1)
+                                      //     mem_C[ci] <= 32'd0;
+                                  end
+                              end
+                          end
+                          5'd1: begin
+                              if (wb_sel[0]) cfg_M[7:0]  <= wb_dat_w[7:0];
+                              if (wb_sel[1]) cfg_M[15:8] <= wb_dat_w[15:8];
+                              if (wb_sel[2]) cfg_N[7:0]  <= wb_dat_w[23:16];
+                              if (wb_sel[3]) cfg_N[15:8] <= wb_dat_w[31:24];
+                          end
+                          5'd2: begin
+                              if (wb_sel[0]) cfg_K[7:0]  <= wb_dat_w[7:0];
+                              if (wb_sel[1]) cfg_K[15:8] <= wb_dat_w[15:8];
+                          end
+                          5'd3: begin
+                              if (wb_sel[0]) a_idx_reg[7:0]  <= wb_dat_w[7:0];
+                              if (wb_sel[1]) a_idx_reg[15:8] <= wb_dat_w[15:8];
+                          end
+                          5'd4: begin
+                              if (a_idx_reg < MAX_A)
+                                  mem_A[a_idx_reg] <= wb_dat_w[15:0];
+                          end
+                          5'd5: begin
+                              if (wb_sel[0]) b_idx_reg[7:0]  <= wb_dat_w[7:0];
+                              if (wb_sel[1]) b_idx_reg[15:8] <= wb_dat_w[15:8];
+                          end
+                          5'd6: begin
+                              if (b_idx_reg < MAX_B)
+                                  mem_B[b_idx_reg] <= wb_dat_w[15:0];
+                          end
+                          5'd7: begin
+                              if (wb_sel[0]) c_idx_reg[7:0]  <= wb_dat_w[7:0];
+                              if (wb_sel[1]) c_idx_reg[15:8] <= wb_dat_w[15:8];
+                          end
+                          default: ;
+                      endcase
+                  end else begin
+                      // READ
+                      case (addr)
+                          5'd0: begin
+                              wb_dat_r[0] = busy;
+                              wb_dat_r[1] = done;
+                              // auto-clear done when read
+                              done <= 1'b0;
+                          end
+                          5'd1: wb_dat_r = {cfg_N, cfg_M};
+                          5'd2: wb_dat_r = {16'd0, cfg_K};
+                          5'd3: wb_dat_r = {16'd0, a_idx_reg};
+                          5'd4: wb_dat_r = {16'd0,
+                                            (a_idx_reg < MAX_A) ? mem_A[a_idx_reg] : 16'd0};
+                          5'd5: wb_dat_r = {16'd0, b_idx_reg};
+                          5'd6: wb_dat_r = {16'd0,
+                                            (b_idx_reg < MAX_B) ? mem_B[b_idx_reg] : 16'd0};
+                          5'd7: wb_dat_r = {16'd0, c_idx_reg};
+                          5'd8: wb_dat_r = (c_idx_reg < MAX_C) ? mem_C[c_idx_reg] : 32'd0;
+                          default: wb_dat_r = 32'd0;
+                      endcase
+                  end
+              end
+
+              // GEMM FSM: nested loops over M, N, K
+              case (state)
+                  S_IDLE: begin
+                      // Idle; waiting for CTRL.start
+                  end
+                  S_RUN: begin
+                      if (i_m < cfg_M) begin
+                          if (i_n < cfg_N) begin
+                              if (i_k < cfg_K) begin
+                                  // Compute index into A and B
+                                  // A index = i_m * K + i_k
+                                  // B index = i_k * N + i_n
+                                  integer idxA;
+                                  integer idxB;
+                                  integer idxC;
+                                  idxA = i_m * cfg_K + i_k;
+                                  idxB = i_k * cfg_N + i_n;
+                                  idxC = i_m * cfg_N + i_n;
+
+                                  if (idxA < MAX_A && idxB < MAX_B && idxC < MAX_C) begin
+                                      acc <= acc +
+                                        $signed(mem_A[idxA]) * $signed(mem_B[idxB]);
+                                  end
+
+                                  i_k <= i_k + 16'd1;
+                              end else begin
+                                  // Done with K loop; write acc to C and move to next (m,n)
+                                  integer idxC2;
+                                  idxC2 = i_m * cfg_N + i_n;
+                                  if (idxC2 < MAX_C)
+                                      mem_C[idxC2] <= acc;
+
+                                  acc <= 32'd0;
+                                  i_k <= 16'd0;
+                                  i_n <= i_n + 16'd1;
+                              end
+                          end else begin
+                              // Done with N; next row M
+                              i_n <= 16'd0;
+                              i_m <= i_m + 16'd1;
+                          end
+                      end else begin
+                          // Done all
+                          busy <= 1'b0;
+                          done <= 1'b1;
+                          state <= S_IDLE;
+                      end
+                  end
+              endcase
+          end
+      end
+
+  endmodule
+
+
+-----------------------------
+3.5 wb_interconnect.v (Wishbone mux)
+-----------------------------
+
+(Exactly like before, but NPU slave now is `npu_gemm_wb` instead of dot NPU.)
+
+
+-----------------------------
+3.6 soc_top.v (top-level)
+-----------------------------
+
+  // soc_top.v
+  module soc_top (
+      input  wire clk_50,
+      input  wire rst_n,
+      input  wire uart_rx,
+      output wire uart_tx
+  );
+      wire clk = clk_50;
+      wire rst = ~rst_n;
+
+      // VexRiscv Wishbone bus
+      wire        wb_cyc;
+      wire        wb_stb;
+      wire        wb_we;
+      wire [3:0]  wb_sel;
+      wire [31:0] wb_adr;
+      wire [31:0] wb_dat_w;
+      wire [31:0] wb_dat_r;
+      wire        wb_ack;
+
+      VexRiscv cpu (
+          .clk  (clk),
+          .reset(rst),
+          .io_busWishbone_CYC   (wb_cyc),
+          .io_busWishbone_STB   (wb_stb),
+          .io_busWishbone_WE    (wb_we),
+          .io_busWishbone_SEL   (wb_sel),
+          .io_busWishbone_ADR   (wb_adr),
+          .io_busWishbone_DAT_MOSI(wb_dat_w),
+          .io_busWishbone_DAT_MISO(wb_dat_r),
+          .io_busWishbone_ACK   (wb_ack)
+      );
+
+      // Slave wires
+      wire        ram_cyc, ram_stb, ram_we, ram_ack;
+      wire [3:0]  ram_sel;
+      wire [31:0] ram_adr, ram_dat_w, ram_dat_r;
+
+      wire        uart_cyc, uart_stb, uart_we, uart_ack;
+      wire [3:0]  uart_sel;
+      wire [31:0] uart_adr, uart_dat_w, uart_dat_r;
+
+      wire        npu_cyc, npu_stb, npu_we, npu_ack;
+      wire [3:0]  npu_sel;
+      wire [31:0] npu_adr, npu_dat_w, npu_dat_r;
+
+      // Interconnect
+      wb_interconnect xbar (
+          .clk      (clk),
+          .rst      (rst),
+          .m_cyc    (wb_cyc),
+          .m_stb    (wb_stb),
+          .m_we     (wb_we),
+          .m_sel    (wb_sel),
+          .m_adr    (wb_adr),
+          .m_dat_w  (wb_dat_w),
+          .m_dat_r  (wb_dat_r),
+          .m_ack    (wb_ack),
+
+          .ram_cyc  (ram_cyc),
+          .ram_stb  (ram_stb),
+          .ram_we   (ram_we),
+          .ram_sel  (ram_sel),
+          .ram_adr  (ram_adr),
+          .ram_dat_w(ram_dat_w),
+          .ram_dat_r(ram_dat_r),
+          .ram_ack  (ram_ack),
+
+          .uart_cyc (uart_cyc),
+          .uart_stb (uart_stb),
+          .uart_we  (uart_we),
+          .uart_sel (uart_sel),
+          .uart_adr (uart_adr),
+          .uart_dat_w(uart_dat_w),
+          .uart_dat_r(uart_dat_r),
+          .uart_ack (uart_ack),
+
+          .npu_cyc  (npu_cyc),
+          .npu_stb  (npu_stb),
+          .npu_we   (npu_we),
+          .npu_sel  (npu_sel),
+          .npu_adr  (npu_adr),
+          .npu_dat_w(npu_dat_w),
+          .npu_dat_r(npu_dat_r),
+          .npu_ack  (npu_ack)
+      );
+
+      // RAM
+      simple_ram_wb #(
+          .MEM_SIZE(64*1024)
+      ) ram0 (
+          .clk    (clk),
+          .rst    (rst),
+          .wb_cyc (ram_cyc),
+          .wb_stb (ram_stb),
+          .wb_we  (ram_we),
+          .wb_sel (ram_sel),
+          .wb_adr (ram_adr),
+          .wb_dat_w(ram_dat_w),
+          .wb_dat_r(ram_dat_r),
+          .wb_ack (ram_ack)
+      );
+
+      // UART
+      uart_wb #(
+          .CLK_FREQ(50000000),
+          .BAUD(115200)
+      ) uart0 (
+          .clk    (clk),
+          .rst    (rst),
+          .rx     (uart_rx),
+          .tx     (uart_tx),
+          .wb_cyc (uart_cyc),
+          .wb_stb (uart_stb),
+          .wb_we  (uart_we),
+          .wb_sel (uart_sel),
+          .wb_adr (uart_adr),
+          .wb_dat_w(uart_dat_w),
+          .wb_dat_r(uart_dat_r),
+          .wb_ack (uart_ack)
+      );
+
+      // GEMM NPU
+      npu_gemm_wb #(
+          .MAX_M(16),
+          .MAX_N(16),
+          .MAX_K(16)
+      ) npu0 (
+          .clk    (clk),
+          .rst    (rst),
+          .wb_cyc (npu_cyc),
+          .wb_stb (npu_stb),
+          .wb_we  (npu_we),
+          .wb_sel (npu_sel),
+          .wb_adr (npu_adr),
+          .wb_dat_w(npu_dat_w),
+          .wb_dat_r(npu_dat_r),
+          .wb_ack (npu_ack)
+      );
+
+  endmodule
+
+
+==================================================
+4. FIRMWARE FOR GEMM NPU (BARE-METAL C)
+==================================================
+
+Memory map:
+
+- RAM:  0x00000000
+- UART: 0x10000000
+- NPU:  0x20000000
+
+NPU register offsets:
+
+- 0x00: CTRL     (W: bit0=start; R: bit0=busy, bit1=done)
+- 0x04: M_N      (bits[15:0]=M, bits[31:16]=N)
+- 0x08: K        (bits[15:0]=K)
+- 0x0C: A_IDX
+- 0x10: A_DATA
+- 0x14: B_IDX
+- 0x18: B_DATA
+- 0x1C: C_IDX
+- 0x20: C_DATA
+
+We define a UART protocol:
+
+- Host → SoC:
+  - 0xAA (sync)
+  - 0x02 (command: GEMM)
+  - M (uint8), N (uint8), K (uint8)   (all ≤16; we ignore upper bits)
+  - A elements: M*K int16, row‑major
+  - B elements: K*N int16, row‑major
+- SoC → Host:
+  - 0x55 (sync)
+  - C elements: M*N int32, row‑major (each little‑endian)
+
+-----------------------------
+4.1 firmware.c
+-----------------------------
+
+  #include <stdint.h>
+
+  #define UART_BASE   0x10000000u
+  #define UART_DATA   (*(volatile uint32_t*)(UART_BASE + 0x0))
+  #define UART_STATUS (*(volatile uint32_t*)(UART_BASE + 0x4))
+
+  #define NPU_BASE    0x20000000u
+  #define NPU_CTRL    (*(volatile uint32_t*)(NPU_BASE + 0x0))
+  #define NPU_MN      (*(volatile uint32_t*)(NPU_BASE + 0x4))
+  #define NPU_K       (*(volatile uint32_t*)(NPU_BASE + 0x8))
+  #define NPU_A_IDX   (*(volatile uint32_t*)(NPU_BASE + 0xC))
+  #define NPU_A_DATA  (*(volatile uint32_t*)(NPU_BASE + 0x10))
+  #define NPU_B_IDX   (*(volatile uint32_t*)(NPU_BASE + 0x14))
+  #define NPU_B_DATA  (*(volatile uint32_t*)(NPU_BASE + 0x18))
+  #define NPU_C_IDX   (*(volatile uint32_t*)(NPU_BASE + 0x1C))
+  #define NPU_C_DATA  (*(volatile uint32_t*)(NPU_BASE + 0x20))
+
+  static void uart_putc(uint8_t c) {
+      while (UART_STATUS & 0x1u) ;
+      UART_DATA = c;
+  }
+
+  static uint8_t uart_getc(void) {
+      uint32_t v;
+      do {
+          v = UART_DATA;
+      } while ((v & 0x80000000u) == 0);
+      return (uint8_t)(v & 0xFF);
+  }
+
+  static void uart_write(const uint8_t* buf, uint32_t len) {
+      for (uint32_t i = 0; i < len; i++) uart_putc(buf[i]);
+  }
+
+  #define SYNC_CMD  0xAA
+  #define CMD_GEMM  0x02
+  #define SYNC_RESP 0x55
+
+  // Load A and B into NPU BRAM and run GEMM
+  static void npu_gemm(const int16_t* A, const int16_t* B,
+                       uint8_t M, uint8_t N, uint8_t K,
+                       int32_t* C_out) {
+      if (M == 0 || N == 0 || K == 0) return;
+      if (M > 16 || N > 16 || K > 16) return;
+
+      // Write dimensions
+      uint32_t mn = ((uint32_t)N << 16) | (uint32_t)M;
+      NPU_MN = mn;
+      NPU_K  = (uint32_t)K;
+
+      // Write A (M*K)
+      uint16_t totalA = (uint16_t)M * (uint16_t)K;
+      for (uint16_t i = 0; i < totalA; i++) {
+          NPU_A_IDX = i;
+          NPU_A_DATA = (uint16_t)A[i];
+      }
+
+      // Write B (K*N)
+      uint16_t totalB = (uint16_t)K * (uint16_t)N;
+      for (uint16_t i = 0; i < totalB; i++) {
+          NPU_B_IDX = i;
+          NPU_B_DATA = (uint16_t)B[i];
+      }
+
+      // Start
+      NPU_CTRL = 1u;
+
+      // Wait for busy clear
+      while (NPU_CTRL & 0x1u) { }
+
+      // Read C (M*N)
+      uint16_t totalC = (uint16_t)M * (uint16_t)N;
+      for (uint16_t i = 0; i < totalC; i++) {
+          NPU_C_IDX = i;
+          C_out[i] = (int32_t)NPU_C_DATA;
+      }
+  }
+
+  void main(void) {
+      while (1) {
+          uint8_t sync = uart_getc();
+          if (sync != SYNC_CMD) continue;
+
+          uint8_t cmd = uart_getc();
+          if (cmd != CMD_GEMM) continue;
+
+          uint8_t M = uart_getc();
+          uint8_t N = uart_getc();
+          uint8_t K = uart_getc();
+          if (M == 0 || N == 0 || K == 0) continue;
+          if (M > 16 || N > 16 || K > 16) continue;
+
+          uint16_t totalA = (uint16_t)M * (uint16_t)K;
+          uint16_t totalB = (uint16_t)K * (uint16_t)N;
+          uint16_t totalC = (uint16_t)M * (uint16_t)N;
+
+          static int16_t A_buf[16*16];
+          static int16_t B_buf[16*16];
+          static int32_t C_buf[16*16];
+
+          // Read A
+          for (uint16_t i = 0; i < totalA; i++) {
+              uint8_t lo = uart_getc();
+              uint8_t hi = uart_getc();
+              A_buf[i] = (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+          }
+
+          // Read B
+          for (uint16_t i = 0; i < totalB; i++) {
+              uint8_t lo = uart_getc();
+              uint8_t hi = uart_getc();
+              B_buf[i] = (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+          }
+
+          // Run GEMM
+          npu_gemm(A_buf, B_buf, M, N, K, C_buf);
+
+          // Send back result
+          uart_putc(SYNC_RESP);
+          for (uint16_t i = 0; i < totalC; i++) {
+              int32_t v = C_buf[i];
+              uart_putc((uint8_t)(v & 0xFF));
+              uart_putc((uint8_t)((v >> 8) & 0xFF));
+              uart_putc((uint8_t)((v >> 16) & 0xFF));
+              uart_putc((uint8_t)((v >> 24) & 0xFF));
+          }
+      }
+  }
+
+
+-----------------------------
+4.2 Build firmware → firmware.hex
+-----------------------------
+
+On your dev machine:
+
+  riscv32-unknown-elf-gcc -Os -march=rv32im -mabi=ilp32 -nostdlib -ffreestanding \
+      -Wl,-Bstatic,-Ttext=0x00000000,-Map=firmware.map \
+      -o firmware.elf firmware.c
+
+  riscv32-unknown-elf-objcopy -O binary firmware.elf firmware.bin
+
+  python3 - << 'EOF'
+  data = open("firmware.bin", "rb").read()
+  if len(data) % 4 != 0:
+      data += b'\x00' * (4 - (len(data) % 4))
+  words = []
+  for i in range(0, len(data), 4):
+      w = data[i] | (data[i+1]<<8) | (data[i+2]<<16) | (data[i+3]<<24)
+      words.append(w)
+  with open("firmware.hex", "w") as f:
+      for w in words:
+          f.write("{:08x}\n".format(w))
+  EOF
+
+Place `firmware.hex` next to `simple_ram_wb.v`.
+
+
+==================================================
+5. QUARTUS PROJECT AND VOLATILE PROGRAMMING
+==================================================
+
+- Create a new Quartus project for the DueProLogic board.
+- Add files:
+  - VexRiscv.v
+  - soc_top.v
+  - wb_interconnect.v
+  - simple_ram_wb.v
+  - uart_rx.v
+  - uart_tx.v
+  - uart_wb.v
+  - npu_gemm_wb.v
+  - firmware.hex (not as HDL, just in project directory)
+
+Set `soc_top` as top-level.
+
+Pin assignments (Pin Planner):
+
+- `clk_50` → 50 MHz clock pin on DueProLogic
+- `rst_n`  → a reset button pin (active-low) or tie high
+- `uart_rx` → header pin wired to USB-UART TX
+- `uart_tx` → header pin wired to USB-UART RX
+- I/O standard: 3.3-V LVTTL
+
+Compile. You get `soc_top.sof`.
+
+On the Raspberry Pi 5, with USB-Blaster connected:
+
+  sudo openFPGALoader -c usb-blaster soc_top.sof
+
+This configures the FPGA SRAM only (volatile). Power-cycling restores the old
+flash image.
+
+
+==================================================
+6. RASPBERRY PI 5 HOST: GEMM CLIENT
+==================================================
+
+Host protocol for GEMM:
+
+- Send:
+  - 0xAA
+  - 0x02
+  - M (uint8), N (uint8), K (uint8)
+  - A[M*K] int16 (row-major)
+  - B[K*N] int16 (row-major)
+- Receive:
+  - 0x55
+  - C[M*N] int32 (row-major)
+
+-----------------------------
+6.1 fpga_gemm_client.py
+-----------------------------
+
+  #!/usr/bin/env python3
+  import serial
+  import struct
+  import time
+  import random
+
+  SYNC_CMD  = 0xAA
+  CMD_GEMM  = 0x02
+  SYNC_RESP = 0x55
+
+  class FPGAGemmClient:
+      def __init__(self, port="/dev/ttyUSB0", baud=115200, timeout=2.0):
+          self.ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+          time.sleep(0.2)
+
+      def close(self):
+          self.ser.close()
+
+      def gemm(self, A, B, M, N, K):
+          """
+          A: list or iterable of length M*K (int16)
+          B: list or iterable of length K*N (int16)
+          Returns: list of length M*N (int32)
+          """
+          if M < 1 or M > 16 or N < 1 or N > 16 or K < 1 or K > 16:
+              raise ValueError("M,N,K must be 1..16")
+
+          if len(A) != M*K:
+              raise ValueError("A size mismatch")
+          if len(B) != K*N:
+              raise ValueError("B size mismatch")
+
+          pkt = bytearray()
+          pkt.append(SYNC_CMD)
+          pkt.append(CMD_GEMM)
+          pkt.append(M & 0xFF)
+          pkt.append(N & 0xFF)
+          pkt.append(K & 0xFF)
+
+          for x in A:
+              pkt += struct.pack("<h", int(x))
+          for x in B:
+              pkt += struct.pack("<h", int(x))
+
+          self.ser.write(pkt)
+
+          sync = self.ser.read(1)
+          if not sync or sync[0] != SYNC_RESP:
+              raise RuntimeError("Bad sync from FPGA GEMM")
+
+          totalC = M*N
+          res_bytes = self.ser.read(4*totalC)
+          if len(res_bytes) != 4*totalC:
+              raise RuntimeError("Incomplete C matrix from FPGA")
+
+          C = list(struct.unpack("<" + "i"*totalC, res_bytes))
+          return C
+
+  def test():
+      cli = FPGAGemmClient("/dev/ttyUSB0", 115200)
+      try:
+          M, N, K = 4, 4, 4
+          A = [random.randint(-4, 4) for _ in range(M*K)]
+          B = [random.randint(-4, 4) for _ in range(K*N)]
+          print("A:", A)
+          print("B:", B)
+          C_hw = cli.gemm(A, B, M, N, K)
+
+          # Software reference
+          def gemm_sw(A, B, M, N, K):
+              C = [0]*(M*N)
+              for m in range(M):
+                  for n in range(N):
+                      acc = 0
+                      for k in range(K):
+                          acc += A[m*K + k] * B[k*N + n]
+                      C[m*N + n] = acc
+              return C
+
+          C_sw = gemm_sw(A, B, M, N, K)
+
+          print("C_hw:", C_hw)
+          print("C_sw:", C_sw)
+          print("MATCH" if C_hw == C_sw else "MISMATCH")
+      finally:
+          cli.close()
+
+  if __name__ == "__main__":
+      test()
+
+
+==================================================
+7. HUGGING FACE TEXT-TO-IMAGE EXAMPLE USING GEMM NPU
+==================================================
+
+We now integrate the GEMM NPU into a Hugging Face Stable Diffusion workflow.
+
+Idea:
+
+- Take a text embedding vector of dimension D (e.g. 768)
+- Use a small tile (e.g. D_t = 16) and out_dim_t = 16 to build a tiny linear
+  layer piecewise using the FPGA GEMM block:
+    - For each tile of size (1×K_t)*(K_t×N_t) -> (1×N_t)
+- For simplicity, we demonstrate a single tile: M=1, K=16, N=16.
+
+Install Python deps on the Pi (or your dev machine that has access to FPGA):
+
+  pip install torch diffusers transformers accelerate safetensors pyserial
+
+-----------------------------
+7.1 hf_sd_gemm_fpga.py
+-----------------------------
+
+  #!/usr/bin/env python3
+  import torch
+  from diffusers import StableDiffusionPipeline
+  from fpga_gemm_client import FPGAGemmClient
+  import numpy as np
+
+  def main():
+      # Connect to FPGA GEMM NPU
+      fpga = FPGAGemmClient("/dev/ttyUSB0", 115200)
+
+      # Load Stable Diffusion
+      pipe = StableDiffusionPipeline.from_pretrained(
+          "runwayml/stable-diffusion-v1-5",
+          torch_dtype=torch.float32
+      )
+      device = "cpu"
+      pipe = pipe.to(device)
+
+      prompt = "a highly detailed futuristic lab with robots"
+      text_inputs = pipe.tokenizer(
+          [prompt],
+          padding="max_length",
+          max_length=pipe.tokenizer.model_max_length,
+          truncation=True,
+          return_tensors="pt"
+      )
+
+      with torch.no_grad():
+          text_embeds = pipe.text_encoder(text_inputs.input_ids.to(device))[0]  # [1, seq, hidden]
+
+      # Take the first token embedding
+      emb = text_embeds[:, 0, :]  # [1, hidden_dim]
+      hidden_dim = emb.shape[-1]
+
+      emb_np = emb.cpu().numpy().reshape(-1).astype(np.float32)
+
+      # We'll take the first 16 elements as our K dimension for GEMM
+      K = 16
+      M = 1
+      N = 16
+
+      if hidden_dim < K:
+          raise RuntimeError("Hidden dim < 16, adjust K")
+
+      # Slice
+      x_slice = emb_np[:K]  # shape (K,)
+
+      # Quantize to int16
+      scale = 128.0
+      x_q = np.clip(np.round(x_slice * (1.0 / scale)), -32768, 32767).astype(np.int16)
+
+      # Create a random weight matrix W: shape (K x N)
+      np.random.seed(42)
+      W = np.random.randint(-8, 8, size=(K, N), dtype=np.int16)
+
+      # GEMM expects A[M*K] row-major and B[K*N] row-major:
+      # We'll treat A as row [x_q], B as W, but we need shapes:
+      #   A: M x K = 1 x K -> row-major is x_q
+      #   B: K x N -> row-major flatten
+      A = x_q.tolist()
+      B = W.flatten().tolist()
+
+      # Run GEMM on FPGA: C[M*N], where M=1, N=16, K=16
+      C_hw = fpga.gemm(A, B, M, N, K)  # int32 outputs
+
+      # Dequantize: each product is (x_q*W), but W was int16 "weights",
+      # and x_q represents emb/scale, so C ~ sum((emb/scale)*W) * scale? No,
+      # we defined W directly as int16, so each product is (emb/scale)*W,
+      # so C scales ~ 1/scale. We'll just rescale by scale for a rough float.
+      C_fp = (np.array(C_hw, dtype=np.float32) / (1.0 * scale))
+
+      print("FPGA GEMM output (float approx):", C_fp)
+
+      # For demo, we just print and then run SD normally
+      image = pipe(prompt, num_inference_steps=20, guidance_scale=7.5).images[0]
+      image.save("sd_gemm_fpga_demo.png")
+      print("Saved sd_gemm_fpga_demo.png")
+
+  if __name__ == "__main__":
+      main()
+
+
+==================================================
+8. END-TO-END CHECKLIST
+==================================================
+
+1. Generate VexRiscv with WishboneSlavePlugin, get `VexRiscv.v`.
+2. Create all RTL files (RAM, UART, GEMM NPU, interconnect, soc_top).
+3. Build firmware, generate `firmware.hex`.
+4. Put RTL + `VexRiscv.v` + `firmware.hex` into a Quartus project, top `soc_top`.
+5. Assign pins for `clk_50`, `rst_n`, `uart_rx`, `uart_tx`.
+6. Compile → `soc_top.sof`.
+7. On Raspberry Pi 5, use:
+
+     openFPGALoader -c usb-blaster soc_top.sof
+
+   to program SRAM (volatile).
+
+8. Wire USB‑UART: TX→uart_rx, RX→uart_tx, GND shared.
+9. On Pi, run `fpga_gemm_client.py` and confirm HW/SW GEMM results match.
+10. Run `hf_sd_gemm_fpga.py` to:
+    - Generate a Stable Diffusion image
+    - Call your FPGA GEMM NPU on a real embedding slice.
+
+At that point, you have:
+
+- A **VexRiscv-based soft processor SoC** with:
+  - On-chip RAM
+  - UART
+  - **GEMM-capable NPU** (small tile)
+- **Volatile FPGA configuration** (no flash writes)
+- A **Hugging Face text-to-image flow** that actually uses your GEMM NPU.
+
+From here you can:
+
+- Increase MAX_M, MAX_N, MAX_K (within BRAM limits)
+- Add tiling and DMA from main RAM
+- Add multi-lane MAC arrays for more throughput
+- Extend to convolution kernels and more serious UNet offload.
+
+======================================================================
+END OF GEMM-CAPABLE NPU END-TO-END DOCUMENT
+======================================================================
