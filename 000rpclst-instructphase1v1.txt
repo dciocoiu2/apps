@@ -1,0 +1,762 @@
+################################################################################
+# FROM ZERO: FLASH OS, BOOTSTRAP, INSTALL HA K3S, GUI MANAGEMENT (FOSS ONLY)
+# NO HARDCODED IPs, ALL ACCESSIBLE VIA MASTER NODE HOSTNAMES / LAN
+################################################################################
+
+# ASSUMPTIONS:
+# - You have 6 Pis:
+#   * pi5-1, pi5-2, pi4-1 (control-plane + workers)
+#   * pi3plus-1, pi3-1, pi3-2 (workers)
+# - Your LAN/DHCP gives them IPs and lets you reach them by hostname (e.g. pi5-1)
+#   via local DNS or mDNS. If not, add them to /etc/hosts on your workstation.
+# - All tools below run from your Linux workstation unless stated otherwise.
+
+################################################################################
+# STEP 0: FLASH RASPBERRY PI OS LITE TO EACH NODE
+################################################################################
+
+# Install Raspberry Pi Imager on your workstation, then for each SD/SSD:
+# In the GUI:
+#   - OS: "Raspberry Pi OS Lite (64-bit)" for Pi 4/5, Lite (32-bit or 64-bit) for Pi 3
+#   - Set hostname: pi5-1, pi5-2, pi4-1, pi3plus-1, pi3-1, pi3-2
+#   - Enable SSH
+#   - Set username: pi, password: choose one
+#   - Configure Wi-Fi OFF (use wired LAN)
+#   - Flash
+# Insert each card into the matching Pi, connect Ethernet, power on.
+# Verify you can SSH to each: ssh pi@pi5-1, ssh pi@pi5-2, etc.
+
+################################################################################
+# STEP 1: BASE BOOTSTRAP ON EACH NODE
+################################################################################
+
+cat >bootstrap.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <hostname>"
+  exit 1
+fi
+HOSTNAME="$1"
+sudo hostnamectl set-hostname "$HOSTNAME"
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo apt-get install -y curl wget git vim htop jq net-tools iproute2 iptables conntrack chrony ca-certificates socat tcpdump dnsutils
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab || true
+if ! grep -q "cgroup_enable=cpuset" /boot/cmdline.txt; then
+  sudo sed -i '1 s/$/ cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1/' /boot/cmdline.txt
+fi
+cat <<EOM | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+br_netfilter
+overlay
+EOM
+sudo modprobe br_netfilter || true
+sudo modprobe overlay || true
+cat <<EOM | sudo tee /etc/sysctl.d/99-k8s.conf >/dev/null
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOM
+sudo sysctl --system
+sudo systemctl enable chrony --now
+echo "Bootstrap complete for $HOSTNAME. Reboot now."
+EOF
+
+chmod +x bootstrap.sh
+
+ssh pi@pi5-1 "bash -s" < ./bootstrap.sh pi5-1
+ssh pi@pi5-1 "sudo reboot"
+
+ssh pi@pi5-2 "bash -s" < ./bootstrap.sh pi5-2
+ssh pi@pi5-2 "sudo reboot"
+
+ssh pi@pi4-1 "bash -s" < ./bootstrap.sh pi4-1
+ssh pi@pi4-1 "sudo reboot"
+
+ssh pi@pi3plus-1 "bash -s" < ./bootstrap.sh pi3plus-1
+ssh pi@pi3plus-1 "sudo reboot"
+
+ssh pi@pi3-1 "bash -s" < ./bootstrap.sh pi3-1
+ssh pi@pi3-1 "sudo reboot"
+
+ssh pi@pi3-2 "bash -s" < ./bootstrap.sh pi3-2
+ssh pi@pi3-2 "sudo reboot"
+
+################################################################################
+# STEP 2: INSTALL K3S HA CONTROL PLANE (3 SERVERS, NO IP HARDCODES)
+################################################################################
+
+K3S_TOKEN="k3scluster-shared-token-1234567890"
+
+ssh pi@pi5-1 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  INSTALL_K3S_EXEC="server \
+    --cluster-init \
+    --disable traefik \
+    --disable servicelb \
+    --write-kubeconfig-mode 644 \
+    --tls-san pi5-1 \
+    --tls-san pi5-2 \
+    --tls-san pi4-1" \
+  /tmp/install-k3s.sh
+EOF
+
+ssh pi@pi5-2 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  K3S_URL="https://pi5-1:6443" \
+  INSTALL_K3S_EXEC="server \
+    --disable traefik \
+    --disable servicelb \
+    --write-kubeconfig-mode 644 \
+    --tls-san pi5-1 \
+    --tls-san pi5-2 \
+    --tls-san pi4-1" \
+  /tmp/install-k3s.sh
+EOF
+
+ssh pi@pi4-1 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  K3S_URL="https://pi5-1:6443" \
+  INSTALL_K3S_EXEC="server \
+    --disable traefik \
+    --disable servicelb \
+    --write-kubeconfig-mode 644 \
+    --tls-san pi5-1 \
+    --tls-san pi5-2 \
+    --tls-san pi4-1" \
+  /tmp/install-k3s.sh
+EOF
+
+################################################################################
+# STEP 3: INSTALL K3S AGENTS (3 WORKERS)
+################################################################################
+
+ssh pi@pi3plus-1 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  K3S_URL="https://pi5-1:6443" \
+  INSTALL_K3S_EXEC="agent" \
+  /tmp/install-k3s.sh
+EOF
+
+ssh pi@pi3-1 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  K3S_URL="https://pi5-1:6443" \
+  INSTALL_K3S_EXEC="agent" \
+  /tmp/install-k3s.sh
+EOF
+
+ssh pi@pi3-2 <<EOF
+set -euo pipefail
+curl -sfL https://get.k3s.io -o /tmp/install-k3s.sh
+chmod +x /tmp/install-k3s.sh
+sudo INSTALL_K3S_VERSION="v1.30.0+k3s1" \
+  K3S_TOKEN="$K3S_TOKEN" \
+  K3S_URL="https://pi5-1:6443" \
+  INSTALL_K3S_EXEC="agent" \
+  /tmp/install-k3s.sh
+EOF
+
+################################################################################
+# STEP 4: FETCH KUBECONFIG, SET NAMESPACES AND NODE LABELS
+################################################################################
+
+ssh pi@pi5-1 "sudo cat /etc/rancher/k3s/k3s.yaml" > kubeconfig
+chmod 600 kubeconfig
+export KUBECONFIG=$(pwd)/kubeconfig
+
+# Replace server to use hostname instead of IP (if necessary):
+# Make sure 'server:' line points to https://pi5-1:6443
+
+kubectl get nodes -o wide
+
+cat >namespaces.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sit
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: uat
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod
+EOF
+
+kubectl apply -f namespaces.yaml
+
+kubectl label node pi5-1 tier=heavy
+kubectl label node pi5-2 tier=heavy
+kubectl label node pi4-1 tier=medium
+kubectl label node pi3plus-1 tier=light
+kubectl label node pi3-1 tier=light
+kubectl label node pi3-2 tier=light
+
+################################################################################
+# STEP 5: INSTALL NGINX INGRESS CONTROLLER AS HOSTNETWORK DAEMONSET
+# EXPOSES HTTP/HTTPS ON ALL NODES (OR JUST HEAVY NODES) VIA THEIR LAN IPs
+################################################################################
+
+cat >nginx-ingress.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingress-nginx
+  namespace: ingress-nginx
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ingress-nginx
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps","endpoints","nodes","pods","secrets","services"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses","ingresses/status"]
+    verbs: ["get","list","watch","update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create","patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx
+    namespace: ingress-nginx
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  selector:
+    matchLabels:
+      app: ingress-nginx
+  template:
+    metadata:
+      labels:
+        app: ingress-nginx
+    spec:
+      serviceAccountName: ingress-nginx
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        tier: heavy
+      containers:
+        - name: controller
+          image: registry.k8s.io/ingress-nginx/controller:v1.11.1
+          args:
+            - /nginx-ingress-controller
+            - --election-id=ingress-controller-leader
+            - --ingress-class=nginx
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+          securityContext:
+            allowPrivilegeEscalation: false
+EOF
+
+kubectl apply -f nginx-ingress.yaml
+
+################################################################################
+# STEP 6: INSTALL ARGO CD (GITOPS + DEPLOYMENT GUI)
+################################################################################
+
+cat >argocd-install.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-server
+  namespace: argocd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: argocd-server
+  template:
+    metadata:
+      labels:
+        app: argocd-server
+    spec:
+      serviceAccountName: argocd-server
+      containers:
+        - name: argocd-server
+          image: quay.io/argoproj/argocd:v2.11.0
+          args:
+            - argocd-server
+            - --insecure
+          ports:
+            - containerPort: 8080
+              name: server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  selector:
+    app: argocd-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-ingress
+  namespace: argocd
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: argocd.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 80
+EOF
+
+kubectl apply -f argocd-install.yaml
+
+################################################################################
+# STEP 7: INSTALL OBSERVABILITY: PROMETHEUS + GRAFANA + LOKI
+################################################################################
+
+cat >observability.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+          - role: endpoints
+      - job_name: 'kubernetes-nodes'
+        kubernetes_sd_configs:
+          - role: node
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.1.0
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: admin
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.1.1
+          args:
+            - "-config.file=/etc/loki/config.yml"
+          ports:
+            - containerPort: 3100
+          volumeMounts:
+            - name: loki-config
+              mountPath: /etc/loki
+      volumes:
+        - name: loki-config
+          configMap:
+            name: loki-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: observability
+data:
+  config.yml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    ingester:
+      lifecycler:
+        ring:
+          kvstore:
+            store: inmemory
+      chunk_idle_period: 5m
+      max_chunk_age: 1h
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: boltdb
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: index_
+            period: 24h
+    storage_config:
+      boltdb:
+        directory: /loki/index
+      filesystem:
+        directory: /loki/chunks
+    limits_config:
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  selector:
+    app: loki
+  ports:
+    - name: http
+      port: 3100
+      targetPort: 3100
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: observability
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: grafana.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+EOF
+
+kubectl apply -f observability.yaml
+
+################################################################################
+# STEP 8: INSTALL KEYCLOAK (SSO) FOSS
+################################################################################
+
+cat >keycloak.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:24.0.5
+          args: ["start-dev"]
+          env:
+            - name: KEYCLOAK_ADMIN
+              value: admin
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              value: admin
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak-ingress
+  namespace: keycloak
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: keycloak.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+EOF
+
+kubectl apply -f keycloak.yaml
+
+################################################################################
+# HOW TO ACCESS GUIs FROM YOUR LAN (NO IP HARDCODE IN CLUSTER)
+################################################################################
+
+# 1) Find any heavy node IP from your workstation:
+#    ping pi5-1
+#    or: getent hosts pi5-1
+#    Suppose it resolves to A.B.C.D (your LAN will decide).
+
+# 2) Add hostnames to your workstation's /etc/hosts, mapping to pi5-1's IP:
+#    sudo nano /etc/hosts
+#    A.B.C.D   argocd.local grafana.local keycloak.local hello.local
+
+# 3) Test:
+#    - http://argocd.local   → Argo CD GUI (deployment/management)
+#    - http://grafana.local  → Grafana GUI (observability)
+#    - http://keycloak.local → Keycloak GUI (SSO)
+
+# 4) Test NGINX ingress with a sample app:
+cat <<'EOF' >hello.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello
+  template:
+    metadata:
+      labels:
+        app: hello
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable-alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: dev
+spec:
+  selector:
+    app: hello
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello
+  namespace: dev
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: hello.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hello
+                port:
+                  number: 80
+EOF
+
+kubectl apply -f hello.yaml
+
+# Add hello.local to /etc/hosts pointing to pi5-1, open http://hello.local and
+# you should see the NGINX welcome page.
+################################################################################
