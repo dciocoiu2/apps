@@ -4762,6 +4762,627 @@ WHAT PHASE 1I GIVES YOU TOWARD THE QUAD-CORE GOAL
   - Future multi-core: other harts can be started by firmware after boot.
 
 #######END PHASE1I########
+================================================================================
+PHASE 1J: C HAL FOR UART0, JTAG-UART, I2C, SPI, GPIO (FOR SDRAM FIRMWARE)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1J
+----------------
+Build a **Hardware Abstraction Layer (HAL)** so SDRAM-resident firmware can:
+
+- Use UART0, JTAG-UART, I2C, SPI, GPIO through clean C APIs.
+- Ignore raw register addresses and bit twiddling in application code.
+- Rely on a single header and one C file for all low-level peripherals.
+- Integrate cleanly with your Phase 1I bootloader (H3BT → SDRAM @ 0x8000_0000).
+
+We will:
+
+1. Define the memory map constants consistently with all previous phases.
+2. Create:
+   - `h3_soc.h`  — SoC-wide definitions + HAL API.
+   - `h3_soc.c`  — HAL implementation.
+3. Sketch a minimal SDRAM firmware `main.c` that uses the HAL (for Phase 1K).
+
+Nothing here touches FPGA flash:
+- You still only load `.sof` into SRAM.
+- Bootloader is in ROM, firmware is in SDRAM.
+- Power-cycle → factory demo.
+
+================================================================================
+DIRECTORY STRUCTURE FOR HAL + FIRMWARE
+================================================================================
+
+Keep bootloader separate. For SDRAM firmware (Phase 1K), use:
+
+  ~/hazard3_fw/app/
+    - h3_soc.h      (NEW — HAL header)
+    - h3_soc.c      (NEW — HAL implementation)
+    - main.c        (Phase 1K will flesh this out)
+    - linker_app.ld (for SDRAM @ 0x80000000, later)
+    - Makefile      (for firmware, later)
+
+Phase 1J focuses just on:
+
+- `h3_soc.h`
+- `h3_soc.c`
+
+================================================================================
+STEP 1 — HAL HEADER: h3_soc.h
+================================================================================
+
+Defines:
+
+- Memory map constants.
+- Peripheral register structures.
+- HAL function prototypes.
+- Simple error codes and types.
+
+----- FILE: ~/hazard3_fw/app/h3_soc.h -----------------------------------------
+
+#ifndef H3_SOC_H
+#define H3_SOC_H
+
+#include <stdint.h>
+
+/* ============================================================================
+ * Memory map
+ * ============================================================================
+ */
+#define H3_SDRAM_BASE       0x80000000u
+
+#define H3_UART0_BASE       0x10000000u
+#define H3_I2C0_BASE        0x10000100u
+#define H3_SPI0_BASE        0x10000200u
+#define H3_GPIO_BASE        0x10000300u
+#define H3_JTAG_UART_BASE   0x10000500u
+
+/* ============================================================================
+ * UART0 (16550) register layout (32-bit accesses, low 8 bits used)
+ * ============================================================================
+ */
+typedef struct {
+    volatile uint32_t RBR_THR_DLL;   // 0x00: RBR (RO), THR (WO), DLL (DLAB=1)
+    volatile uint32_t IER_DLM;       // 0x04: IER / DLM (DLAB=1)
+    volatile uint32_t IIR_FCR;       // 0x08: IIR (RO) / FCR (WO)
+    volatile uint32_t LCR;           // 0x0C
+    volatile uint32_t MCR;           // 0x10
+    volatile uint32_t LSR;           // 0x14
+    volatile uint32_t MSR;           // 0x18
+    volatile uint32_t SCR;           // 0x1C
+} h3_uart_t;
+
+#define H3_UART0   ((h3_uart_t *)H3_UART0_BASE)
+
+#define H3_UART_LSR_DR    (1u << 0)
+#define H3_UART_LSR_THRE  (1u << 5)
+#define H3_UART_LCR_DLAB  (1u << 7)
+
+/* ============================================================================
+ * I2C master (OpenCores) register layout
+ * Base + 0x00: PRERlo
+ * Base + 0x04: PRERhi
+ * Base + 0x08: CTR
+ * Base + 0x0C: TXR/RXR
+ * Base + 0x10: CR/SR
+ * ============================================================================
+ */
+typedef struct {
+    volatile uint32_t PRER_LO;   // 0x00
+    volatile uint32_t PRER_HI;   // 0x04
+    volatile uint32_t CTR;       // 0x08
+    volatile uint32_t TXR_RXR;   // 0x0C
+    volatile uint32_t CR_SR;     // 0x10
+} h3_i2c_t;
+
+#define H3_I2C0   ((h3_i2c_t *)H3_I2C0_BASE)
+
+#define H3_I2C_CTR_EN    (1u << 7)
+#define H3_I2C_CR_STA    (1u << 7)
+#define H3_I2C_CR_STO    (1u << 6)
+#define H3_I2C_CR_RD     (1u << 5)
+#define H3_I2C_CR_WR     (1u << 4)
+#define H3_I2C_CR_ACK    (1u << 3)
+
+#define H3_I2C_SR_RXACK  (1u << 7)
+#define H3_I2C_SR_TIP    (1u << 1)
+
+/* ============================================================================
+ * SPI master (OpenCores-like) register layout
+ * Base + 0x00: RX/TX
+ * Base + 0x04: STATUS
+ * Base + 0x08: CTRL
+ * Base + 0x0C: DIVIDER
+ * Base + 0x10: SS
+ * ============================================================================
+ */
+typedef struct {
+    volatile uint32_t RXTX;      // 0x00
+    volatile uint32_t STATUS;    // 0x04
+    volatile uint32_t CTRL;      // 0x08
+    volatile uint32_t DIVIDER;   // 0x0C
+    volatile uint32_t SS;        // 0x10
+} h3_spi_t;
+
+#define H3_SPI0   ((h3_spi_t *)H3_SPI0_BASE)
+
+/* Bits used (adjust to actual core if needed) */
+#define H3_SPI_CTRL_GO     (1u << 0)
+#define H3_SPI_CTRL_RXNEG  (1u << 1)
+#define H3_SPI_CTRL_TXNEG  (1u << 2)
+#define H3_SPI_CTRL_LSBF   (1u << 3)
+#define H3_SPI_CTRL_IE     (1u << 4)
+#define H3_SPI_CTRL_ASS    (1u << 5)
+
+/* ============================================================================
+ * GPIO register layout (our custom WB GPIO)
+ * Base + 0x00: DATA_OUT
+ * Base + 0x04: DATA_IN
+ * Base + 0x08: DIR
+ * Base + 0x0C: PULLUP
+ * ============================================================================
+ */
+typedef struct {
+    volatile uint32_t DATA_OUT;  // 0x00
+    volatile uint32_t DATA_IN;   // 0x04
+    volatile uint32_t DIR;       // 0x08
+    volatile uint32_t PULLUP;    // 0x0C
+} h3_gpio_t;
+
+#define H3_GPIO   ((h3_gpio_t *)H3_GPIO_BASE)
+
+/* ============================================================================
+ * JTAG UART register layout
+ * Base + 0x00: DATA
+ * Base + 0x04: CTRL
+ * CTRL: upper 16 bits = RX count, lower 16 bits = TX space
+ * ============================================================================
+ */
+typedef struct {
+    volatile uint32_t DATA;      // 0x00
+    volatile uint32_t CTRL;      // 0x04
+} h3_jtag_uart_t;
+
+#define H3_JU    ((h3_jtag_uart_t *)H3_JTAG_UART_BASE)
+
+/* ============================================================================
+ * HAL types & error codes
+ * ============================================================================
+ */
+typedef enum {
+    H3_CONSOLE_UART = 0,
+    H3_CONSOLE_JTAG = 1
+} h3_console_t;
+
+typedef enum {
+    H3_OK            = 0,
+    H3_ERR_I2C_NACK  = -1,
+    H3_ERR_I2C_RANGE = -2,
+    H3_ERR_SPI       = -3
+} h3_status_t;
+
+/* ============================================================================
+ * HAL API
+ * ============================================================================
+ */
+
+/* UART0 */
+void        h3_uart_init(uint32_t sys_clk_hz, uint32_t baud);
+void        h3_uart_putc(char c);
+char        h3_uart_getc_blocking(void);
+int         h3_uart_getc_nonblock(char *out);
+void        h3_uart_puts(const char *s);
+void        h3_uart_put_hex8(uint8_t v);
+void        h3_uart_put_hex32(uint32_t v);
+
+/* JTAG UART */
+int         h3_ju_tx_space(void);
+int         h3_ju_rx_count(void);
+void        h3_ju_putc(char c);
+int         h3_ju_getc_nonblock(char *out);
+char        h3_ju_getc_blocking(void);
+void        h3_ju_puts(const char *s);
+
+/* Combined console */
+void        h3_console_select(h3_console_t which);
+h3_console_t h3_console_get(void);
+void        h3_con_putc(char c);
+char        h3_con_getc_blocking(void);
+int         h3_con_getc_nonblock(char *out);
+void        h3_con_puts(const char *s);
+
+/* I2C */
+h3_status_t h3_i2c_init(uint32_t sys_clk_hz, uint32_t bus_khz);
+h3_status_t h3_i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t data);
+h3_status_t h3_i2c_read_byte(uint8_t addr7, uint8_t reg, uint8_t *data_out);
+
+/* SPI */
+void        h3_spi_init(uint32_t sys_clk_hz, uint32_t clk_div);
+uint8_t     h3_spi_transfer(uint8_t data);
+
+/* GPIO */
+void        h3_gpio_set_dir(uint32_t mask, uint32_t value);
+void        h3_gpio_write(uint32_t mask, uint32_t value);
+uint32_t    h3_gpio_read(void);
+
+/* Utility */
+void        h3_delay_cycles(volatile uint32_t cycles);
+
+#endif /* H3_SOC_H */
+
+================================================================================
+STEP 2 — HAL IMPLEMENTATION: h3_soc.c
+================================================================================
+
+Implements all declared functions. This is the single low-level place where
+you touch registers.
+
+----- FILE: ~/hazard3_fw/app/h3_soc.c -----------------------------------------
+
+#include "h3_soc.h"
+
+/* ============================================================================
+ * UART0
+ * ============================================================================
+ */
+
+void h3_uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+
+    /* Enable DLAB to write DLL/DLM */
+    H3_UART0->LCR = H3_UART_LCR_DLAB;
+    H3_UART0->RBR_THR_DLL = (divisor & 0xFFu);           /* DLL */
+    H3_UART0->IER_DLM      = ((divisor >> 8) & 0xFFu);   /* DLM */
+
+    /* 8N1, DLAB=0 */
+    H3_UART0->LCR = 0x03u;
+
+    /* Enable FIFO, clear RX/TX */
+    H3_UART0->IIR_FCR = 0x07u;
+
+    /* Modem Control: OUT2 set (often enables interrupts), but we don't use IRQ yet */
+    H3_UART0->MCR = 0x08u;
+}
+
+void h3_uart_putc(char c)
+{
+    while (!(H3_UART0->LSR & H3_UART_LSR_THRE)) { }
+    H3_UART0->RBR_THR_DLL = (uint8_t)c;
+}
+
+char h3_uart_getc_blocking(void)
+{
+    while (!(H3_UART0->LSR & H3_UART_LSR_DR)) { }
+    return (char)(H3_UART0->RBR_THR_DLL & 0xFFu);
+}
+
+int h3_uart_getc_nonblock(char *out)
+{
+    if (H3_UART0->LSR & H3_UART_LSR_DR) {
+        *out = (char)(H3_UART0->RBR_THR_DLL & 0xFFu);
+        return 1;
+    }
+    return 0;
+}
+
+void h3_uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') h3_uart_putc('\r');
+        h3_uart_putc(*s++);
+    }
+}
+
+void h3_uart_put_hex8(uint8_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    h3_uart_putc(hex[(v >> 4) & 0xF]);
+    h3_uart_putc(hex[v & 0xF]);
+}
+
+void h3_uart_put_hex32(uint32_t v)
+{
+    for (int i = 7; i >= 0; i--) {
+        h3_uart_putc("0123456789ABCDEF"[(v >> (4 * i)) & 0xF]);
+    }
+}
+
+/* ============================================================================
+ * JTAG UART
+ * ============================================================================
+ */
+
+int h3_ju_tx_space(void)
+{
+    uint32_t ctrl = H3_JU->CTRL;
+    return (int)(ctrl & 0xFFFFu);
+}
+
+int h3_ju_rx_count(void)
+{
+    uint32_t ctrl = H3_JU->CTRL;
+    return (int)(ctrl >> 16);
+}
+
+void h3_ju_putc(char c)
+{
+    while (h3_ju_tx_space() == 0) { }
+    H3_JU->DATA = (uint32_t)(uint8_t)c;
+}
+
+int h3_ju_getc_nonblock(char *out)
+{
+    if (h3_ju_rx_count() > 0) {
+        uint32_t v = H3_JU->DATA;
+        *out = (char)(v & 0xFFu);
+        return 1;
+    }
+    return 0;
+}
+
+char h3_ju_getc_blocking(void)
+{
+    char c;
+    while (!h3_ju_getc_nonblock(&c)) { }
+    return c;
+}
+
+void h3_ju_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') h3_ju_putc('\r');
+        h3_ju_putc(*s++);
+    }
+}
+
+/* ============================================================================
+ * Combined console
+ * ============================================================================
+ */
+
+static h3_console_t g_console = H3_CONSOLE_UART;
+
+void h3_console_select(h3_console_t which)
+{
+    g_console = which;
+}
+
+h3_console_t h3_console_get(void)
+{
+    return g_console;
+}
+
+void h3_con_putc(char c)
+{
+    if (g_console == H3_CONSOLE_UART) {
+        h3_uart_putc(c);
+    } else {
+        h3_ju_putc(c);
+    }
+}
+
+char h3_con_getc_blocking(void)
+{
+    if (g_console == H3_CONSOLE_UART) {
+        return h3_uart_getc_blocking();
+    } else {
+        return h3_ju_getc_blocking();
+    }
+}
+
+int h3_con_getc_nonblock(char *out)
+{
+    if (g_console == H3_CONSOLE_UART) {
+        return h3_uart_getc_nonblock(out);
+    } else {
+        return h3_ju_getc_nonblock(out);
+    }
+}
+
+void h3_con_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') h3_con_putc('\r');
+        h3_con_putc(*s++);
+    }
+}
+
+/* ============================================================================
+ * I2C
+ * ============================================================================
+ */
+
+h3_status_t h3_i2c_init(uint32_t sys_clk_hz, uint32_t bus_khz)
+{
+    uint32_t freq = bus_khz * 1000u;
+    if (freq == 0u) return H3_ERR_I2C_RANGE;
+
+    uint32_t presc = (sys_clk_hz / (5u * freq)) - 1u;
+    H3_I2C0->PRER_LO = (presc & 0xFFu);
+    H3_I2C0->PRER_HI = ((presc >> 8) & 0xFFu);
+    H3_I2C0->CTR     = H3_I2C_CTR_EN;
+
+    return H3_OK;
+}
+
+static h3_status_t h3_i2c_wait_tip_clear(void)
+{
+    while (H3_I2C0->CR_SR & H3_I2C_SR_TIP) { }
+    return H3_OK;
+}
+
+h3_status_t h3_i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t data)
+{
+    /* Address (write) */
+    H3_I2C0->TXR_RXR = (uint32_t)((addr7 << 1) | 0u);
+    H3_I2C0->CR_SR   = H3_I2C_CR_STA | H3_I2C_CR_WR;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    /* Register index */
+    H3_I2C0->TXR_RXR = reg;
+    H3_I2C0->CR_SR   = H3_I2C_CR_WR;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    /* Data + STOP */
+    H3_I2C0->TXR_RXR = data;
+    H3_I2C0->CR_SR   = H3_I2C_CR_WR | H3_I2C_CR_STO;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    return H3_OK;
+}
+
+h3_status_t h3_i2c_read_byte(uint8_t addr7, uint8_t reg, uint8_t *data_out)
+{
+    if (!data_out) return H3_ERR_I2C_RANGE;
+
+    /* Address (write) */
+    H3_I2C0->TXR_RXR = (uint32_t)((addr7 << 1) | 0u);
+    H3_I2C0->CR_SR   = H3_I2C_CR_STA | H3_I2C_CR_WR;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    /* Register index */
+    H3_I2C0->TXR_RXR = reg;
+    H3_I2C0->CR_SR   = H3_I2C_CR_WR;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    /* Repeated START + address (read) */
+    H3_I2C0->TXR_RXR = (uint32_t)((addr7 << 1) | 1u);
+    H3_I2C0->CR_SR   = H3_I2C_CR_STA | H3_I2C_CR_WR;
+    h3_i2c_wait_tip_clear();
+    if (H3_I2C0->CR_SR & H3_I2C_SR_RXACK) return H3_ERR_I2C_NACK;
+
+    /* Read data with NACK + STOP */
+    H3_I2C0->CR_SR = H3_I2C_CR_RD | H3_I2C_CR_ACK | H3_I2C_CR_STO;
+    h3_i2c_wait_tip_clear();
+
+    *data_out = (uint8_t)(H3_I2C0->TXR_RXR & 0xFFu);
+    return H3_OK;
+}
+
+/* ============================================================================
+ * SPI
+ * ============================================================================
+ */
+
+void h3_spi_init(uint32_t sys_clk_hz, uint32_t clk_div)
+{
+    (void)sys_clk_hz; /* Not strictly needed if clk_div is given directly. */
+
+    H3_SPI0->DIVIDER = clk_div;
+
+    uint32_t ctrl = 0;
+    ctrl |= H3_SPI_CTRL_ASS;  /* auto slave select */
+    /* Mode 0: CPOL=0, CPHA=0, so RXNEG=0, TXNEG=0 by default */
+    H3_SPI0->CTRL = ctrl;
+
+    /* Select SS0 (bit0) */
+    H3_SPI0->SS = 1u;
+}
+
+uint8_t h3_spi_transfer(uint8_t data)
+{
+    H3_SPI0->RXTX = data;
+    H3_SPI0->CTRL = H3_SPI0->CTRL | H3_SPI_CTRL_GO;
+
+    while (H3_SPI0->CTRL & H3_SPI_CTRL_GO) { }
+
+    return (uint8_t)(H3_SPI0->RXTX & 0xFFu);
+}
+
+/* ============================================================================
+ * GPIO
+ * ============================================================================
+ */
+
+void h3_gpio_set_dir(uint32_t mask, uint32_t value)
+{
+    uint32_t d = H3_GPIO->DIR;
+    d &= ~mask;
+    d |= (value & mask);
+    H3_GPIO->DIR = d;
+}
+
+void h3_gpio_write(uint32_t mask, uint32_t value)
+{
+    uint32_t d = H3_GPIO->DATA_OUT;
+    d &= ~mask;
+    d |= (value & mask);
+    H3_GPIO->DATA_OUT = d;
+}
+
+uint32_t h3_gpio_read(void)
+{
+    return H3_GPIO->DATA_IN;
+}
+
+/* ============================================================================
+ * Utility
+ * ============================================================================
+ */
+
+void h3_delay_cycles(volatile uint32_t cycles)
+{
+    while (cycles--) {
+        __asm__ volatile("nop");
+    }
+}
+
+================================================================================
+STEP 3 — HOW THIS CONNECTS TO THE BOOTLOADER & PHASE 1K
+================================================================================
+
+At this point:
+
+- Bootloader (Phase 1I) is in ROM @ 0x2000_0000, written separately.
+- HAL (Phase 1J) is just a library for SDRAM-resident firmware.
+- Next (Phase 1K), you will:
+  - Create an SDRAM firmware project using `h3_soc.h` / `h3_soc.c`.
+  - Link it to run at 0x80000000.
+  - Use the H3BT protocol via bootloader to load that firmware and run it.
+
+You do NOT need to touch Quartus RTL for Phase 1J.
+Just compile the HAL into your future application ELF.
+
+================================================================================
+STEP 4 — QUICK MENTAL TEST OF THE HAL
+================================================================================
+
+Once you have a `main.c` (Phase 1K), you’ll be able to do things like:
+
+- `h3_uart_init(50000000u, 115200u);`
+- `h3_uart_puts("Hello from SDRAM firmware\n");`
+- `h3_i2c_init(50000000u, 100u);`
+- `h3_i2c_write_byte(0x68, 0x00, 0x55);`
+- `h3_spi_init(50000000u, 4u);`
+- `h3_spi_transfer(0x9Fu);`
+- `h3_gpio_set_dir(1u << 18, 1u << 18);`
+- `h3_gpio_write(1u << 18, 1u << 18);`
+
+All without touching any raw addresses in the application.
+
+================================================================================
+WHAT PHASE 1J GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A clean, reusable HAL that abstracts:
+  - UART0
+  - JTAG-UART
+  - I2C0
+  - SPI0
+  - GPIO
+- A consistent memory map and register model for all future firmware.
+- A sharp separation of responsibilities:
+  - ROM bootloader (Phase 1I) → H3BT + SDRAM load.
+  - HAL (Phase 1J) → peripheral access.
+  - SDRAM firmware (Phase 1K) → your actual applications.
+
+########END PHASE 1J ########
 
 
 
