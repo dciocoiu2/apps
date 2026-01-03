@@ -1,1667 +1,199 @@
 ============================================================
-PHASE 1 — LINUX VM + QUARTUS LITE + RISC‑V TOOLCHAIN SETUP
+PHASE 1 — FRESH START: TOOLCHAIN, REPO, AND ARDUINO-HEADER FOCUS
 ============================================================
 
-----------------------------------------
-1. Install VirtualBox on Windows
-----------------------------------------
-Download: https://www.virtualbox.org/wiki/Downloads
-Install “Windows hosts” package with defaults.
+Goal:
+- Start from zero with a clean, reproducible environment.
+- Lock in: DE10-Lite (MAX 10 10M50DAF484C7G) + Arduino headers as the *primary* SoC I/O interface.
+- Install and verify:
+  - Linux environment (VM or bare metal)
+  - Quartus Lite for MAX 10
+  - RISC-V GCC toolchain
+  - Git + basic directory structure for the SoC project
+- Make an explicit design rule: **all user-facing digital I/O uses the DE10-Lite Arduino headers**, not random GPIO pins or on-board LEDs/switches.
 
-----------------------------------------
-2. Download Ubuntu 22.04.5 LTS ISO
-----------------------------------------
-Download: https://ubuntu.com/download/desktop
-File: ubuntu-22.04.5-desktop-amd64.iso
+Reference:
+- DE10-Lite has a MAX 10 10M50 and dedicated Arduino-compatible headers for GPIO/ADC[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://faculty-web.msoe.edu/johnsontimoj/Common/FILES/de10-lite.pdf?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1&citationId=2 "MSOE Faculty Web").
+- We will treat those Arduino headers as the “MCU pinout” for the SoC.
 
-----------------------------------------
-3. Create VM in VirtualBox
-----------------------------------------
-Name: Ubuntu-Quartus
-Type: Linux
-Version: Ubuntu (64-bit)
-Memory: 8192 MB (or 4096 MB minimum)
-CPUs: 2+
-Disk: 80 GB VDI, dynamically allocated
-Attach ISO: Settings → Storage → Empty → Choose ISO
+------------------------------------------------------------
+0. High-level design constraints (locked in now)
+------------------------------------------------------------
 
-----------------------------------------
-4. Install Ubuntu
-----------------------------------------
-Boot VM → Install Ubuntu
-Normal installation
-Install third-party software
-Erase disk (virtual disk only)
-Create user:
-  Name: quartususer
-  Username: quartususer
-  Password: your choice
-Finish installation → Reboot
+These are invariants for ALL later phases:
 
-----------------------------------------
-5. Install VirtualBox Guest Additions
-----------------------------------------
-Inside Ubuntu:
-sudo apt update
-sudo apt install -y build-essential dkms linux-headers-$(uname -r)
-VirtualBox menu → Devices → Insert Guest Additions CD
-If not auto-run:
-cd /media/$USER/VBox_GAs_*/
-sudo ./VBoxLinuxAdditions.run
-sudo reboot
+- Board:
+  - Terasic DE10-Lite with MAX 10 10M50DAF484C7G.
 
-----------------------------------------
-6. Install Quartus Prime Lite (Linux)
-----------------------------------------
-Download from Intel:
-https://www.intel.com/content/www/us/en/software-kit/795330/intel-quartus-prime-lite-edition-design-software-version.html
-Download Linux installer:
-QuartusLiteSetup-XX.Xstd.X.X-linux.run
+- Configuration model:
+  - FPGA is configured **only into SRAM** via `.sof` over JTAG.
+  - We do **not** program on-board configuration flash.
+  - On power-cycle, the SoC disappears; we re-load the bitstream when needed.
 
-Make executable:
-cd ~/Downloads
-chmod +x QuartusLiteSetup-*-linux.run
+- SoC I/O model:
+  - All user-facing digital I/O (GPIO, SPI, I2C, UART, PWM, external interrupts) are mapped to the **Arduino-style headers** on the DE10-Lite[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://faculty-web.msoe.edu/johnsontimoj/Common/FILES/de10-lite.pdf?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "MSOE Faculty Web").
+  - On-board LEDs, switches, keys may be exposed as *extras*, but the canonical/user pinout is Arduino headers.
 
-Run installer:
-./QuartusLiteSetup-*-linux.run
-Install Quartus Prime Lite + MAX 10 device support.
+- Philosophy:
+  - Open-source IP only (Hazard3, OpenCores, or small custom RTL).
+  - Industrial-capable: IRQ, DMA, advanced PWM/GPIO/I2C/SPI features, but always auditable and deterministic.
+  - Arduino-like firmware UX via a C HAL.
 
-----------------------------------------
-7. Install Quartus dependencies
-----------------------------------------
-sudo apt update
-sudo apt install -y \
-  build-essential \
-  libx11-6 libxext6 libxft2 libxrender1 libxtst6 \
-  libgtk2.0-0 libncurses5 libtinfo5 libxau6 libxdmcp6 \
-  git curl wget unzip python3 python3-pip
+These constraints will drive Phase 2 (memory + pin map), Phase 3 (SoC fabric), and especially Phase 8 (pin assignment to Arduino headers).
 
-----------------------------------------
-8. Add Quartus to PATH
-----------------------------------------
-echo 'export PATH="$HOME/intelFPGA_lite/22.1std/quartus/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+------------------------------------------------------------
+1. Base OS environment
+------------------------------------------------------------
 
-----------------------------------------
-9. Install RISC‑V GCC Toolchain (RV32IM)
-----------------------------------------
-cd ~
-git clone https://github.com/riscv-collab/riscv-gnu-toolchain.git
-cd riscv-gnu-toolchain
-sudo apt install -y gawk bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev
-./configure --prefix=$HOME/riscv --with-arch=rv32im --with-abi=ilp32 --disable-linux
-make newlib -j$(nproc)
+Use a modern Linux environment (VM or bare metal). For example:
 
-Add to PATH:
-echo 'export PATH="$HOME/riscv/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+- Ubuntu 22.04 LTS (recommended)
+- At least:
+  - 4 GB RAM (8 GB+ nicer)
+  - 30+ GB disk
 
-Verify:
-riscv32-unknown-elf-gcc -v
+Ensure the following packages are installed:
 
-----------------------------------------
-10. Install Python UART uploader dependencies
-----------------------------------------
-pip3 install pyserial
+- Build essentials:
+  - sudo apt update
+  - sudo apt install -y build-essential git cmake python3 python3-pip
+
+- Utilities:
+  - sudo apt install -y curl unzip hexdump
+
+------------------------------------------------------------
+2. Quartus Lite for MAX 10 (DE10-Lite)
+------------------------------------------------------------
+
+1) Download Quartus Prime Lite Edition that supports MAX 10 devices.
+   - Install Quartus Lite + MAX 10 device support following Intel’s installer.
+
+2) After installation, ensure `quartus_sh` is in PATH, e.g.:
+
+   - echo 'export PATH="/opt/intelFPGA_lite/23.1/quartus/bin:$PATH"' >> ~/.bashrc
+   - source ~/.bashrc
+
+3) Verify:
+
+   - quartus_sh --version
+
+4) Install USB-Blaster udev rules (if needed):
+
+   - Create `/etc/udev/rules.d/51-usbblaster.rules` with Intel’s recommended rules.
+   - Reload udev and replug the DE10-Lite.
+
+5) Plug in DE10-Lite, run:
+
+   - jtagconfig
+
+   You should see the MAX 10 device detected.
+
+------------------------------------------------------------
+3. RISC-V toolchain (RV32IM bare-metal)
+------------------------------------------------------------
+
+We’ll use a standard GCC-based RISC-V bare-metal toolchain:
+
+1) Install prebuilt toolchain (if available for your distro), or build from source. For example:
+
+   - sudo apt install -y gcc-riscv64-unknown-elf
+
+   If your distro uses a different triplet, adapt accordingly.
+
+2) Verify:
+
+   - riscv64-unknown-elf-gcc --version
+
+3) For this project we’ll target RV32IM / ilp32. We’ll use flags like:
+
+   - -march=rv32im -mabi=ilp32
+
+We’ll standardize on the prefix:
+
+- RISCV_PREFIX = riscv64-unknown-elf
+
+but we’ll compile 32-bit code with `-march`/`-mabi`.
+
+------------------------------------------------------------
+4. Project root and repository layout
+------------------------------------------------------------
+
+Create a root directory for the entire SoC project:
+
+- mkdir -p ~/h3_quad_de10lite
+- cd ~/h3_quad_de10lite
+- git init
+
+We’ll use this top-level layout:
+
+~/h3_quad_de10lite/
+  soc/
+    rtl/            # Verilog RTL for SoC + IP integration
+    quartus/        # Quartus project tcl, qsf, sdc
+    sw/
+      boot_rom/     # Bootloader (UART-based, Instr SRAM loader)
+      arduino_api/  # Arduino-like HAL library
+      apps/         # User firmware examples (Phase 7+)
+    docs/
+      pinmap/       # Pin mapping docs, including Arduino headers on DE10-Lite
+      memmap/       # Memory and register maps
+      build/        # Build + usage documentation
+
+Initialize basic directories:
+
+- mkdir -p soc/rtl soc/quartus soc/sw/boot_rom soc/sw/arduino_api soc/sw/apps docs/pinmap docs/memmap docs/build
+
+Add a minimal README capturing the key constraints:
+
+File: ~/h3_quad_de10lite/README.md
+
+- echo 'H3 Quad-Core SoC on DE10-Lite (Arduino Headers as Primary I/O)' > README.md
+- echo '' >> README.md
+- echo '- Board: DE10-Lite (MAX 10 10M50DAF484C7G)' >> README.md
+- echo '- FPGA config: SRAM-only (.sof via JTAG), no flash' >> README.md
+- echo '- CPU: Quad-core Hazard3 RV32IM' >> README.md
+- echo '- Buses: AHB backbone, APB + Wishbone peripherals' >> README.md
+- echo '- Peripherals: UART16550, SPI, I2C, GPIO, PWM, DMA, IRQ ctrl (OpenCores/custom)' >> README.md
+- echo '- All user I/O via DE10-Lite Arduino headers' >> README.md
+
+Commit:
+
+- git add .
+- git commit -m "Phase 1: initial repo layout and toolchain assumptions"
+
+------------------------------------------------------------
+5. Arduino headers on DE10-Lite (design rule)
+------------------------------------------------------------
+
+DE10-Lite provides a set of Arduino headers for GPIO/ADC interfacing[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://faculty-web.msoe.edu/johnsontimoj/Common/FILES/de10-lite.pdf?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1&citationId=2 "MSOE Faculty Web"). We will:
+
+- Treat Arduino header pins as the canonical “MCU pins” of our SoC.
+- Map:
+  - GPIO, PWM outputs, SPI, I2C, UART pins to specific Arduino I/O pins.
+- Document this thoroughly in:
+  - docs/pinmap/arduino_de10lite_pinout.md
+
+For now, just create the file and a placeholder heading; detailed mapping will be done in Phase 2/Phase 8 when we pin down exact FPGA pins:
+
+- touch docs/pinmap/arduino_de10lite_pinout.md
+- echo '# DE10-Lite Arduino Header Pin Mapping for H3 SoC' > docs/pinmap/arduino_de10lite_pinout.md
+
+(We will fill this with a complete mapping once the SoC’s signal set is fully defined.)
+
+------------------------------------------------------------
+6. Sanity checks
+------------------------------------------------------------
+
+At the end of Phase 1, verify:
+
+- `quartus_sh --version` works.
+- `jtagconfig` detects the MAX 10 on DE10-Lite.
+- `riscv64-unknown-elf-gcc --version` works.
+- The directory structure under `~/h3_quad_de10lite/` matches what we defined.
+- README.md exists and reflects:
+  - SRAM-only configuration rule.
+  - Arduino headers as primary I/O.
 
 ============================================================
 END OF PHASE 1
-============================================================
-============================================================
-PHASE 2 — PROJECT LAYOUT, HAZARD3 CLONE, MEMORY MAP, ADDRESS MAP
-============================================================
-
-Goal of this phase:
-- Create a clean directory structure for the whole SoC.
-- Clone Hazard3.
-- Define memory map (Boot ROM, Instruction SRAM, Data SRAM).
-- Define peripheral address map.
-- Fix all paths that later phases will rely on.
-
-All paths assume:
-- Base directory:  $HOME/h3_quad_de10lite
-- Hazard3 repo:    $HOME/h3_quad_de10lite/Hazard3
-- SoC project:     $HOME/h3_quad_de10lite/soc
-
-----------------------------------------
-1. Create base project directory
-----------------------------------------
-cd ~
-mkdir -p h3_quad_de10lite
-cd h3_quad_de10lite
-
-----------------------------------------
-2. Clone Hazard3
-----------------------------------------
-cd ~/h3_quad_de10lite
-git clone https://github.com/Wren6991/Hazard3.git
-
-----------------------------------------
-3. Create SoC project structure
-----------------------------------------
-cd ~/h3_quad_de10lite
-mkdir -p soc/rtl
-mkdir -p soc/sw/boot_rom
-mkdir -p soc/sw/bootloader
-mkdir -p soc/sw/app
-mkdir -p soc/sw/arduino_api
-mkdir -p soc/quartus
-mkdir -p soc/scripts
-
-Final tree (conceptual):
-~/h3_quad_de10lite
-  ├─ Hazard3/              (upstream core + docs)
-  └─ soc/
-     ├─ rtl/               (all custom RTL: top, interconnect, peripherals, memories)
-     ├─ sw/
-     │  ├─ boot_rom/       (reset stub, minimal init, jumps into bootloader region)
-     │  ├─ bootloader/     (UART loader that fills instruction SRAM)
-     │  ├─ app/            (user firmware main, built against Arduino-like API)
-     │  └─ arduino_api/    (pinMode, digitalWrite, Serial, SPI, I2C, PWM wrappers)
-     ├─ quartus/           (Quartus project, .qpf/.qsf, constraint files)
-     └─ scripts/           (helper scripts, UART uploader)
-
-----------------------------------------
-4. Memory map (R3, Harvard)
-----------------------------------------
-
-We define:
-
-- Boot ROM:          16 KB at 0x0000_0000
-- Instruction SRAM:  64 KB at 0x0001_0000
-- Data SRAM:         64 KB at 0x1000_0000
-- APB peripherals:   0x4000_0000 and above
-
-These align with R3 (Harvard) and keep things simple.
-
-Detail:
-
-Boot ROM:
-  Base:   0x0000_0000
-  Size:   16 KB (0x0000_4000)
-  Use:    Very small ROM that initializes cores, sets up stack, jumps to bootloader
-          (which is also in ROM or in instruction SRAM preload area depending on design).
-
-Instruction SRAM:
-  Base:   0x0001_0000
-  Size:   64 KB (0x0001_0000–0x0001_FFFF)
-  Use:    Firmware text (code) loaded over UART by bootloader.
-          All cores fetch instructions from here.
-
-Data SRAM:
-  Base:   0x1000_0000
-  Size:   64 KB (0x1000_0000–0x1000_FFFF)
-  Use:    .data, .bss, heap, stack for all cores.
-
-----------------------------------------
-5. Peripheral address map (APB)
-----------------------------------------
-
-APB base: 0x4000_0000
-
-We carve simple 4 KB windows per peripheral:
-
-UART:
-  Base:   0x4000_0000
-  Size:   4 KB (0x4000_0000–0x4000_0FFF)
-
-GPIO:
-  Base:   0x4000_1000
-  Size:   4 KB (0x4000_1000–0x4000_1FFF)
-
-SPI:
-  Base:   0x4000_2000
-  Size:   4 KB (0x4000_2000–0x4000_2FFF)
-
-I2C:
-  Base:   0x4000_3000
-  Size:   4 KB (0x4000_3000–0x4000_3FFF)
-
-PWM:
-  Base:   0x4000_4000
-  Size:   4 KB (0x4000_4000–0x4000_4FFF)
-
-This will be enforced by the APB address decoder in the SoC RTL.
-
-----------------------------------------
-6. Core architecture decisions (fixed)
-----------------------------------------
-
-Cores:
-- 4× Hazard3 cores, RV32IM, no caches.
-
-Boot:
-- Reset vector at 0x0000_0000 (Boot ROM).
-- Boot ROM sets up minimal environment, then enters the UART bootloader logic.
-- Bootloader receives firmware over UART and writes it into Instruction SRAM starting at 0x0001_0000.
-- After upload, bootloader jumps to 0x0001_0000.
-
-Heap/stack:
-- Data, BSS, stack, and heap are all in Data SRAM region 0x1000_0000–0x1000_FFFF.
-
-Instruction-side vs data-side:
-- All cores share the same instruction SRAM and data SRAM.
-- Cores use `mhartid` to customize behavior.
-
-----------------------------------------
-7. File naming conventions for later phases
-----------------------------------------
-
-In soc/rtl/:
-
-- h3_config_quad.vh        Hazard3 configuration header
-- h3_ahb_arbiter.v         AHB-Lite round-robin arbiter (4 masters)
-- h3_ahb_instr_sram.v      Instruction SRAM AHB slave (64 KB)
-- h3_ahb_data_sram.v       Data SRAM AHB slave (64 KB)
-- h3_ahb_boot_rom.v        Boot ROM AHB slave (16 KB, uses boot_rom.hex)
-- h3_ahb_to_apb.v          AHB-to-APB bridge
-- apb_uart.v               Simple UART (TX+RX)
-- apb_gpio.v               32-bit GPIO
-- apb_spi.v                SPI master
-- apb_i2c.v                I2C bit-bang master
-- apb_pwm.v                4-channel PWM
-- h3_quad_soc.v            SoC-level integration (cores + bus + memories + peripherals)
-- de10lite_quadcore_top.v  Board-level top for DE10-Lite (clock, reset, pins)
-
-In soc/sw/boot_rom/:
-- boot_rom.c               Minimal reset stub
-- linker.ld                ROM linker script
-- Makefile                 Build to boot_rom.hex
-
-In soc/sw/bootloader/:
-- bootloader.c             UART-based firmware loader
-- linker.ld                Bootloader linker script (if separate)
-- Makefile                 Build bootloader binary (may be merged with boot_rom)
-
-In soc/sw/arduino_api/:
-- arduino_hal.h            Basic definitions
-- gpio_api.c               pinMode, digitalWrite, digitalRead
-- uart_api.c               Serial.begin, Serial.print
-- pwm_api.c                analogWrite
-- spi_api.c                SPI functions
-- i2c_api.c                Wire functions
-- Makefile                 Build as a static library (libarduino_api.a)
-
-In soc/sw/app/:
-- main.c                   Example Arduino-like application
-- linker.ld                App linker script (Instruction SRAM + Data SRAM)
-- Makefile                 Build app.elf and app.bin
-
-In soc/scripts/:
-- uart_upload.py           Python script to upload app.bin over UART
-- quartus_setup.tcl        Script to create and configure Quartus project
-
-In soc/quartus/:
-- de10lite_quadcore.qpf    Quartus project file
-- de10lite_quadcore.qsf    Settings + pin assignment file(s)
-- (auto-generated output files, db/, etc.)
-
-----------------------------------------
-8. Clone Hazard3 and note core RTL path
-----------------------------------------
-
-cd ~/h3_quad_de10lite/Hazard3
-ls
-
-Key directories:
-- hdl/                     Hazard3 core and support RTL
-- doc/                     Docs
-
-Later, you will add to Quartus project:
-- hazard3_core.v
-- any required support files (e.g., multiply/div, CSR, etc.)
-
-We keep Hazard3 unmodified and configure it with our own config header.
-
-----------------------------------------
-9. Confirm toolchain + repo layout
-----------------------------------------
-
-Check:
-- RISC-V GCC:
-  which riscv32-unknown-elf-gcc
-
-- Hazard3:
-  ls ~/h3_quad_de10lite/Hazard3
-
-- SoC tree:
-  ls ~/h3_quad_de10lite/soc
-  ls ~/h3_quad_de10lite/soc/rtl
-  ls ~/h3_quad_de10lite/soc/sw
-  ls ~/h3_quad_de10lite/soc/quartus
-  ls ~/h3_quad_de10lite/soc/scripts
-
-If everything matches, you are ready for RTL integration.
-
-============================================================
-END OF PHASE 2
-============================================================
-============================================================
-PHASE 3 — HAZARD3 QUAD-CORE + AHB + MEMORIES (NO BOARD PINS)
-============================================================
-
-All files in this phase live under:
-  ~/h3_quad_de10lite/soc/rtl
-
-Assumptions from earlier phases:
-- Boot ROM:         0x0000_0000, 16 KB
-- Instruction SRAM: 0x0001_0000, 64 KB
-- Data SRAM:        0x1000_0000, 64 KB
-- APB window:       0x4000_0000+
-
-You must adapt Hazard3 core port names if they differ in the actual repo.
-The structure (signals, directions, widths) is what matters.
-
-----------------------------------------
-1. Hazard3 configuration header
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_config_quad.vh
-
-----------------------------------------
-h3_config_quad.vh
-----------------------------------------
-`ifndef H3_CONFIG_QUAD_VH
-`define H3_CONFIG_QUAD_VH
-
-`define H3_HAVE_M_EXTENSION          1
-`define H3_HAVE_A_EXTENSION          0
-`define H3_HAVE_C_EXTENSION          0
-`define H3_HAVE_ZICSR                1
-`define H3_HAVE_ZIFENCEI             0
-`define H3_HAVE_ZICNTR               1
-`define H3_HAVE_DEBUG                0
-
-`define H3_NUM_IRQS                  16
-
-`define H3_ICACHE_SIZE_WORDS         0
-`define H3_DCACHE_SIZE_WORDS         0
-
-`endif
-----------------------------------------
-
-----------------------------------------
-2. AHB-Lite arbiter (4 masters → 1 slave)
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_arbiter.v
-
-----------------------------------------
-h3_ahb_arbiter.v
-----------------------------------------
-module h3_ahb_arbiter #(
-    parameter NUM_MASTERS = 4
-) (
-    input  wire                        clk,
-    input  wire                        rst_n,
-
-    input  wire [NUM_MASTERS-1:0]      m_hsel,
-    input  wire [NUM_MASTERS-1:0]      m_hwrite,
-    input  wire [NUM_MASTERS*2-1:0]    m_htrans,
-    input  wire [NUM_MASTERS*3-1:0]    m_hsize,
-    input  wire [NUM_MASTERS*32-1:0]   m_haddr,
-    input  wire [NUM_MASTERS*32-1:0]   m_hwdata,
-    output reg  [NUM_MASTERS-1:0]      m_hready,
-    output reg  [NUM_MASTERS*32-1:0]   m_hrdata,
-    output reg  [NUM_MASTERS-1:0]      m_hresp,
-
-    output reg                         s_hsel,
-    output reg  [31:0]                 s_haddr,
-    output reg  [1:0]                  s_htrans,
-    output reg                         s_hwrite,
-    output reg  [2:0]                  s_hsize,
-    output reg  [31:0]                 s_hwdata,
-    input  wire                        s_hready,
-    input  wire [31:0]                 s_hrdata,
-    input  wire                        s_hresp
-);
-
-    reg [1:0] current;
-    integer i;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            current <= 2'd0;
-        else if (s_hready)
-            current <= current + 2'd1;
-    end
-
-    always @(*) begin
-        s_hsel   = 1'b0;
-        s_haddr  = 32'h0;
-        s_htrans = 2'b00;
-        s_hwrite = 1'b0;
-        s_hsize  = 3'b010;
-        s_hwdata = 32'h0;
-
-        for (i = 0; i < NUM_MASTERS; i = i + 1) begin
-            m_hready[i] = 1'b0;
-            m_hresp[i]  = 1'b0;
-        end
-        m_hrdata = {NUM_MASTERS{32'h0}};
-
-        s_hsel   = m_hsel[current];
-        s_hwrite = m_hwrite[current];
-        s_htrans = m_htrans[current*2 +: 2];
-        s_hsize  = m_hsize[current*3 +: 3];
-        s_haddr  = m_haddr[current*32 +: 32];
-        s_hwdata = m_hwdata[current*32 +: 32];
-
-        m_hready[current]         = s_hready;
-        m_hresp[current]          = s_hresp;
-        m_hrdata[current*32 +:32] = s_hrdata;
-    end
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-3. AHB-Lite Boot ROM (16 KB at 0x0000_0000)
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_boot_rom.v
-
-This expects a Verilog hex file named boot_rom.hex in the same directory.
-
-----------------------------------------
-h3_ahb_boot_rom.v
-----------------------------------------
-module h3_ahb_boot_rom #(
-    parameter ADDR_BASE = 32'h0000_0000,
-    parameter BYTES     = 16384
-) (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire        hsel,
-    input  wire [31:0] haddr,
-    input  wire [1:0]  htrans,
-    input  wire        hwrite,
-    input  wire [2:0]  hsize,
-    input  wire [31:0] hwdata,
-    output reg         hready,
-    output reg  [31:0] hrdata,
-    output reg         hresp
-);
-
-    localparam WORDS = BYTES / 4;
-    reg [31:0] mem [0:WORDS-1];
-
-    initial begin
-        $readmemh("boot_rom.hex", mem);
-    end
-
-    wire access = hsel && htrans[1];
-    wire [31:0] addr_off   = haddr - ADDR_BASE;
-    wire [31:0] word_index = addr_off[17:2];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-            hrdata <= 32'h0;
-        end else begin
-            if (access && !hwrite) begin
-                if (word_index < WORDS)
-                    hrdata <= mem[word_index];
-                else
-                    hrdata <= 32'hDEAD_BEEF;
-            end
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-        end
-    end
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-4. AHB-Lite Instruction SRAM (64 KB at 0x0001_0000)
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_instr_sram.v
-
-----------------------------------------
-h3_ahb_instr_sram.v
-----------------------------------------
-module h3_ahb_instr_sram #(
-    parameter ADDR_BASE = 32'h0001_0000,
-    parameter BYTES     = 65536
-) (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire        hsel,
-    input  wire [31:0] haddr,
-    input  wire [1:0]  htrans,
-    input  wire        hwrite,
-    input  wire [2:0]  hsize,
-    input  wire [31:0] hwdata,
-    output reg         hready,
-    output reg  [31:0] hrdata,
-    output reg         hresp
-);
-
-    localparam WORDS = BYTES / 4;
-    reg [31:0] mem [0:WORDS-1];
-
-    wire access = hsel && htrans[1];
-    wire [31:0] addr_off   = haddr - ADDR_BASE;
-    wire [31:0] word_index = addr_off[17:2];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-            hrdata <= 32'h0;
-        end else begin
-            if (access) begin
-                if (hwrite) begin
-                    if (word_index < WORDS)
-                        mem[word_index] <= hwdata;
-                end else begin
-                    if (word_index < WORDS)
-                        hrdata <= mem[word_index];
-                    else
-                        hrdata <= 32'hBAD0_0000;
-                end
-            end
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-        end
-    end
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-5. AHB-Lite Data SRAM (64 KB at 0x1000_0000)
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_data_sram.v
-
-----------------------------------------
-h3_ahb_data_sram.v
-----------------------------------------
-module h3_ahb_data_sram #(
-    parameter ADDR_BASE = 32'h1000_0000,
-    parameter BYTES     = 65536
-) (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire        hsel,
-    input  wire [31:0] haddr,
-    input  wire [1:0]  htrans,
-    input  wire        hwrite,
-    input  wire [2:0]  hsize,
-    input  wire [31:0] hwdata,
-    output reg         hready,
-    output reg  [31:0] hrdata,
-    output reg         hresp
-);
-
-    localparam WORDS = BYTES / 4;
-    reg [31:0] mem [0:WORDS-1];
-
-    wire access = hsel && htrans[1];
-    wire [31:0] addr_off   = haddr - ADDR_BASE;
-    wire [31:0] word_index = addr_off[17:2];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-            hrdata <= 32'h0;
-        end else begin
-            if (access) begin
-                if (hwrite) begin
-                    if (word_index < WORDS)
-                        mem[word_index] <= hwdata;
-                end else begin
-                    if (word_index < WORDS)
-                        hrdata <= mem[word_index];
-                    else
-                        hrdata <= 32'hDA7A_0000;
-                end
-            end
-            hready <= 1'b1;
-            hresp  <= 1'b0;
-        end
-    end
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-6. AHB-to-APB bridge
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_to_apb.v
-
-----------------------------------------
-h3_ahb_to_apb.v
-----------------------------------------
-module h3_ahb_to_apb (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire        hsel,
-    input  wire [31:0] haddr,
-    input  wire [1:0]  htrans,
-    input  wire        hwrite,
-    input  wire [2:0]  hsize,
-    input  wire [31:0] hwdata,
-    output reg         hready,
-    output reg  [31:0] hrdata,
-    output reg         hresp,
-
-    output reg  [31:0] paddr,
-    output reg         pwrite,
-    output reg  [31:0] pwdata,
-    output reg         psel,
-    output reg         penable,
-    input  wire [31:0] prdata,
-    input  wire        pready,
-    input  wire        pslverr
-);
-
-    localparam IDLE   = 2'd0;
-    localparam SETUP  = 2'd1;
-    localparam ACCESS = 2'd2;
-
-    reg [1:0] state, next_state;
-    reg [31:0] addr_r, wdata_r;
-    reg write_r;
-
-    wire ahb_valid = hsel && htrans[1];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state   <= IDLE;
-            addr_r  <= 32'h0;
-            wdata_r <= 32'h0;
-            write_r <= 1'b0;
-        end else begin
-            state <= next_state;
-            if (ahb_valid && state == IDLE) begin
-                addr_r  <= haddr;
-                wdata_r <= hwdata;
-                write_r <= hwrite;
-            end
-        end
-    end
-
-    always @(*) begin
-        next_state = state;
-        case (state)
-            IDLE:   if (ahb_valid) next_state = SETUP;
-            SETUP:  next_state = ACCESS;
-            ACCESS: if (pready) next_state = IDLE;
-            default: next_state = IDLE;
-        endcase
-    end
-
-    always @(*) begin
-        hready  = 1'b0;
-        hresp   = 1'b0;
-        hrdata  = 32'h0;
-
-        paddr   = 32'h0;
-        pwrite  = 1'b0;
-        pwdata  = 32'h0;
-        psel    = 1'b0;
-        penable = 1'b0;
-
-        case (state)
-            IDLE: begin
-                hready = !ahb_valid;
-            end
-            SETUP: begin
-                paddr   = addr_r;
-                pwrite  = write_r;
-                pwdata  = wdata_r;
-                psel    = 1'b1;
-                penable = 1'b0;
-            end
-            ACCESS: begin
-                paddr   = addr_r;
-                pwrite  = write_r;
-                pwdata  = wdata_r;
-                psel    = 1'b1;
-                penable = 1'b1;
-                hready  = pready;
-                hrdata  = prdata;
-                hresp   = pslverr;
-            end
-        endcase
-    end
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-7. Quad-core Hazard3 SoC (no board pins)
-----------------------------------------
-File: ~/h3_quad_de10lite/soc/rtl/h3_quad_soc.v
-
-This module instantiates:
-- 4× Hazard3 cores as AHB masters
-- AHB arbiter
-- Boot ROM, Instruction SRAM, Data SRAM
-- AHB-to-APB bridge
-- APB peripheral bus (UART, GPIO, SPI, I2C, PWM will be added in Phase 4)
-
-For now, we wire APB outward as generic signals; Phase 4 will attach peripherals.
-
-----------------------------------------
-h3_quad_soc.v
-----------------------------------------
-`include "h3_config_quad.vh"
-
-module h3_quad_soc #(
-    parameter N_CORES = 4
-)(
-    input  wire         clk,
-    input  wire         rst_n,
-
-    output wire [31:0]  apb_paddr,
-    output wire         apb_pwrite,
-    output wire [31:0]  apb_pwdata,
-    output wire         apb_psel,
-    output wire         apb_penable,
-    input  wire [31:0]  apb_prdata,
-    input  wire         apb_pready,
-    input  wire         apb_pslverr,
-
-    output wire [31:0]  core_hartid_dbg
-);
-
-    wire [N_CORES-1:0]     core_hsel;
-    wire [N_CORES-1:0]     core_hwrite;
-    wire [N_CORES*2-1:0]   core_htrans;
-    wire [N_CORES*3-1:0]   core_hsize;
-    wire [N_CORES*32-1:0]  core_haddr;
-    wire [N_CORES*32-1:0]  core_hwdata;
-    wire [N_CORES-1:0]     core_hready;
-    wire [N_CORES*32-1:0]  core_hrdata;
-    wire [N_CORES-1:0]     core_hresp;
-
-    genvar i;
-    generate
-        for (i = 0; i < N_CORES; i = i + 1) begin : G_CORES
-            hazard3_core u_core (
-                .clk           (clk),
-                .rst_n         (rst_n),
-
-                .haddr         (core_haddr[i*32 +: 32]),
-                .hwrite        (core_hwrite[i]),
-                .htrans        (core_htrans[i*2 +: 2]),
-                .hsize         (core_hsize[i*3 +: 3]),
-                .hwdata        (core_hwdata[i*32 +: 32]),
-                .hrdata        (core_hrdata[i*32 +: 32]),
-                .hready        (core_hready[i]),
-                .hresp         (core_hresp[i]),
-
-                .irq           (16'h0000),
-                .mhartid       (i[31:0])
-            );
-            assign core_hsel[i] = 1'b1;
-        end
-    endgenerate
-
-    assign core_hartid_dbg = {28'h0, 4'hF};
-
-    wire        s_hsel;
-    wire [31:0] s_haddr;
-    wire [1:0]  s_htrans;
-    wire        s_hwrite;
-    wire [2:0]  s_hsize;
-    wire [31:0] s_hwdata;
-    wire        s_hready;
-    wire [31:0] s_hrdata;
-    wire        s_hresp;
-
-    h3_ahb_arbiter #(
-        .NUM_MASTERS(N_CORES)
-    ) u_arbiter (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .m_hsel    (core_hsel),
-        .m_hwrite  (core_hwrite),
-        .m_htrans  (core_htrans),
-        .m_hsize   (core_hsize),
-        .m_haddr   (core_haddr),
-        .m_hwdata  (core_hwdata),
-        .m_hready  (core_hready),
-        .m_hrdata  (core_hrdata),
-        .m_hresp   (core_hresp),
-        .s_hsel    (s_hsel),
-        .s_haddr   (s_haddr),
-        .s_htrans  (s_htrans),
-        .s_hwrite  (s_hwrite),
-        .s_hsize   (s_hsize),
-        .s_hwdata  (s_hwdata),
-        .s_hready  (s_hready),
-        .s_hrdata  (s_hrdata),
-        .s_hresp   (s_hresp)
-    );
-
-    wire hsel_boot   = s_hsel && (s_haddr[31:16] == 16'h0000);
-    wire hsel_instr  = s_hsel && (s_haddr[31:16] == 16'h0001);
-    wire hsel_data   = s_hsel && (s_haddr[31:16] == 16'h1000);
-    wire hsel_apb    = s_hsel && (s_haddr[31:16] == 16'h4000);
-
-    wire [31:0] hrdata_boot, hrdata_instr, hrdata_data, hrdata_apb;
-    wire        hready_boot, hready_instr, hready_data, hready_apb;
-    wire        hresp_boot,  hresp_instr,  hresp_data,  hresp_apb;
-
-    assign s_hrdata = hsel_boot  ? hrdata_boot  :
-                      hsel_instr ? hrdata_instr :
-                      hsel_data  ? hrdata_data  :
-                      hsel_apb   ? hrdata_apb   : 32'h0;
-
-    assign s_hready = hsel_boot  ? hready_boot  :
-                      hsel_instr ? hready_instr :
-                      hsel_data  ? hready_data  :
-                      hsel_apb   ? hready_apb   : 1'b1;
-
-    assign s_hresp  = hsel_boot  ? hresp_boot   :
-                      hsel_instr ? hresp_instr  :
-                      hsel_data  ? hresp_data   :
-                      hsel_apb   ? hresp_apb    : 1'b0;
-
-    h3_ahb_boot_rom #(
-        .ADDR_BASE(32'h0000_0000),
-        .BYTES(16384)
-    ) u_boot_rom (
-        .clk    (clk),
-        .rst_n  (rst_n),
-        .hsel   (hsel_boot),
-        .haddr  (s_haddr),
-        .htrans (s_htrans),
-        .hwrite (s_hwrite),
-        .hsize  (s_hsize),
-        .hwdata (s_hwdata),
-        .hready (hready_boot),
-        .hrdata (hrdata_boot),
-        .hresp  (hresp_boot)
-    );
-
-    h3_ahb_instr_sram #(
-        .ADDR_BASE(32'h0001_0000),
-        .BYTES(65536)
-    ) u_instr_sram (
-        .clk    (clk),
-        .rst_n  (rst_n),
-        .hsel   (hsel_instr),
-        .haddr  (s_haddr),
-        .htrans (s_htrans),
-        .hwrite (s_hwrite),
-        .hsize  (s_hsize),
-        .hwdata (s_hwdata),
-        .hready (hready_instr),
-        .hrdata (hrdata_instr),
-        .hresp  (hresp_instr)
-    );
-
-    h3_ahb_data_sram #(
-        .ADDR_BASE(32'h1000_0000),
-        .BYTES(65536)
-    ) u_data_sram (
-        .clk    (clk),
-        .rst_n  (rst_n),
-        .hsel   (hsel_data),
-        .haddr  (s_haddr),
-        .htrans (s_htrans),
-        .hwrite (s_hwrite),
-        .hsize  (s_hsize),
-        .hwdata (s_hwdata),
-        .hready (hready_data),
-        .hrdata (hrdata_data),
-        .hresp  (hresp_data)
-    );
-
-    h3_ahb_to_apb u_ahb2apb (
-        .clk     (clk),
-        .rst_n   (rst_n),
-        .hsel    (hsel_apb),
-        .haddr   (s_haddr),
-        .htrans  (s_htrans),
-        .hwrite  (s_hwrite),
-        .hsize   (s_hsize),
-        .hwdata  (s_hwdata),
-        .hready  (hready_apb),
-        .hrdata  (hrdata_apb),
-        .hresp   (hresp_apb),
-        .paddr   (apb_paddr),
-        .pwrite  (apb_pwrite),
-        .pwdata  (apb_pwdata),
-        .psel    (apb_psel),
-        .penable (apb_penable),
-        .prdata  (apb_prdata),
-        .pready  (apb_pready),
-        .pslverr (apb_pslverr)
-    );
-
-endmodule
-----------------------------------------
-
-----------------------------------------
-8. Next step
-----------------------------------------
-
-At this point you have:
-- Quad-core Hazard3 SoC backbone (no peripherals attached yet).
-- Boot ROM, Instruction SRAM, Data SRAM mapped at the correct addresses.
-- AHB-to-APB bridge with external APB master signals.
-
-Phase 4 will:
-- Implement APB UART, GPIO, SPI, I2C, PWM.
-- Add an APB decoder beneath h3_quad_soc.
-- Introduce a board-level top for DE10-Lite that exposes UART pins, GPIO LEDs, etc.
-
-============================================================
-END OF PHASE 3
-============================================================
-============================================================
-PHASE 4 (OpenCores) — FULL UART/SPI/I2C/GPIO/PWM VIA WISHBONE
-============================================================
-
-All files in this phase live under:
-  ~/h3_quad_de10lite/soc/rtl
-
-Goal:
-- Replace simplified APB peripherals with full OpenCores IP (Wishbone B3).
-- Use a single APB→Wishbone bridge and a simple Wishbone interconnect.
-- Keep the memory map stable:
-    UART  : 0x4000_0000
-    GPIO  : 0x4000_1000
-    SPI   : 0x4000_2000
-    I2C   : 0x4000_3000
-    PWM   : 0x4000_4000
-
-You will:
-- Clone OpenCores (or GitHub mirror) IP into soc/rtl/opencores/
-- Add an APB→WB bridge.
-- Add a WB interconnect.
-- Instantiate OpenCores cores in h3_apb_subsys.
-- Update h3_quad_soc to expose full pins.
-
-------------------------------------------------------------
-1. Create OpenCores RTL directory and clone IP cores
-------------------------------------------------------------
-
-cd ~/h3_quad_de10lite/soc
-mkdir -p rtl/opencores
-cd rtl/opencores
-
-Clone GitHub mirrors (adjust if you prefer official opencores.org tarballs):
-
-git clone https://github.com/freecores/uart16550.git
-git clone https://github.com/freecores/i2c.git
-git clone https://github.com/freecores/spi_master.git
-git clone https://github.com/freecores/gpio.git
-git clone https://github.com/freecores/pwm.git
-
-Result (conceptual):
-
-soc/rtl/opencores/
-  uart16550/
-  i2c/
-  spi_master/
-  gpio/
-  pwm/
-
-Later in Quartus, add the .v/.vhd files from these directories to the project.
-
-------------------------------------------------------------
-2. APB → Wishbone B3 bridge
-------------------------------------------------------------
-
-File: ~/h3_quad_de10lite/soc/rtl/apb2wb_bridge.v
-
-This is an APB slave and a single Wishbone master.
-
-----------------------------------------
-apb2wb_bridge.v
-----------------------------------------
-module apb2wb_bridge (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire [31:0] paddr,
-    input  wire        pwrite,
-    input  wire        psel,
-    input  wire        penable,
-    input  wire [31:0] pwdata,
-    output reg  [31:0] prdata,
-    output reg         pready,
-    output reg         pslverr,
-
-    output reg  [31:0] wb_adr_o,
-    output reg  [31:0] wb_dat_o,
-    input  wire [31:0] wb_dat_i,
-    output reg         wb_we_o,
-    output reg  [3:0]  wb_sel_o,
-    output reg         wb_stb_o,
-    output reg         wb_cyc_o,
-    input  wire        wb_ack_i,
-    input  wire        wb_err_i
-);
-
-    localparam IDLE  = 2'd0;
-    localparam BUSY  = 2'd1;
-
-    reg [1:0] state, next_state;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= IDLE;
-        else
-            state <= next_state;
-    end
-
-    always @(*) begin
-        pready   = 1'b0;
-        pslverr  = 1'b0;
-        prdata   = 32'h0;
-
-        wb_adr_o = 32'h0;
-        wb_dat_o = 32'h0;
-        wb_we_o  = 1'b0;
-        wb_sel_o = 4'b0000;
-        wb_stb_o = 1'b0;
-        wb_cyc_o = 1'b0;
-
-        next_state = state;
-
-        case (state)
-            IDLE: begin
-                if (psel && penable) begin
-                    wb_adr_o = paddr;
-                    wb_dat_o = pwdata;
-                    wb_we_o  = pwrite;
-                    wb_sel_o = 4'b1111;
-                    wb_stb_o = 1'b1;
-                    wb_cyc_o = 1'b1;
-                    next_state = BUSY;
-                end else begin
-                    pready  = 1'b1;
-                end
-            end
-
-            BUSY: begin
-                wb_adr_o = paddr;
-                wb_dat_o = pwdata;
-                wb_we_o  = pwrite;
-                wb_sel_o = 4'b1111;
-                wb_stb_o = 1'b1;
-                wb_cyc_o = 1'b1;
-                if (wb_ack_i || wb_err_i) begin
-                    pready  = 1'b1;
-                    pslverr = wb_err_i;
-                    prdata  = wb_dat_i;
-                    next_state = IDLE;
-                end
-            end
-        endcase
-    end
-
-endmodule
-----------------------------------------
-
-------------------------------------------------------------
-3. Wishbone B3 interconnect (1 master → 5 slaves)
-------------------------------------------------------------
-
-File: ~/h3_quad_de10lite/soc/rtl/wb_interconnect.v
-
-Address ranges (same as APB levels, but we decode on wb_adr_o):
-
-  UART  : 0x4000_0000
-  GPIO  : 0x4000_1000
-  SPI   : 0x4000_2000
-  I2C   : 0x4000_3000
-  PWM   : 0x4000_4000
-
-----------------------------------------
-wb_interconnect.v
-----------------------------------------
-module wb_interconnect (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire [31:0] m_adr_i,
-    input  wire [31:0] m_dat_i,
-    output reg  [31:0] m_dat_o,
-    input  wire        m_we_i,
-    input  wire [3:0]  m_sel_i,
-    input  wire        m_stb_i,
-    input  wire        m_cyc_i,
-    output reg         m_ack_o,
-    output reg         m_err_o,
-
-    output reg  [31:0] s0_adr_o,
-    output reg  [31:0] s0_dat_o,
-    input  wire [31:0] s0_dat_i,
-    output reg         s0_we_o,
-    output reg  [3:0]  s0_sel_o,
-    output reg         s0_stb_o,
-    output reg         s0_cyc_o,
-    input  wire        s0_ack_i,
-    input  wire        s0_err_i,
-
-    output reg  [31:0] s1_adr_o,
-    output reg  [31:0] s1_dat_o,
-    input  wire [31:0] s1_dat_i,
-    output reg         s1_we_o,
-    output reg  [3:0]  s1_sel_o,
-    output reg         s1_stb_o,
-    output reg         s1_cyc_o,
-    input  wire        s1_ack_i,
-    input  wire        s1_err_i,
-
-    output reg  [31:0] s2_adr_o,
-    output reg  [31:0] s2_dat_o,
-    input  wire [31:0] s2_dat_i,
-    output reg         s2_we_o,
-    output reg  [3:0]  s2_sel_o,
-    output reg         s2_stb_o,
-    output reg         s2_cyc_o,
-    input  wire        s2_ack_i,
-    input  wire        s2_err_i,
-
-    output reg  [31:0] s3_adr_o,
-    output reg  [31:0] s3_dat_o,
-    input  wire [31:0] s3_dat_i,
-    output reg         s3_we_o,
-    output reg  [3:0]  s3_sel_o,
-    output reg         s3_stb_o,
-    output reg         s3_cyc_o,
-    input  wire        s3_ack_i,
-    input  wire        s3_err_i,
-
-    output reg  [31:0] s4_adr_o,
-    output reg  [31:0] s4_dat_o,
-    input  wire [31:0] s4_dat_i,
-    output reg         s4_we_o,
-    output reg  [3:0]  s4_sel_o,
-    output reg         s4_stb_o,
-    output reg         s4_cyc_o,
-    input  wire        s4_ack_i,
-    input  wire        s4_err_i
-);
-
-    wire sel0 = (m_adr_i[15:12] == 4'h0);
-    wire sel1 = (m_adr_i[15:12] == 4'h1);
-    wire sel2 = (m_adr_i[15:12] == 4'h2);
-    wire sel3 = (m_adr_i[15:12] == 4'h3);
-    wire sel4 = (m_adr_i[15:12] == 4'h4);
-
-    always @(*) begin
-        s0_adr_o = 32'h0;
-        s0_dat_o = 32'h0;
-        s0_we_o  = 1'b0;
-        s0_sel_o = 4'b0000;
-        s0_stb_o = 1'b0;
-        s0_cyc_o = 1'b0;
-
-        s1_adr_o = 32'h0;
-        s1_dat_o = 32'h0;
-        s1_we_o  = 1'b0;
-        s1_sel_o = 4'b0000;
-        s1_stb_o = 1'b0;
-        s1_cyc_o = 1'b0;
-
-        s2_adr_o = 32'h0;
-        s2_dat_o = 32'h0;
-        s2_we_o  = 1'b0;
-        s2_sel_o = 4'b0000;
-        s2_stb_o = 1'b0;
-        s2_cyc_o = 1'b0;
-
-        s3_adr_o = 32'h0;
-        s3_dat_o = 32'h0;
-        s3_we_o  = 1'b0;
-        s3_sel_o = 4'b0000;
-        s3_stb_o = 1'b0;
-        s3_cyc_o = 1'b0;
-
-        s4_adr_o = 32'h0;
-        s4_dat_o = 32'h0;
-        s4_we_o  = 1'b0;
-        s4_sel_o = 4'b0000;
-        s4_stb_o = 1'b0;
-        s4_cyc_o = 1'b0;
-
-        m_dat_o = 32'h0;
-        m_ack_o = 1'b0;
-        m_err_o = 1'b0;
-
-        if (m_cyc_i && m_stb_i) begin
-            if (sel0) begin
-                s0_adr_o = m_adr_i;
-                s0_dat_o = m_dat_i;
-                s0_we_o  = m_we_i;
-                s0_sel_o = m_sel_i;
-                s0_stb_o = 1'b1;
-                s0_cyc_o = 1'b1;
-                m_dat_o  = s0_dat_i;
-                m_ack_o  = s0_ack_i;
-                m_err_o  = s0_err_i;
-            end else if (sel1) begin
-                s1_adr_o = m_adr_i;
-                s1_dat_o = m_dat_i;
-                s1_we_o  = m_we_i;
-                s1_sel_o = m_sel_i;
-                s1_stb_o = 1'b1;
-                s1_cyc_o = 1'b1;
-                m_dat_o  = s1_dat_i;
-                m_ack_o  = s1_ack_i;
-                m_err_o  = s1_err_i;
-            end else if (sel2) begin
-                s2_adr_o = m_adr_i;
-                s2_dat_o = m_dat_i;
-                s2_we_o  = m_we_i;
-                s2_sel_o = m_sel_i;
-                s2_stb_o = 1'b1;
-                s2_cyc_o = 1'b1;
-                m_dat_o  = s2_dat_i;
-                m_ack_o  = s2_ack_i;
-                m_err_o  = s2_err_i;
-            end else if (sel3) begin
-                s3_adr_o = m_adr_i;
-                s3_dat_o = m_dat_i;
-                s3_we_o  = m_we_i;
-                s3_sel_o = m_sel_i;
-                s3_stb_o = 1'b1;
-                s3_cyc_o = 1'b1;
-                m_dat_o  = s3_dat_i;
-                m_ack_o  = s3_ack_i;
-                m_err_o  = s3_err_i;
-            end else if (sel4) begin
-                s4_adr_o = m_adr_i;
-                s4_dat_o = m_dat_i;
-                s4_we_o  = m_we_i;
-                s4_sel_o = m_sel_i;
-                s4_stb_o = 1'b1;
-                s4_cyc_o = 1'b1;
-                m_dat_o  = s4_dat_i;
-                m_ack_o  = s4_ack_i;
-                m_err_o  = s4_err_i;
-            end else begin
-                m_ack_o = 1'b1;
-                m_err_o = 1'b1;
-                m_dat_o = 32'h0;
-            end
-        end
-    end
-
-endmodule
-----------------------------------------
-
-------------------------------------------------------------
-4. APB subsystem using OpenCores peripherals
-------------------------------------------------------------
-
-File: ~/h3_quad_de10lite/soc/rtl/h3_apb_subsys.v
-
-This replaces the previous minimal version. It now:
-- Takes APB signals from h3_quad_soc.
-- Bridges APB to Wishbone.
-- Connects to Wishbone interconnect.
-- Instantiates OpenCores peripherals:
-    s0: UART16550
-    s1: GPIO
-    s2: SPI master
-    s3: I2C master
-    s4: PWM
-
-Note: The exact top-level module names and ports of each OpenCores core may differ slightly. Adjust them to match the actual IP you clone (uart_top vs uart16550, etc.). The structure is correct.
-
-----------------------------------------
-h3_apb_subsys.v
-----------------------------------------
-module h3_apb_subsys (
-    input  wire        clk,
-    input  wire        rst_n,
-
-    input  wire [31:0] paddr,
-    input  wire        pwrite,
-    input  wire        psel,
-    input  wire        penable,
-    input  wire [31:0] pwdata,
-    output wire [31:0] prdata,
-    output wire        pready,
-    output wire        pslverr,
-
-    input  wire        uart_rx,
-    output wire        uart_tx,
-
-    input  wire [31:0] gpio_in,
-    output wire [31:0] gpio_out,
-    output wire [31:0] gpio_dir,
-
-    output wire        spi_sclk,
-    output wire        spi_mosi,
-    input  wire        spi_miso,
-    output wire        spi_cs_n,
-
-    inout  wire        i2c_sda,
-    output wire        i2c_scl,
-
-    output wire [3:0]  pwm_out
-);
-
-    wire [31:0] wb_m_adr;
-    wire [31:0] wb_m_dat_o;
-    wire [31:0] wb_m_dat_i;
-    wire        wb_m_we;
-    wire [3:0]  wb_m_sel;
-    wire        wb_m_stb;
-    wire        wb_m_cyc;
-    wire        wb_m_ack;
-    wire        wb_m_err;
-
-    apb2wb_bridge u_apb2wb (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .paddr     (paddr),
-        .pwrite    (pwrite),
-        .psel      (psel),
-        .penable   (penable),
-        .pwdata    (pwdata),
-        .prdata    (prdata),
-        .pready    (pready),
-        .pslverr   (pslverr),
-        .wb_adr_o  (wb_m_adr),
-        .wb_dat_o  (wb_m_dat_o),
-        .wb_dat_i  (wb_m_dat_i),
-        .wb_we_o   (wb_m_we),
-        .wb_sel_o  (wb_m_sel),
-        .wb_stb_o  (wb_m_stb),
-        .wb_cyc_o  (wb_m_cyc),
-        .wb_ack_i  (wb_m_ack),
-        .wb_err_i  (wb_m_err)
-    );
-
-    wire [31:0] wb_s0_adr, wb_s0_dat_o, wb_s0_dat_i;
-    wire        wb_s0_we, wb_s0_stb, wb_s0_cyc, wb_s0_ack, wb_s0_err;
-    wire [3:0]  wb_s0_sel;
-
-    wire [31:0] wb_s1_adr, wb_s1_dat_o, wb_s1_dat_i;
-    wire        wb_s1_we, wb_s1_stb, wb_s1_cyc, wb_s1_ack, wb_s1_err;
-    wire [3:0]  wb_s1_sel;
-
-    wire [31:0] wb_s2_adr, wb_s2_dat_o, wb_s2_dat_i;
-    wire        wb_s2_we, wb_s2_stb, wb_s2_cyc, wb_s2_ack, wb_s2_err;
-    wire [3:0]  wb_s2_sel;
-
-    wire [31:0] wb_s3_adr, wb_s3_dat_o, wb_s3_dat_i;
-    wire        wb_s3_we, wb_s3_stb, wb_s3_cyc, wb_s3_ack, wb_s3_err;
-    wire [3:0]  wb_s3_sel;
-
-    wire [31:0] wb_s4_adr, wb_s4_dat_o, wb_s4_dat_i;
-    wire        wb_s4_we, wb_s4_stb, wb_s4_cyc, wb_s4_ack, wb_s4_err;
-    wire [3:0]  wb_s4_sel;
-
-    wb_interconnect u_wb_ic (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .m_adr_i    (wb_m_adr),
-        .m_dat_i    (wb_m_dat_o),
-        .m_dat_o    (wb_m_dat_i),
-        .m_we_i     (wb_m_we),
-        .m_sel_i    (wb_m_sel),
-        .m_stb_i    (wb_m_stb),
-        .m_cyc_i    (wb_m_cyc),
-        .m_ack_o    (wb_m_ack),
-        .m_err_o    (wb_m_err),
-        .s0_adr_o   (wb_s0_adr),
-        .s0_dat_o   (wb_s0_dat_o),
-        .s0_dat_i   (wb_s0_dat_i),
-        .s0_we_o    (wb_s0_we),
-        .s0_sel_o   (wb_s0_sel),
-        .s0_stb_o   (wb_s0_stb),
-        .s0_cyc_o   (wb_s0_cyc),
-        .s0_ack_i   (wb_s0_ack),
-        .s0_err_i   (wb_s0_err),
-        .s1_adr_o   (wb_s1_adr),
-        .s1_dat_o   (wb_s1_dat_o),
-        .s1_dat_i   (wb_s1_dat_i),
-        .s1_we_o    (wb_s1_we),
-        .s1_sel_o   (wb_s1_sel),
-        .s1_stb_o   (wb_s1_stb),
-        .s1_cyc_o   (wb_s1_cyc),
-        .s1_ack_i   (wb_s1_ack),
-        .s1_err_i   (wb_s1_err),
-        .s2_adr_o   (wb_s2_adr),
-        .s2_dat_o   (wb_s2_dat_o),
-        .s2_dat_i   (wb_s2_dat_i),
-        .s2_we_o    (wb_s2_we),
-        .s2_sel_o   (wb_s2_sel),
-        .s2_stb_o   (wb_s2_stb),
-        .s2_cyc_o   (wb_s2_cyc),
-        .s2_ack_i   (wb_s2_ack),
-        .s2_err_i   (wb_s2_err),
-        .s3_adr_o   (wb_s3_adr),
-        .s3_dat_o   (wb_s3_dat_o),
-        .s3_dat_i   (wb_s3_dat_i),
-        .s3_we_o    (wb_s3_we),
-        .s3_sel_o   (wb_s3_sel),
-        .s3_stb_o   (wb_s3_stb),
-        .s3_cyc_o   (wb_s3_cyc),
-        .s3_ack_i   (wb_s3_ack),
-        .s3_err_i   (wb_s3_err),
-        .s4_adr_o   (wb_s4_adr),
-        .s4_dat_o   (wb_s4_dat_o),
-        .s4_dat_i   (wb_s4_dat_i),
-        .s4_we_o    (wb_s4_we),
-        .s4_sel_o   (wb_s4_sel),
-        .s4_stb_o   (wb_s4_stb),
-        .s4_cyc_o   (wb_s4_cyc),
-        .s4_ack_i   (wb_s4_ack),
-        .s4_err_i   (wb_s4_err)
-    );
-
-    wire [31:0] gpio_out_reg;
-    wire [31:0] gpio_dir_reg;
-    assign gpio_out = gpio_out_reg;
-    assign gpio_dir = gpio_dir_reg;
-
-    wire i2c_scl_o;
-    wire i2c_sda_o;
-    wire i2c_sda_oe;
-
-    assign i2c_scl = i2c_scl_o;
-    assign i2c_sda = i2c_sda_oe ? i2c_sda_o : 1'bz;
-    wire i2c_sda_i = i2c_sda;
-
-    wire [3:0] pwm_out_int;
-    assign pwm_out = pwm_out_int;
-
-    uart_top u_uart (
-        .wb_clk_i   (clk),
-        .wb_rst_i   (~rst_n),
-        .wb_adr_i   (wb_s0_adr[4:2]),
-        .wb_dat_i   (wb_s0_dat_o),
-        .wb_dat_o   (wb_s0_dat_i),
-        .wb_we_i    (wb_s0_we),
-        .wb_stb_i   (wb_s0_stb),
-        .wb_cyc_i   (wb_s0_cyc),
-        .wb_ack_o   (wb_s0_ack),
-        .wb_sel_i   (wb_s0_sel),
-        .int_o      (),
-        .stx_pad_o  (uart_tx),
-        .srx_pad_i  (uart_rx),
-        .rts_pad_o  (),
-        .cts_pad_i  (1'b0),
-        .dtr_pad_o  (),
-        .dsr_pad_i  (1'b0),
-        .ri_pad_i   (1'b0),
-        .dcd_pad_i  (1'b0)
-    );
-    assign wb_s0_err = 1'b0;
-
-    gpio_top u_gpio (
-        .wb_clk_i   (clk),
-        .wb_rst_i   (~rst_n),
-        .wb_adr_i   (wb_s1_adr[4:2]),
-        .wb_dat_i   (wb_s1_dat_o),
-        .wb_dat_o   (wb_s1_dat_i),
-        .wb_we_i    (wb_s1_we),
-        .wb_stb_i   (wb_s1_stb),
-        .wb_cyc_i   (wb_s1_cyc),
-        .wb_ack_o   (wb_s1_ack),
-        .wb_sel_i   (wb_s1_sel),
-        .ext_pad_i  (gpio_in),
-        .ext_pad_o  (gpio_out_reg),
-        .ext_padoe_o(gpio_dir_reg),
-        .int_o      ()
-    );
-    assign wb_s1_err = 1'b0;
-
-    spi_top u_spi (
-        .wb_clk_i   (clk),
-        .wb_rst_i   (~rst_n),
-        .wb_adr_i   (wb_s2_adr[4:2]),
-        .wb_dat_i   (wb_s2_dat_o),
-        .wb_dat_o   (wb_s2_dat_i),
-        .wb_we_i    (wb_s2_we),
-        .wb_stb_i   (wb_s2_stb),
-        .wb_cyc_i   (wb_s2_cyc),
-        .wb_ack_o   (wb_s2_ack),
-        .wb_sel_i   (wb_s2_sel),
-        .ss_pad_o   (spi_cs_n),
-        .sclk_pad_o (spi_sclk),
-        .mosi_pad_o (spi_mosi),
-        .miso_pad_i (spi_miso),
-        .int_o      ()
-    );
-    assign wb_s2_err = 1'b0;
-
-    i2c_master_top u_i2c (
-        .wb_clk_i   (clk),
-        .wb_rst_i   (~rst_n),
-        .wb_adr_i   (wb_s3_adr[4:2]),
-        .wb_dat_i   (wb_s3_dat_o),
-        .wb_dat_o   (wb_s3_dat_i),
-        .wb_we_i    (wb_s3_we),
-        .wb_stb_i   (wb_s3_stb),
-        .wb_cyc_i   (wb_s3_cyc),
-        .wb_ack_o   (wb_s3_ack),
-        .wb_sel_i   (wb_s3_sel),
-        .scl_pad_o  (i2c_scl_o),
-        .scl_padoen_o(),
-        .sda_pad_o  (i2c_sda_o),
-        .sda_padoen_o(i2c_sda_oe),
-        .sda_pad_i  (i2c_sda_i),
-        .int_o      ()
-    );
-    assign wb_s3_err = 1'b0;
-
-    pwm_top u_pwm (
-        .wb_clk_i   (clk),
-        .wb_rst_i   (~rst_n),
-        .wb_adr_i   (wb_s4_adr[4:2]),
-        .wb_dat_i   (wb_s4_dat_o),
-        .wb_dat_o   (wb_s4_dat_i),
-        .wb_we_i    (wb_s4_we),
-        .wb_stb_i   (wb_s4_stb),
-        .wb_cyc_i   (wb_s4_cyc),
-        .wb_ack_o   (wb_s4_ack),
-        .wb_sel_i   (wb_s4_sel),
-        .pwm_o      (pwm_out_int),
-        .int_o      ()
-    );
-    assign wb_s4_err = 1'b0;
-
-endmodule
-----------------------------------------
-
-------------------------------------------------------------
-5. Update h3_quad_soc to use OpenCores APB subsystem
-------------------------------------------------------------
-
-File: ~/h3_quad_de10lite/soc/rtl/h3_quad_soc.v
-
-Ensure the module header matches:
-
-  module h3_quad_soc #(
-      parameter N_CORES = 4
-  )(
-      input  wire         clk,
-      input  wire         rst_n,
-
-      input  wire         uart_rx,
-      output wire         uart_tx,
-
-      input  wire [31:0]  gpio_in,
-      output wire [31:0]  gpio_out,
-      output wire [31:0]  gpio_dir,
-
-      output wire         spi_sclk,
-      output wire         spi_mosi,
-      input  wire         spi_miso,
-      output wire         spi_cs_n,
-
-      inout  wire         i2c_sda,
-      output wire         i2c_scl,
-
-      output wire [3:0]   pwm_out
-  );
-
-Inside h3_quad_soc, where you had:
-
-  h3_ahb_to_apb u_ahb2apb ( ... )
-  h3_apb_subsys u_apb ( ... )
-
-ensure that h3_apb_subsys is now the OpenCores version above, and connect:
-
-  h3_apb_subsys u_apb (
-      .clk      (clk),
-      .rst_n    (rst_n),
-      .paddr    (paddr),
-      .pwrite   (pwrite),
-      .psel     (psel),
-      .penable  (penable),
-      .pwdata   (pwdata),
-      .prdata   (prdata),
-      .pready   (pready),
-      .pslverr  (pslverr),
-      .uart_rx  (uart_rx),
-      .uart_tx  (uart_tx),
-      .gpio_in  (gpio_in),
-      .gpio_out (gpio_out),
-      .gpio_dir (gpio_dir),
-      .spi_sclk (spi_sclk),
-      .spi_mosi (spi_mosi),
-      .spi_miso (spi_miso),
-      .spi_cs_n (spi_cs_n),
-      .i2c_sda  (i2c_sda),
-      .i2c_scl  (i2c_scl),
-      .pwm_out  (pwm_out)
-  );
-
-------------------------------------------------------------
-6. What you have now
-------------------------------------------------------------
-
-At this point, your SoC includes:
-
-- Quad-core Hazard3 (RV32IM).
-- AHB backbone with:
-  - Boot ROM (0x0000_0000, 16 KB).
-  - Instruction SRAM (0x0001_0000, 64 KB).
-  - Data SRAM (0x1000_0000, 64 KB).
-  - APB region (0x4000_0000+).
-- AHB→APB bridge.
-- APB→Wishbone bridge.
-- Wishbone interconnect (single master, 5 slaves).
-- OpenCores peripherals:
-  - UART16550 (0x4000_0000).
-  - GPIO (0x4000_1000).
-  - SPI Master (0x4000_2000).
-  - I2C Master (0x4000_3000).
-  - PWM (0x4000_4000).
-
-All are full-featured, protocol-correct IP cores, not simplified demos.
-
-============================================================
-END OF PHASE 4 (OPENCORES)
 ============================================================
