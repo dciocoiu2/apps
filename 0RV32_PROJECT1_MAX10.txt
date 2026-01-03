@@ -3620,3 +3620,633 @@ Next, we can:
 
 ##############End Phase 1G########
 
+================================================================================
+PHASE 1H: JTAG-UART INTEGRATION ON WISHBONE s5 @ 0x1000_0500
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1H
+----------------
+Extend the SoC from Phase 1G (Hazard3 + SDRAM + UART + I2C + SPI + GPIO) by:
+
+- Replacing the JTAG-UART stub on Wishbone s5 with a **real JTAG-UART** block.
+- Mapping JTAG-UART @ 0x1000_0500.
+- Using the Intel JTAG UART IP, wrapped in a simple Wishbone shim.
+- Adding ROM-based test code that:
+  - Prints over UART0 (external USB-serial).
+  - Prints over JTAG-UART (seen via nios2-terminal).
+
+Constraints preserved:
+- Only `.sof` via JTAG to **SRAM**, NEVER flash.
+- Power-cycle → DE0-Lite factory demo restored.
+
+HIGH-LEVEL STRATEGY
+-------------------
+The Intel JTAG UART IP is Avalon-MM, not Wishbone. We’ll:
+
+- Instantiate Intel JTAG UART in Quartus (IP Catalog).
+- Wrap it in a small Avalon-MM→Wishbone shim in RTL.
+- Expose a minimal register interface at 0x1000_0500:
+
+  - 0x00: DATA (read/write)
+  - 0x04: CONTROL/STATUS
+
+Implementations vary, but the default Nios-style mapping is:
+
+- DATA:
+  - write: send char if TX space available.
+  - read: get char if RX data available.
+- CONTROL:
+  - upper bits: RX count
+  - lower bits: TX space
+
+We’ll mirror that behavior logically in the HAL/boot code.
+
+================================================================================
+STEP 1 — CREATE AVALON-MM JTAG UART VIA QUARTUS IP
+================================================================================
+
+1. In Quartus, open your h3_phase1_sc project.
+
+2. IP Catalog → “JTAG UART”:
+   - Create “JTAG UART” IP.
+   - Interface: Avalon-MM slave.
+   - Data width: 32 bits.
+   - Address width: 2 (giving 0x0 and 0x4 registers).
+   - Name the instance e.g.: jtag_uart_0
+   - Generate HDL files into:
+
+     ~/fpga/h3_phase1_sc/rtl/cores/intel_jtag_uart/
+
+   This will produce:
+   - jtag_uart_0.v (or .sv)
+   - jtag_uart_0.qip
+   - Supporting files.
+
+3. Add the .qip file to your project:
+   - Project → Add/Remove Files in Project.
+   - Add `../rtl/cores/intel_jtag_uart/jtag_uart_0.qip`.
+
+We do NOT modify this Intel IP; we only wrap it.
+
+================================================================================
+STEP 2 — WISHBONE WRAPPER AROUND AVALON JTAG UART (s5 SLAVE)
+================================================================================
+
+We now build a small Wishbone wrapper exposing:
+
+- 0x00: DATA
+- 0x04: CONTROL
+
+The wrapper:
+
+- Translates WB cycles to Avalon reads/writes.
+- Implements simple “wait until ready” semantics for ROM test (no IRQs).
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/jtag_uart_wb_wrapper.sv --------------
+
+module jtag_uart_wb_wrapper
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave interface
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // JTAG UART Avalon-MM signals
+    // (match the generated jtag_uart_0 module ports)
+    output wire [1:0]  av_address,
+    output wire        av_read_n,
+    input  wire [31:0] av_readdata,
+    output wire        av_write_n,
+    output wire [31:0] av_writedata,
+    input  wire        av_waitrequest,
+    input  wire        av_irq
+);
+
+    assign wb_err_o = 1'b0;
+
+    // We decode only word addresses 0x00 and 0x04 relative to 0x1000_0500.
+    wire [1:0] reg_adr = wb_adr_i[3:2];
+
+    // Avalon expects active-low read/write strobes.
+    reg        read_req;
+    reg        write_req;
+
+    assign av_address   = reg_adr;
+    assign av_read_n    = ~read_req;
+    assign av_write_n   = ~write_req;
+    assign av_writedata = wb_dat_i;
+
+    // Simple FSM: IDLE -> ACCESS -> DONE
+    localparam ST_IDLE  = 2'd0;
+    localparam ST_WAIT  = 2'd1;
+    localparam ST_DONE  = 2'd2;
+
+    reg [1:0] state, next_state;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) state <= ST_IDLE;
+        else     state <= next_state;
+    end
+
+    always @(*) begin
+        next_state = state;
+        case (state)
+            ST_IDLE: begin
+                if (wb_cyc_i && wb_stb_i) begin
+                    next_state = ST_WAIT;
+                end
+            end
+            ST_WAIT: begin
+                if (!av_waitrequest) begin
+                    next_state = ST_DONE;
+                end
+            end
+            ST_DONE: begin
+                next_state = ST_IDLE;
+            end
+        endcase
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            read_req  <= 1'b0;
+            write_req <= 1'b0;
+            wb_ack_o  <= 1'b0;
+            wb_dat_o  <= 32'h0;
+        end else begin
+            wb_ack_o  <= 1'b0;
+            read_req  <= 1'b0;
+            write_req <= 1'b0;
+
+            case (state)
+                ST_IDLE: begin
+                    if (wb_cyc_i && wb_stb_i) begin
+                        if (wb_we_i)
+                            write_req <= 1'b1;
+                        else
+                            read_req <= 1'b1;
+                    end
+                end
+                ST_WAIT: begin
+                    // hold read_req/write_req from previous cycle if needed
+                    if (wb_we_i)
+                        write_req <= 1'b1;
+                    else
+                        read_req <= 1'b1;
+                end
+                ST_DONE: begin
+                    wb_ack_o <= 1'b1;
+                    if (!wb_we_i)
+                        wb_dat_o <= av_readdata;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+NOTES:
+- You may need to tweak exactly how av_waitrequest is used depending on the JTAG UART IP behavior.
+- If the IP has no waitrequest, tie it to 0 and simplify FSM.
+
+================================================================================
+STEP 3 — INSTANTIATE THE INTEL JTAG UART + WRAPPER IN top_soc.sv (s5)
+================================================================================
+
+We now:
+
+- Add Avalon signals for JTAG UART instance in top_soc.
+- Instantiate `jtag_uart_0` (from Intel IP).
+- Wrap it with `jtag_uart_wb_wrapper` connected to s5_*.
+
+No new external pins: JTAG UART uses the JTAG interface already present (USB-Blaster).
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv --------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq,
+
+    // UART0 pins
+    input  wire        uart0_rx,
+    output wire        uart0_tx,
+
+    // I2C0 pins
+    inout  wire        i2c_sda,
+    inout  wire        i2c_scl,
+
+    // SPI0 pins
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire        spi_sck,
+    output wire        spi_ss0,
+
+    // GPIO pins
+    inout  wire [19:0] gpio_pins
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    // *** All AHB/WB signals and modules from Phase 1G remain the same ***
+    // hazard3_tile, ahb_interconnect_4m, boot_rom, ahb_to_wb_bridge,
+    // wb_interconnect, sdram_wb_wrapper (s0), uart16550_wb_wrapper (s1),
+    // i2c_wb_wrapper (s2), spi_wb_wrapper (s3), gpio_wb (s4).
+
+    // We only replace the s5 stub with real JTAG UART.
+
+    // ...
+    // [existing declarations and instances for m0..m3, s0..s5, wb, etc.]
+    // ...
+
+    // JTAG UART Avalon signals
+    wire [1:0]  ju_av_address;
+    wire        ju_av_read_n;
+    wire [31:0] ju_av_readdata;
+    wire        ju_av_write_n;
+    wire [31:0] ju_av_writedata;
+    wire        ju_av_waitrequest;
+    wire        ju_av_irq;
+
+    // Intel JTAG UART instance (from IP)
+    jtag_uart_0 u_jtag_uart (
+        .clk           (clk),
+        .rst_n         (~rst),
+
+        .av_address    (ju_av_address),
+        .av_read_n     (ju_av_read_n),
+        .av_readdata   (ju_av_readdata),
+        .av_write_n    (ju_av_write_n),
+        .av_writedata  (ju_av_writedata),
+        .av_waitrequest(ju_av_waitrequest),
+        .av_irq        (ju_av_irq)
+
+        // plus any other ports the IP might have; tie off as needed
+    );
+
+    // Wishbone wrapper on s5
+    jtag_uart_wb_wrapper u_jtag_wb (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s5_adr_o),
+        .wb_dat_i   (s5_dat_o),
+        .wb_dat_o   (s5_dat_i),
+        .wb_we_i    (s5_we_o),
+        .wb_sel_i   (s5_sel_o),
+        .wb_cyc_i   (s5_cyc_o),
+        .wb_stb_i   (s5_stb_o),
+        .wb_ack_o   (s5_ack_i),
+        .wb_err_o   (s5_err_i),
+
+        .av_address     (ju_av_address),
+        .av_read_n      (ju_av_read_n),
+        .av_readdata    (ju_av_readdata),
+        .av_write_n     (ju_av_write_n),
+        .av_writedata   (ju_av_writedata),
+        .av_waitrequest (ju_av_waitrequest),
+        .av_irq         (ju_av_irq)
+    );
+
+endmodule
+
+(Ensure all previously defined s5_* signals from the WB fabric remain connected.)
+
+================================================================================
+STEP 4 — BOOT ROM JTAG UART TEST (PRINT VIA UART0 + JTAG-UART)
+================================================================================
+
+We now extend bootrom.c to include simple JTAG UART access:
+
+- Base: 0x1000_0500
+  - DATA:   +0x00
+  - CONTROL:+0x04
+- CONTROL bits:
+  - [31:16] = RX data available count.
+  - [15:0]  = TX space available.
+
+We’ll:
+
+- Add JTAG UART write/read routines.
+- Print a banner on both UART0 and JTAG-UART.
+
+----- UPDATED FILE: ~/hazard3_fw/bootrom/bootrom.c ----------------------------
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+#define UART_RBR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_THR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_IER     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_FCR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_LCR     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_MCR     (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_LSR     (*(volatile uint32_t *)(UART0_BASE + 0x14))
+
+#define UART_LSR_DR   (1u << 0)
+#define UART_LSR_THRE (1u << 5)
+
+#define I2C0_BASE    0x10000100u
+#define I2C_PRER_LO  (*(volatile uint32_t *)(I2C0_BASE + 0x00))
+#define I2C_PRER_HI  (*(volatile uint32_t *)(I2C0_BASE + 0x04))
+#define I2C_CTR      (*(volatile uint32_t *)(I2C0_BASE + 0x08))
+#define I2C_TXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_RXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_CR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+#define I2C_SR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+
+#define I2C_CTR_EN   (1u << 7)
+#define I2C_CR_STA   (1u << 7)
+#define I2C_CR_STO   (1u << 6)
+#define I2C_CR_RD    (1u << 5)
+#define I2C_CR_WR    (1u << 4)
+#define I2C_CR_ACK   (1u << 3)
+
+#define I2C_SR_RXACK (1u << 7)
+#define I2C_SR_TIP   (1u << 1)
+
+#define SPI0_BASE      0x10000200u
+#define SPI_RXTX       (*(volatile uint32_t *)(SPI0_BASE + 0x00))
+#define SPI_STATUS     (*(volatile uint32_t *)(SPI0_BASE + 0x04))
+#define SPI_CTRL       (*(volatile uint32_t *)(SPI0_BASE + 0x08))
+#define SPI_DIVIDER    (*(volatile uint32_t *)(SPI0_BASE + 0x0C))
+#define SPI_SS         (*(volatile uint32_t *)(SPI0_BASE + 0x10))
+
+#define SPI_CTRL_GO     (1u << 0)
+#define SPI_CTRL_RXNEG  (1u << 1)
+#define SPI_CTRL_TXNEG  (1u << 2)
+#define SPI_CTRL_LSBF   (1u << 3)
+#define SPI_CTRL_IE     (1u << 4)
+#define SPI_CTRL_ASS    (1u << 5)
+
+#define GPIO_BASE      0x10000300u
+#define GPIO_DATA_OUT  (*(volatile uint32_t *)(GPIO_BASE + 0x00))
+#define GPIO_DATA_IN   (*(volatile uint32_t *)(GPIO_BASE + 0x04))
+#define GPIO_DIR       (*(volatile uint32_t *)(GPIO_BASE + 0x08))
+#define GPIO_PULLUP    (*(volatile uint32_t *)(GPIO_BASE + 0x0C))
+
+#define JU_BASE        0x10000500u
+#define JU_DATA        (*(volatile uint32_t *)(JU_BASE + 0x00))
+#define JU_CTRL        (*(volatile uint32_t *)(JU_BASE + 0x04))
+
+static void uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+    UART_LCR = 0x80u;
+    UART_THR = (divisor & 0xFFu);
+    UART_IER = ((divisor >> 8) & 0xFFu);
+    UART_LCR = 0x03u;
+    UART_FCR = 0x07u;
+    UART_MCR = 0x08u;
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_LSR & UART_LSR_THRE)) { }
+    UART_THR = (uint8_t)c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+static void uart_put_hex8(uint8_t v)
+{
+    const char hex[] = "0123456789ABCDEF";
+    uart_putc(hex[(v >> 4) & 0xF]);
+    uart_putc(hex[v & 0xF]);
+}
+
+static void i2c_init(uint32_t sys_clk_hz, uint32_t bus_khz)
+{
+    uint32_t freq = bus_khz * 1000u;
+    uint32_t presc = (sys_clk_hz / (5u * freq)) - 1u;
+    I2C_PRER_LO = (presc & 0xFFu);
+    I2C_PRER_HI = ((presc >> 8) & 0xFFu);
+    I2C_CTR     = I2C_CTR_EN;
+}
+
+static int i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t data)
+{
+    I2C_TXR = (uint32_t)((addr7 << 1) | 0u);
+    I2C_CR  = I2C_CR_STA | I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -1;
+
+    I2C_TXR = reg;
+    I2C_CR  = I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -2;
+
+    I2C_TXR = data;
+    I2C_CR  = I2C_CR_WR | I2C_CR_STO;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -3;
+
+    return 0;
+}
+
+static void spi_init(uint32_t sys_clk_hz)
+{
+    uint32_t div = 4u;
+    SPI_DIVIDER = div;
+    uint32_t ctrl = 0;
+    ctrl |= SPI_CTRL_ASS;
+    SPI_CTRL = ctrl;
+    SPI_SS   = 1u;
+}
+
+static uint8_t spi_transfer(uint8_t data)
+{
+    SPI_RXTX = data;
+    SPI_CTRL = SPI_CTRL | SPI_CTRL_GO;
+    while (SPI_CTRL & SPI_CTRL_GO) { }
+    return (uint8_t)(SPI_RXTX & 0xFFu);
+}
+
+static void delay(volatile uint32_t cycles)
+{
+    while (cycles--) {
+        __asm__ volatile("nop");
+    }
+}
+
+// JTAG UART helpers
+static int jtag_uart_tx_space(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl & 0xFFFFu);
+}
+
+static int jtag_uart_rx_count(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl >> 16);
+}
+
+static void jtag_uart_putc(char c)
+{
+    while (jtag_uart_tx_space() == 0) { }
+    JU_DATA = (uint32_t)(uint8_t)c;
+}
+
+static void jtag_uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') jtag_uart_putc('\r');
+        jtag_uart_putc(*s++);
+    }
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    uart_init(SYS_CLK_HZ, 115200u);
+
+    uart_puts("Hazard3 Phase 1H: JTAG-UART test\n");
+    jtag_uart_puts("Hazard3 Phase 1H: JTAG-UART test\n");
+
+    i2c_init(SYS_CLK_HZ, 100u);
+    uart_puts("I2C initialized\n");
+    jtag_uart_puts("I2C initialized\n");
+
+    int rc = i2c_write_byte(0x68, 0x00, 0x55);
+    if (rc == 0) {
+        uart_puts("I2C write to 0x68 succeeded\n");
+        jtag_uart_puts("I2C write to 0x68 succeeded\n");
+    } else {
+        uart_puts("I2C write to 0x68 failed\n");
+        jtag_uart_puts("I2C write to 0x68 failed\n");
+    }
+
+    spi_init(SYS_CLK_HZ);
+    uart_puts("SPI initialized\n");
+    jtag_uart_puts("SPI initialized\n");
+
+    uint8_t resp = spi_transfer(0x9F);
+    uart_puts("SPI transfer 0x9F returned 0x");
+    uart_put_hex8(resp);
+    uart_putc('\n');
+
+    jtag_uart_puts("SPI transfer 0x9F returned 0x");
+    jtag_uart_putc("0123456789ABCDEF"[(resp >> 4) & 0xF]);
+    jtag_uart_putc("0123456789ABCDEF"[resp & 0xF]);
+    jtag_uart_putc('\n');
+
+    // Optional: blink GPIO LED as before
+    GPIO_DIR    |= (1u << 18);
+    GPIO_PULLUP &= ~(1u << 18);
+
+    for (int i = 0; i < 5; i++) {
+        GPIO_DATA_OUT |= (1u << 18);
+        delay(5000000u);
+        GPIO_DATA_OUT &= ~(1u << 18);
+        delay(5000000u);
+    }
+
+    uart_puts("Phase 1H test done\n");
+    jtag_uart_puts("Phase 1H test done\n");
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+Rebuild bootrom:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+Place/refresh bootrom.hex as before.
+
+================================================================================
+STEP 5 — QUARTUS: ADD WRAPPER, KEEP IP, COMPILE, PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Ensure Intel JTAG UART IP is already generated and `.qip` added (Step 1).
+
+2. Add wrapper RTL:
+   - Project → Add/Remove Files:
+     - ../rtl/soc/jtag_uart_wb_wrapper.sv
+     - Updated ../rtl/soc/top_soc.sv
+
+3. Boot ROM:
+   - Ensure updated bootrom.hex is seen by boot_rom.sv.
+
+4. Compile:
+   - Processing → Start Compilation.
+
+5. Program SRAM-only:
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - Mode: JTAG.
+     - File: h3_phase1_sc.sof.
+     - Check “Program/Configure” only.
+     - START.
+   - Do NOT generate/program .pof; do NOT program configuration flash.
+   - Power-cycle → factory demo returns.
+
+6. Run-time verification:
+   - Connect UART0 via USB-serial (115200 8N1).
+   - In a terminal, run:
+
+     nios2-terminal
+
+     (or the equivalent JTAG UART console depending on your Quartus version.)
+
+   - Power on DE0-Lite → factory demo.
+   - Program .sof → Hazard3 SoC overlays in SRAM.
+   - Reset board.
+   - You should see identical messages in:
+     - Your UART0 terminal.
+     - JTAG UART terminal (nios2-terminal).
+
+================================================================================
+WHAT PHASE 1H GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A complete, bus-consistent peripheral set behind AHB→WB:
+  - SDRAM (s0), UART (s1), I2C (s2), SPI (s3), GPIO (s4), JTAG-UART (s5).
+- Two independent debug I/O channels:
+  - UART0 (physical).
+  - JTAG-UART (over USB-Blaster, no extra wiring).
+- Fully functional base SoC, still:
+  - Quad-core-ready at the AHB level.
+  - Ephemeral-only configuration (.sof in SRAM, factory demo on power-cycle).
+
+Next steps (Phase 1I onward) are where it gets really interesting:
+
+- 1I: Bootloader in ROM (dual-path: UART0 + JTAG-UART) that loads firmware into SDRAM.
+- 1J: HAL (C) for all these peripherals.
+- 1K: SDRAM-resident user firmware, then multi-core.
+########END PHASE 1H########
+
