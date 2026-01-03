@@ -1,0 +1,531 @@
+================================================================================
+PHASE 3A: PLIC-LITE (PLATFORM-LEVEL INTERRUPT CONTROLLER) FOR 4-HART H3 SOC
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Add a small, clean **PLIC-lite** so your peripherals (UART/I2C/SPI/GPIO/PWM/DMA/etc.)
+can raise interrupts to any of the 4 harts.
+
+We will:
+
+- Implement a **PLIC-like interrupt controller** as a Wishbone slave.
+- Support up to 16 interrupt sources (you’ll use fewer initially).
+- Provide **per-source enable per hart**.
+- Provide **pending + claim/complete** interface per hart (RISC-V style).
+- Wire a single `irq_mei[h]` (machine external interrupt) per hart.
+
+No change to CLINT (M_TIMER/MSIP); this is for **external/PLIC-style** interrupts.
+
+================================================================================
+STEP 1 — INTERRUPT SOURCES AND SIGNALS
+================================================================================
+
+We define up to 16 sources (ID 1..16). ID 0 = "no interrupt".
+
+You can map them like this (example):
+
+- 1: UART0
+- 2: I2C0
+- 3: SPI0
+- 4: GPIO
+- 5: PWM
+- 6: DMA
+- 7–16: reserved / future
+
+At the top-level (`top_soc.sv`), each peripheral exposes a **level or pulse** signal, e.g.:
+
+- `irq_uart0`
+- `irq_i2c0`
+- `irq_spi0`
+- `irq_gpio`
+- `irq_pwm`
+- `irq_dma`
+
+We will bundle them into a vector:
+
+- `wire [15:1] plic_sources;`
+
+and feed them into PLIC-lite.
+
+================================================================================
+STEP 2 — PLIC-LITE REGISTER MAP
+================================================================================
+
+Base: **0x1000_0800**
+
+We’ll keep it small and RISC-V-flavored.
+
+- Interrupt IDs: 1..16 (0 = "no interrupt").
+- Harts: 0..3.
+
+Registers:
+
+1) **Pending bits** (global):
+
+- 0x000: PENDING_LO  (bits [31:0], we use [16:1])
+- 0x004: PENDING_HI  (unused for now, kept for future)
+
+2) **Enable matrix** (per hart):
+
+Hart h enable base = 0x010 + 0x10 * h
+
+- 0x010 + 0x10*h: HART_EN_LO[h] (bits [31:0], [16:1] used)
+- 0x014 + 0x10*h: HART_EN_HI[h] (unused)
+
+3) **Claim/complete** (per hart):
+
+Hart h claim base = 0x080 + 0x10 * h
+
+- 0x080 + 0x10*h: HART_CLAIM[h]
+  - Read: return highest-priority pending enabled ID for that hart (or 0).
+  - Write: write same ID to indicate "completion" (clear pending if source is level-sensitive).
+
+4) **Priority & threshold** (optional, we make it trivial for now):
+
+For simplicity: **no per-source priority, no threshold**. We just pick
+the lowest ID (1..16) that is pending & enabled. This keeps PLIC-lite very small.
+
+================================================================================
+STEP 3 — PLIC-LITE WISHBONE SLAVE RTL
+================================================================================
+
+File: ~/fpga/h3_phase1_sc/rtl/soc/plic_wb.sv
+
+module plic_wb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // Interrupt sources (IDs 1..16)
+    input  wire [16:1] src_irq_i,
+
+    // Interrupt outputs to harts (machine external interrupt)
+    output wire [3:0]  hart_mei_o
+);
+
+    assign wb_err_o = 1'b0;
+
+    // Pending bits, one per source (1..16).
+    // We'll treat src_irq_i as level-sensitive.
+    reg [16:1] pending;
+
+    // Enable bits: 4 harts x 16 sources.
+    reg [16:1] enable_hart [0:3];
+
+    integer i, h;
+
+    // Latch level-sensitive pending bits.
+    // When a source goes high, pending bit is set.
+    // Completion will clear it.
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            pending <= {16{1'b0}};
+        end else begin
+            for (i = 1; i <= 16; i = i + 1) begin
+                if (src_irq_i[i])
+                    pending[i] <= 1'b1;
+            end
+        end
+    end
+
+    // Claim/complete logic helpers.
+    // For each hart, we compute the "best" interrupt ID:
+    // the lowest ID with pending & enabled.
+    reg [4:0] best_id [0:3]; // 0..16
+
+    always @(*) begin
+        for (h = 0; h < 4; h = h + 1) begin
+            best_id[h] = 5'd0;
+            for (i = 1; i <= 16; i = i + 1) begin
+                if (pending[i] && enable_hart[h][i] && (best_id[h] == 5'd0))
+                    best_id[h] = i[4:0];  // pick first match
+            end
+        end
+    end
+
+    // Hart MEI outputs: any non-zero best_id => interrupt.
+    assign hart_mei_o[0] = (best_id[0] != 5'd0);
+    assign hart_mei_o[1] = (best_id[1] != 5'd0);
+    assign hart_mei_o[2] = (best_id[2] != 5'd0);
+    assign hart_mei_o[3] = (best_id[3] != 5'd0);
+
+    // Wishbone address decode
+    wire [9:0] byte_off = wb_adr_i[9:0];    // within 0x1000_0800 block
+    wire [7:0] word_off = byte_off[9:2];    // 4-byte words
+
+    // Basic register write
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+
+            for (h = 0; h < 4; h = h + 1) begin
+                enable_hart[h] <= {16{1'b0}};
+            end
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    // WRITE
+                    case (word_off)
+                        // PENDING - writes ignored (read-only)
+                        8'h00,
+                        8'h01: begin
+                            // no-op
+                        end
+
+                        // HART0 enables: 0x10, 0x14
+                        8'h04: enable_hart[0][16:1] <= wb_dat_i[16:1];
+                        8'h05: ; // high part unused
+
+                        // HART1 enables: 0x20, 0x24
+                        8'h08: enable_hart[1][16:1] <= wb_dat_i[16:1];
+                        8'h09: ;
+
+                        // HART2 enables: 0x30, 0x34
+                        8'h0C: enable_hart[2][16:1] <= wb_dat_i[16:1];
+                        8'h0D: ;
+
+                        // HART3 enables: 0x40, 0x44
+                        8'h10: enable_hart[3][16:1] <= wb_dat_i[16:1];
+                        8'h11: ;
+
+                        // HART0 claim/complete: 0x80
+                        8'h20: begin
+                            // Write = completion; clear pending[ID]
+                            // ID = wb_dat_i[4:0]
+                            if (wb_dat_i[4:0] != 5'd0 && wb_dat_i[4:0] <= 5'd16)
+                                pending[wb_dat_i[4:0]] <= 1'b0;
+                        end
+
+                        // HART1 claim/complete: 0x90
+                        8'h24: begin
+                            if (wb_dat_i[4:0] != 5'd0 && wb_dat_i[4:0] <= 5'd16)
+                                pending[wb_dat_i[4:0]] <= 1'b0;
+                        end
+
+                        // HART2 claim/complete: 0xA0
+                        8'h28: begin
+                            if (wb_dat_i[4:0] != 5'd0 && wb_dat_i[4:0] <= 5'd16)
+                                pending[wb_dat_i[4:0]] <= 1'b0;
+                        end
+
+                        // HART3 claim/complete: 0xB0
+                        8'h2C: begin
+                            if (wb_dat_i[4:0] != 5'd0 && wb_dat_i[4:0] <= 5'd16)
+                                pending[wb_dat_i[4:0]] <= 1'b0;
+                        end
+
+                        default: ;
+                    endcase
+                end else begin
+                    // READ
+                    case (word_off)
+                        // PENDING_LO
+                        8'h00: wb_dat_o <= {15'b0, pending[16:1], 1'b0};
+                        // PENDING_HI (unused)
+                        8'h01: wb_dat_o <= 32'h0;
+
+                        // HART0 enables
+                        8'h04: wb_dat_o <= {15'b0, enable_hart[0][16:1], 1'b0};
+                        8'h05: wb_dat_o <= 32'h0;
+
+                        // HART1 enables
+                        8'h08: wb_dat_o <= {15'b0, enable_hart[1][16:1], 1'b0};
+                        8'h09: wb_dat_o <= 32'h0;
+
+                        // HART2 enables
+                        8'h0C: wb_dat_o <= {15'b0, enable_hart[2][16:1], 1'b0};
+                        8'h0D: wb_dat_o <= 32'h0;
+
+                        // HART3 enables
+                        8'h10: wb_dat_o <= {15'b0, enable_hart[3][16:1], 1'b0};
+                        8'h11: wb_dat_o <= 32'h0;
+
+                        // HART0 claim
+                        8'h20: wb_dat_o <= {27'b0, best_id[0]};
+                        // HART1 claim
+                        8'h24: wb_dat_o <= {27'b0, best_id[1]};
+                        // HART2 claim
+                        8'h28: wb_dat_o <= {27'b0, best_id[2]};
+                        // HART3 claim
+                        8'h2C: wb_dat_o <= {27'b0, best_id[3]};
+
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+
+endmodule
+
+NOTES:
+- Level-sensitive sources: once the peripheral asserts `src_irq_i[id]`, PLIC sets `pending[id]`.
+  Firmware must write the same ID to claim/complete to clear `pending[id]`.
+- If you want clear-on-deassert, you can also clear `pending[i]` when `!src_irq_i[i]`.
+
+================================================================================
+STEP 4 — INTEGRATION IN wb_interconnect + top_soc.sv
+================================================================================
+
+### 4.1 — wb_interconnect.sv
+
+Add new WB slave slot, e.g. **s9**, at **0x1000_0800**:
+
+- Add s9_* ports.
+- Decode:
+
+  sel_s9 = (m_adr_i[31:8] == 24'h100008);
+
+- Add in master→slave and slave→master mux, like previous slaves.
+
+### 4.2 — top_soc.sv: wiring PLIC and connecting peripherals
+
+Add WB signals:
+
+    wire [31:0] s9_adr_o, s9_dat_o, s9_dat_i;
+    wire        s9_we_o, s9_cyc_o, s9_stb_o;
+    wire [3:0]  s9_sel_o;
+    wire        s9_ack_i, s9_err_i;
+
+Add PLIC signals:
+
+    wire [16:1] plic_src_irq;
+    wire [3:0]  hart_mei;
+
+Connect peripheral IRQ outputs into plic_src_irq.
+
+Example mapping (you can adjust):
+
+    assign plic_src_irq[1]  = uart0_irq;   // UART0
+    assign plic_src_irq[2]  = i2c0_irq;    // I2C
+    assign plic_src_irq[3]  = spi0_irq;    // SPI
+    assign plic_src_irq[4]  = gpio_irq;    // GPIO edges
+    assign plic_src_irq[5]  = pwm_irq;     // PWM wrap
+    assign plic_src_irq[6]  = dma_irq;     // future DMA
+    assign plic_src_irq[7]  = 1'b0;
+    // ...
+    assign plic_src_irq[16] = 1'b0;
+
+(If your current cores don’t have an irq output yet, you can start by wiring 1–2 real ones and leave others tied to 0.)
+
+Instantiate PLIC:
+
+    plic_wb u_plic (
+        .clk       (clk),
+        .rst       (rst),
+
+        .wb_adr_i  (s9_adr_o),
+        .wb_dat_i  (s9_dat_o),
+        .wb_dat_o  (s9_dat_i),
+        .wb_we_i   (s9_we_o),
+        .wb_sel_i  (s9_sel_o),
+        .wb_cyc_i  (s9_cyc_o),
+        .wb_stb_i  (s9_stb_o),
+        .wb_ack_o  (s9_ack_i),
+        .wb_err_o  (s9_err_i),
+
+        .src_irq_i (plic_src_irq),
+        .hart_mei_o(hart_mei)
+    );
+
+Connect `hart_mei` to your Hazard3 tiles’ **machine external interrupt input**.
+
+If each tile has `irq_mei_i`:
+
+    .irq_mei_i(hart_mei[0])  // for hart0 tile
+    .irq_mei_i(hart_mei[1])  // for hart1 tile
+    ...
+
+If they have a generic interrupt input, you can OR:
+
+    assign hart_irq[0] = hart_mei[0]; // or | with other IRQ classes
+
+CLINT (MSIP/MTIMER) remains separate and goes to the appropriate CSR-based inputs.
+
+================================================================================
+STEP 5 — HAL EXTENSIONS (h3_soc.h / h3_soc.c)
+================================================================================
+
+Update: ~/hazard3_fw/app/h3_soc.h
+
+Add:
+
+#define H3_PLIC_BASE         0x10000800u
+
+/* Pending bits */
+#define H3_PLIC_PENDING_LO   (*(volatile uint32_t *)(H3_PLIC_BASE + 0x000))
+#define H3_PLIC_PENDING_HI   (*(volatile uint32_t *)(H3_PLIC_BASE + 0x004))
+
+/* Enable registers per hart h (0..3) */
+#define H3_PLIC_HART_EN_LO(h) (*(volatile uint32_t *)(H3_PLIC_BASE + 0x010 + 0x10u*(h)))
+#define H3_PLIC_HART_EN_HI(h) (*(volatile uint32_t *)(H3_PLIC_BASE + 0x014 + 0x10u*(h)))
+
+/* Claim/complete per hart h */
+#define H3_PLIC_HART_CLAIM(h) (*(volatile uint32_t *)(H3_PLIC_BASE + 0x080 + 0x10u*(h)))
+
+/* Simple helper APIs */
+
+void     h3_plic_enable_irq(uint32_t hartid, uint32_t irq_id, int enable);
+uint32_t h3_plic_claim(uint32_t hartid);
+void     h3_plic_complete(uint32_t hartid, uint32_t irq_id);
+
+Implement in ~/hazard3_fw/app/h3_soc.c:
+
+void h3_plic_enable_irq(uint32_t hartid, uint32_t irq_id, int enable)
+{
+    if (hartid >= 4 || irq_id == 0 || irq_id > 16) return;
+
+    uint32_t mask = 1u << irq_id;
+    uint32_t v = H3_PLIC_HART_EN_LO(hartid);
+    if (enable)
+        v |= mask;
+    else
+        v &= ~mask;
+    H3_PLIC_HART_EN_LO(hartid) = v;
+}
+
+uint32_t h3_plic_claim(uint32_t hartid)
+{
+    if (hartid >= 4) return 0;
+    return H3_PLIC_HART_CLAIM(hartid);
+}
+
+void h3_plic_complete(uint32_t hartid, uint32_t irq_id)
+{
+    if (hartid >= 4 || irq_id == 0 || irq_id > 16) return;
+    H3_PLIC_HART_CLAIM(hartid) = irq_id;
+}
+
+================================================================================
+STEP 6 — FIRMWARE USAGE EXAMPLE (UART RX INTERRUPT ON HART0)
+================================================================================
+
+As a minimal demo, let’s make **HART0** handle UART RX via PLIC.
+
+Concept:
+
+- UART0 asserts `irq_uart0` when RX FIFO has data (you may need to expose this from your UART wrapper).
+- PLIC sees it as source ID 1.
+- HART0 has:
+  - `mie.MEIE = 1` (machine external interrupt enable).
+  - `mstatus.MIE = 1`.
+- On interrupt:
+  - Firmware reads `H3_PLIC_HART_CLAIM(0)` → gets ID 1.
+  - Reads a byte from UART, prints it back.
+  - Writes `1` to `H3_PLIC_HART_CLAIM(0)` to complete.
+
+You’ll need a small machine-external interrupt handler in your trap/ISR code.
+
+Example trap handler sketch (in your common ISRs file):
+
+static inline uint32_t h3_read_mcause(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mcause" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+void trap_handler(void)
+{
+    uint32_t mcause = h3_read_mcause();
+    uint32_t hartid = h3_read_mhartid();
+
+    if ((mcause & 0x80000000u) && ((mcause & 0x7FFFFFFFu) == 11u)) {
+        // Machine external interrupt
+        uint32_t id = h3_plic_claim(hartid);
+
+        if (id == 1u) {
+            // UART0 IRQ
+            char c;
+            if (h3_uart_getc_nonblock(&c)) {
+                h3_con_putc(c); // echo
+            }
+        }
+
+        // Complete interrupt
+        if (id != 0)
+            h3_plic_complete(hartid, id);
+    } else {
+        // Other traps: you can add handler for timer/software/etc.
+    }
+}
+
+You’ll also need startup code to enable MEI:
+
+static inline void h3_enable_mei(void)
+{
+    uint32_t mstatus, mie;
+    __asm__ volatile ("csrr %0, mstatus" : "=r"(mstatus));
+    __asm__ volatile ("csrr %0, mie"     : "=r"(mie));
+
+    mstatus |= (1u << 3);   // MIE
+    mie     |= (1u << 11);  // MEIE
+
+    __asm__ volatile ("csrw mstatus, %0" :: "r"(mstatus));
+    __asm__ volatile ("csrw mie, %0"     :: "r"(mie));
+}
+
+In your hart0_main() (or global init):
+
+    uint32_t hartid = h3_read_mhartid();
+    if (hartid == 0) {
+        // Enable UART0 IRQ (ID 1) on HART0
+        h3_plic_enable_irq(0, 1, 1);
+        h3_enable_mei();
+        h3_con_puts("HART0: PLIC + UART IRQ enabled\n");
+    }
+
+Then run in WFI loop; typing over UART should generate interrupts that echo characters.
+
+================================================================================
+STEP 7 — QUARTUS FLOW (SRAM-ONLY)
+================================================================================
+
+1. Add `plic_wb.sv` to your Quartus project.
+2. Update `wb_interconnect.sv`:
+   - Add s9_* signals.
+   - Decode 0x1000_0800.
+3. Update `top_soc.sv`:
+   - Add plic_src_irq wiring from peripherals.
+   - Connect hart_mei to each Hazard3 tile.
+4. Update `h3_soc.h` / `h3_soc.c` with PLIC macros/APIs.
+5. Add/modify your trap handler to handle MEI via PLIC.
+6. Rebuild, program `.sof` to SRAM via JTAG.
+7. Load firmware via H3BT as usual.
+
+================================================================================
+WHAT PHASE 3A GIVES YOU
+================================================================================
+
+- A **proper external interrupt controller** for your 4-hart Hazard3 SoC.
+- Ability for peripherals (UART/I2C/SPI/GPIO/PWM/DMA) to generate interrupts.
+- A clean path to:
+  - Event-driven firmware.
+  - Low-power WFI loops.
+  - RTOS / SMP scheduling (Phase 3C).
+  - DMA completion handling (Phase 3B).
