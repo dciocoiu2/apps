@@ -4249,4 +4249,518 @@ Next steps (Phase 1I onward) are where it gets really interesting:
 - 1J: HAL (C) for all these peripherals.
 - 1K: SDRAM-resident user firmware, then multi-core.
 ########END PHASE 1H########
+================================================================================
+PHASE 1I: BOOTLOADER IN ROM (UART0 + JTAG-UART → SDRAM @ 0x8000_0000)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1I
+----------------
+Transform the current ROM stub (Phase 1H) into a **real bootloader** that:
+
+- Lives entirely in Boot ROM at 0x2000_0000.
+- Uses **either**:
+  - UART0 (0x1000_0000), or
+  - JTAG-UART (0x1000_0500)
+  as a host link.
+- Receives a firmware image (raw binary) from the host.
+- Writes it into SDRAM starting at 0x8000_0000.
+- Jumps to 0x8000_0000 to execute the loaded firmware.
+
+Still:
+- FPGA config is **ephemeral**: only `.sof` via JTAG → SRAM.
+- Power-cycle returns to factory demo image in flash.
+
+We’ll define:
+
+1. A simple “Hazard3 Boot Transfer” protocol (H3BT).
+2. A new `bootrom.c` implementing:
+   - Low-level UART0 + JTAG-UART I/O.
+   - H3BT receive logic.
+   - SDRAM check + memory write.
+   - Jump to firmware entry.
+3. A minimal host-side expectation (what you send over serial/JTAG-UART).
+4. Keep all hardware unchanged from Phase 1H.
+
+================================================================================
+H3BT PROTOCOL (HOST ↔ BOOTLOADER)
+================================================================================
+
+We define a **very simple binary protocol**, little-endian, over UART0 or JTAG-UART.
+
+All values are 32-bit, little-endian.
+
+1. Host sends 4-byte magic:
+   - "H3BT" = 0x48 0x33 0x42 0x54
+
+2. Host sends 4-byte load address:
+   - For now, always 0x80000000 (SDRAM base).
+   - Bootloader checks that it is in SDRAM range.
+
+3. Host sends 4-byte length:
+   - Number of data bytes to follow.
+
+4. Host sends 4-byte checksum:
+   - Sum of all data bytes modulo 2^32 (simple additive checksum).
+
+5. Host sends `length` data bytes:
+   - Raw firmware image (e.g., your main program).
+
+Bootloader behavior:
+
+- Wait for magic.
+- Read address, length, checksum.
+- Receive data into SDRAM, computing sum in parallel.
+- Compare checksums.
+- If OK:
+  - Print success on UART0 + JTAG-UART.
+  - Jump to given address (assume RV32I code).
+- If fail:
+  - Print error, stay in bootloader loop.
+
+================================================================================
+STEP 1 — NEW BOOT ROM CODE: bootrom.c (BOOTLOADER)
+================================================================================
+
+We replace the old ROM test code with the new bootloader implementation.
+
+Memory map (from previous phases):
+
+- ROM:          0x2000_0000 (bootloader lives here; execute-only).
+- SRAM/SDRAM:   0x8000_0000 (firmware load target).
+- UART0:        0x1000_0000.
+- I2C0:         0x1000_0100.
+- SPI0:         0x1000_0200.
+- GPIO:         0x1000_0300.
+- JTAG-UART:    0x1000_0500.
+
+----- UPDATED FILE: ~/hazard3_fw/bootrom/bootrom.c ----------------------------
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+#define UART_RBR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_THR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_IER     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_FCR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_LCR     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_MCR     (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_LSR     (*(volatile uint32_t *)(UART0_BASE + 0x14))
+
+#define UART_LSR_DR   (1u << 0)
+#define UART_LSR_THRE (1u << 5)
+
+#define JU_BASE       0x10000500u
+#define JU_DATA       (*(volatile uint32_t *)(JU_BASE + 0x00))
+#define JU_CTRL       (*(volatile uint32_t *)(JU_BASE + 0x04))
+
+#define SDRAM_BASE    0x80000000u
+
+// H3BT protocol constants
+#define H3BT_MAGIC_0  0x48u  // 'H'
+#define H3BT_MAGIC_1  0x33u  // '3'
+#define H3BT_MAGIC_2  0x42u  // 'B'
+#define H3BT_MAGIC_3  0x54u  // 'T'
+
+// UART0 helpers
+static void uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+    UART_LCR = 0x80u;
+    UART_THR = (divisor & 0xFFu);
+    UART_IER = ((divisor >> 8) & 0xFFu);
+    UART_LCR = 0x03u;
+    UART_FCR = 0x07u;
+    UART_MCR = 0x08u;
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_LSR & UART_LSR_THRE)) { }
+    UART_THR = (uint8_t)c;
+}
+
+static int uart_getc_nonblock(char *out)
+{
+    if (UART_LSR & UART_LSR_DR) {
+        *out = (char)(UART_RBR & 0xFFu);
+        return 1;
+    }
+    return 0;
+}
+
+static char uart_getc_blocking(void)
+{
+    char c;
+    while (!uart_getc_nonblock(&c)) { }
+    return c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+// JTAG-UART helpers
+static int ju_tx_space(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl & 0xFFFFu);
+}
+
+static int ju_rx_count(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl >> 16);
+}
+
+static void ju_putc(char c)
+{
+    while (ju_tx_space() == 0) { }
+    JU_DATA = (uint32_t)(uint8_t)c;
+}
+
+static int ju_getc_nonblock(char *out)
+{
+    if (ju_rx_count() > 0) {
+        uint32_t v = JU_DATA;
+        *out = (char)(v & 0xFFu);
+        return 1;
+    }
+    return 0;
+}
+
+static char ju_getc_blocking(void)
+{
+    char c;
+    while (!ju_getc_nonblock(&c)) { }
+    return c;
+}
+
+static void ju_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') ju_putc('\r');
+        ju_putc(*s++);
+    }
+}
+
+// Combined console abstraction: we allow host to choose UART0 or JTAG-UART.
+typedef enum {
+    CONSOLE_UART = 0,
+    CONSOLE_JTAG = 1
+} console_t;
+
+static console_t active_console = CONSOLE_UART;
+
+static void con_putc(char c)
+{
+    if (active_console == CONSOLE_UART) uart_putc(c);
+    else                                ju_putc(c);
+}
+
+static char con_getc_blocking(void)
+{
+    if (active_console == CONSOLE_UART) return uart_getc_blocking();
+    else                                return ju_getc_blocking();
+}
+
+static void con_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') con_putc('\r');
+        con_putc(*s++);
+    }
+}
+
+// Utility: read 32-bit little-endian from console
+static uint32_t con_read_u32(void)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        uint8_t b = (uint8_t)con_getc_blocking();
+        v |= ((uint32_t)b) << (8u * i);
+    }
+    return v;
+}
+
+// Bootloader: receive firmware via active console using H3BT
+static void bootloader_loop(void)
+{
+    for (;;) {
+        con_puts("\n[H3BT] Waiting for magic H3BT...\n");
+
+        // Detect magic sequence
+        char m0 = con_getc_blocking();
+        char m1 = con_getc_blocking();
+        char m2 = con_getc_blocking();
+        char m3 = con_getc_blocking();
+
+        if ((uint8_t)m0 != H3BT_MAGIC_0 ||
+            (uint8_t)m1 != H3BT_MAGIC_1 ||
+            (uint8_t)m2 != H3BT_MAGIC_2 ||
+            (uint8_t)m3 != H3BT_MAGIC_3) {
+            con_puts("[H3BT] Invalid magic, ignoring.\n");
+            continue;
+        }
+
+        con_puts("[H3BT] Magic OK.\n");
+
+        uint32_t load_addr = con_read_u32();
+        uint32_t length    = con_read_u32();
+        uint32_t checksum  = con_read_u32();
+
+        con_puts("[H3BT] Header: addr=0x");
+        // small inline hex print, just 8 chars
+        const char hex[] = "0123456789ABCDEF";
+        for (int i = 7; i >= 0; i--) {
+            con_putc(hex[(load_addr >> (4 * i)) & 0xF]);
+        }
+        con_puts(", len=0x");
+        for (int i = 7; i >= 0; i--) {
+            con_putc(hex[(length >> (4 * i)) & 0xF]);
+        }
+        con_puts("\n");
+
+        // Basic sanity: must be in SDRAM and within some max
+        if (load_addr < SDRAM_BASE) {
+            con_puts("[H3BT] ERROR: load_addr below SDRAM base.\n");
+            continue;
+        }
+        if (length == 0 || length > (16u * 1024u * 1024u)) {
+            con_puts("[H3BT] ERROR: suspicious length.\n");
+            continue;
+        }
+
+        con_puts("[H3BT] Receiving data...\n");
+
+        uint8_t *dst = (uint8_t *)load_addr;
+        uint32_t sum = 0;
+
+        for (uint32_t i = 0; i < length; i++) {
+            uint8_t b = (uint8_t)con_getc_blocking();
+            dst[i] = b;
+            sum += (uint32_t)b;
+        }
+
+        con_puts("[H3BT] Data received. Verifying checksum...\n");
+
+        if (sum != checksum) {
+            con_puts("[H3BT] ERROR: checksum mismatch.\n");
+            continue;
+        }
+
+        con_puts("[H3BT] Checksum OK. Jumping to firmware.\n");
+
+        // Jump to loaded code
+        void (*entry)(void) = (void (*)(void))load_addr;
+        entry();
+
+        // If firmware returns, loop again.
+        con_puts("[H3BT] WARNING: firmware returned, back to bootloader.\n");
+    }
+}
+
+// Choose console: check if JTAG-UART is present / used by host.
+//
+// Simple heuristic: wait briefly; if JTAG-UART receives 'J' as the
+// first char, use JTAG; otherwise default to UART.
+static void select_console(void)
+{
+    active_console = CONSOLE_UART; // default
+
+    // Small window to see if JTAG terminal sends a 'J' greeting, etc.
+    for (volatile uint32_t i = 0; i < 2000000u; i++) {
+        char c;
+        if (ju_getc_nonblock(&c)) {
+            // any char from JTAG → prefer JTAG
+            active_console = CONSOLE_JTAG;
+            break;
+        }
+    }
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    uart_init(SYS_CLK_HZ, 115200u);
+
+    select_console();
+
+    con_puts("\nHazard3 Phase 1I Bootloader (H3BT)\n");
+    con_puts("Console: ");
+    if (active_console == CONSOLE_UART)
+        con_puts("UART0\n");
+    else
+        con_puts("JTAG-UART\n");
+
+    con_puts("Protocol: magic 'H3BT', addr, len, checksum, data.\n");
+    con_puts("Ready.\n");
+
+    bootloader_loop();
+}
+
+================================================================================
+STEP 2 — LINKER & MAKEFILE (UNCHANGED OR MINOR)
+================================================================================
+
+Your existing `linker.ld` for the ROM is already valid:
+
+- ORIGIN = 0x20000000
+- LENGTH = 16K
+- Entry = _start
+
+You can reuse it as-is. The Makefile from Phase 1A/1D is also valid.
+
+Ensure it still looks roughly like:
+
+----- FILE: ~/hazard3_fw/bootrom/linker.ld (for reference) ---------------------
+
+ENTRY(_start)
+
+MEMORY
+{
+  ROM (rx) : ORIGIN = 0x20000000, LENGTH = 16K
+}
+
+SECTIONS
+{
+  .text :
+  {
+    *(.text.entry)
+    *(.text*)
+    *(.rodata*)
+  } > ROM
+
+  .data :
+  {
+    *(.data*)
+  } > ROM
+
+  .bss :
+  {
+    *(.bss*)
+    *(COMMON)
+  } > ROM
+}
+
+----- FILE: ~/hazard3_fw/bootrom/Makefile (for reference) ----------------------
+
+RISCV_PREFIX = riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJCOPY = $(RISCV_PREFIX)objcopy
+
+CFLAGS  = -march=rv32imc -mabi=ilp32 -Os -nostdlib -ffreestanding -Wall -Wextra
+LDFLAGS = -T linker.ld -nostartfiles -nostdlib
+
+all: bootrom.hex
+
+bootrom.elf: bootrom.c linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ bootrom.c
+
+bootrom.hex: bootrom.elf
+	$(OBJCOPY) -O verilog $< $@
+
+clean:
+	rm -f bootrom.elf bootrom.hex
+
+Rebuild ROM:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+Copy/make sure `bootrom.hex` is in the path referenced by `boot_rom.sv`.
+
+================================================================================
+STEP 3 — HARDWARE (RTL) CHANGES
+================================================================================
+
+None required beyond what you already have up to Phase 1H.
+
+- Hazard3 tile, AHB interconnect, Boot ROM, SDRAM, UART0, I2C, SPI, GPIO,
+  JTAG-UART are already integrated.
+- `boot_rom.sv` still reads `bootrom.hex` and serves AHB reads from ROM.
+
+You only need to:
+
+- Ensure `boot_rom.sv` points to the updated `bootrom.hex`.
+- Recompile the Quartus project.
+
+================================================================================
+STEP 4 — QUARTUS: BUILD & PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Ensure RTL / IP unchanged from Phase 1H.
+2. Update ROM contents:
+   - Make sure the new `bootrom.hex` is in the correct directory.
+3. Compile:
+   - Processing → Start Compilation.
+4. Program:
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - Mode: JTAG.
+     - File: h3_phase1_sc.sof.
+     - Check only “Program/Configure”.
+     - START.
+   - Never generate/program `.pof`. Flash remains untouched.
+   - Power-cycle → factory demo returns.
+
+================================================================================
+STEP 5 — HOST-SIDE: USING H3BT TO LOAD FIRMWARE
+================================================================================
+
+You now have a ROM-resident bootloader. To load firmware:
+
+1. Build your firmware ELF for SDRAM start (e.g., `0x80000000`):
+   - Separate project with its own linker script mapping `.text` to 0x80000000.
+
+2. Convert firmware to a raw binary:
+   - `riscv64-unknown-elf-objcopy -O binary firmware.elf firmware.bin`
+
+3. Compute checksum:
+   - Sum of all bytes modulo 2^32.
+
+4. Send H3BT stream over chosen console:
+
+   For UART0:
+   - Open serial at 115200 8N1.
+   - Send:
+     - "H3BT"
+     - 4 bytes: 0x00 0x00 0x00 0x80 (0x80000000 LE)
+     - 4 bytes: `<length in bytes, LE>`
+     - 4 bytes: `<checksum, LE>`
+     - `length` bytes of firmware.bin
+
+   For JTAG-UART:
+   - Use a small helper program using `nios2-terminal` pipe or a custom JTAG-UART host if available.
+   - The byte stream is identical.
+
+5. Bootloader:
+   - Receives magic + header.
+   - Loads firmware into SDRAM.
+   - Jumps to 0x80000000.
+   - Your firmware now runs on the same SoC.
+
+================================================================================
+WHAT PHASE 1I GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A real, ROM-resident bootloader:
+  - No more fixed demo code; you can load arbitrary firmware into SDRAM.
+  - Dual-path input: UART0 or JTAG-UART, chosen automatically.
+- Clean separation:
+  - ROM = stable bootloader.
+  - SDRAM = loadable, replaceable firmware.
+- Fully compatible with:
+  - Later HAL (Phase 1J) and user firmware (Phase 1K).
+  - Future multi-core: other harts can be started by firmware after boot.
+
+#######END PHASE1I########
+
+
 
