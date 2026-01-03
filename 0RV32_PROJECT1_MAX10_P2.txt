@@ -1031,3 +1031,449 @@ You now have:
   - Stay fully ephemeral and reproducible.
 
 ########END P2C########
+================================================================================
+PHASE 2D: MULTI-HART HAL + EXAMPLE FIRMWARE (HART0–HART3 WITH ROLES)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Turn your now multi-hart, mailbox+CLINT-equipped Hazard3 SoC into a **usable
+multi-core platform** by:
+
+- Extending the HAL to be **hart-aware** (mhartid, CLINT, mailbox).
+- Defining a simple **role model** per hart:
+  - HART0: system/init + console + coordinator
+  - HART1: periodic timer job
+  - HART2: GPIO blinker
+  - HART3: SPI/I2C worker (placeholder)
+- Providing a single SDRAM firmware `main.c` that:
+  - Boots on HART0 (after H3BT+ROM).
+  - Starts HART1–HART3 via mailbox.
+  - Uses CLINT timers + MSIP for basic coordination.
+
+Everything remains:
+
+- Ephemeral: `.sof` in SRAM only.
+- ROM bootloader unchanged (except earlier phases).
+- SDRAM firmware replaceable via H3BT.
+
+================================================================================
+ASSUMED STATE (FROM PREVIOUS PHASES)
+================================================================================
+
+You already have:
+
+- 4 Hazard3 harts (0..3) on AHB M0..M3.
+- Boot ROM:
+  - HART0 runs bootloader (H3BT → SDRAM @ 0x8000_0000).
+  - HART1–3 park in ROM WFI, watching mailbox GO+START_ADDR.
+- Wishbone peripherals:
+  - SDRAM (s0), UART0, I2C, SPI, GPIO, JTAG-UART.
+  - Mailbox @ 0x1000_0400.
+  - CLINT-lite @ 0x1000_0600 (MSIP + MTIME + MTIMECMP).
+- SDRAM firmware template (Phase 1K) + HAL (Phase 1J).
+
+Phase 2D is **purely firmware/HAL**; RTL is assumed ready from 2A–2C.
+
+================================================================================
+STEP 1 — EXTEND HAL FOR MULTI-HART + CLINT + MAILBOX
+================================================================================
+
+File: ~/hazard3_fw/app/h3_soc.h
+
+We add:
+
+- mhartid read helper.
+- CLINT register macros.
+- Mailbox macros.
+- Small helper functions.
+
+Only the **new / updated parts** are shown here; keep all old HAL content too.
+
+----- PATCH / REPLACEMENT: h3_soc.h (add near top) ----------------------------
+
+#ifndef H3_SOC_H
+#define H3_SOC_H
+
+#include <stdint.h>
+
+/* ============================================================================
+ * Core CSRs / helpers
+ * ============================================================================
+ */
+static inline uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t h3_read_mcycle(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mcycle" : "=r"(v));
+    return v;
+}
+
+/* existing memory map... */
+#define H3_SDRAM_BASE       0x80000000u
+#define H3_UART0_BASE       0x10000000u
+#define H3_I2C0_BASE        0x10000100u
+#define H3_SPI0_BASE        0x10000200u
+#define H3_GPIO_BASE        0x10000300u
+#define H3_MBOX_BASE        0x10000400u
+#define H3_JTAG_UART_BASE   0x10000500u
+#define H3_CLINT_BASE       0x10000600u
+
+/* ============================================================================
+ * CLINT-lite (MSIP + MTIME + MTIMECMP)
+ * ============================================================================
+ */
+
+#define H3_CLINT_MTIME_LO     (*(volatile uint32_t *)(H3_CLINT_BASE + 0x00))
+#define H3_CLINT_MTIME_HI     (*(volatile uint32_t *)(H3_CLINT_BASE + 0x04))
+
+#define H3_CLINT_MSIP(h)      (*(volatile uint32_t *)(H3_CLINT_BASE + 0x10 + 4u*(h)))
+
+#define H3_CLINT_MTIMECMP_LO(h) (*(volatile uint32_t *)(H3_CLINT_BASE + 0x30 + 8u*(h)))
+#define H3_CLINT_MTIMECMP_HI(h) (*(volatile uint32_t *)(H3_CLINT_BASE + 0x34 + 8u*(h)))
+
+static inline uint64_t h3_clint_mtime_read(void)
+{
+    uint32_t hi1, lo, hi2;
+    do {
+        hi1 = H3_CLINT_MTIME_HI;
+        lo  = H3_CLINT_MTIME_LO;
+        hi2 = H3_CLINT_MTIME_HI;
+    } while (hi1 != hi2);
+    return ((uint64_t)hi2 << 32) | lo;
+}
+
+static inline void h3_clint_set_msip(uint32_t hartid, int on)
+{
+    H3_CLINT_MSIP(hartid) = on ? 1u : 0u;
+}
+
+static inline void h3_clint_set_mtimecmp(uint32_t hartid, uint64_t t)
+{
+    H3_CLINT_MTIMECMP_LO(hartid) = (uint32_t)(t & 0xFFFFFFFFu);
+    H3_CLINT_MTIMECMP_HI(hartid) = (uint32_t)(t >> 32);
+}
+
+/* ============================================================================
+ * Mailbox (from Phase 2B)
+ * ============================================================================
+ */
+
+#define H3_MBOX_STRIDE    0x10u
+#define H3_MBOX_CMD_GO    (1u << 0)
+#define H3_MBOX_CMD_CLEAR (1u << 1)
+
+static inline volatile uint32_t *H3_MBOX_START(uint32_t h)
+{
+    return (volatile uint32_t *)(H3_MBOX_BASE + H3_MBOX_STRIDE*h + 0x00u);
+}
+
+static inline volatile uint32_t *H3_MBOX_CMD(uint32_t h)
+{
+    return (volatile uint32_t *)(H3_MBOX_BASE + H3_MBOX_STRIDE*h + 0x04u);
+}
+
+/* ============================================================================
+ * existing UART/I2C/SPI/GPIO/JTAG UART typedefs and APIs from Phase 1J...
+ * ============================================================================
+ */
+
+/* existing h3_console_t, h3_status_t, and prototypes remain */
+
+#endif /* H3_SOC_H */
+
+================================================================================
+STEP 2 — MULTI-HART EXAMPLE FIRMWARE (ROLES PER HART)
+================================================================================
+
+We’ll implement:
+
+- A **single binary** that runs on all harts.
+- Behavior depends on `hartid`:
+
+  - HART0:
+    - Initializes console, I2C, SPI, GPIO.
+    - Prints banner.
+    - Starts HART1–3 via mailbox at same entry (0x80000000).
+    - Sets up a periodic timer on itself via CLINT.
+    - Loops, occasionally poking others with MSIP.
+
+  - HART1:
+    - Uses CLINT timer for a periodic message.
+
+  - HART2:
+    - Blinks GPIO LED using delays.
+
+  - HART3:
+    - Placeholder; prints a heartbeat.
+
+File: ~/hazard3_fw/app/main.c
+
+(Replace your previous main.c with this.)
+
+----- FILE: main.c ------------------------------------------------------------
+
+#include "h3_soc.h"
+
+/* Simple console selection as before: prefer JTAG if activity, else UART. */
+static void select_console_startup(void)
+{
+    h3_console_select(H3_CONSOLE_UART);
+    for (volatile uint32_t i = 0; i < 2000000u; i++) {
+        char c;
+        if (h3_ju_getc_nonblock(&c)) {
+            (void)c;
+            h3_console_select(H3_CONSOLE_JTAG);
+            break;
+        }
+    }
+}
+
+static void hart0_main(void);
+static void hart1_main(void);
+static void hart2_main(void);
+static void hart3_main(void);
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    /* All harts: init UART so console is usable if needed. */
+    h3_uart_init(SYS_CLK_HZ, 115200u);
+
+    uint32_t hartid = h3_read_mhartid();
+
+    /* Only HART0 chooses console; others just use same selection. */
+    if (hartid == 0) {
+        select_console_startup();
+        h3_con_puts("\nHazard3 Multi-Hart Firmware (Phase 2D)\n");
+        h3_con_puts("HART0: system / coordinator\n");
+        h3_con_puts("HART1: timer worker\n");
+        h3_con_puts("HART2: GPIO blinker\n");
+        h3_con_puts("HART3: SPI/I2C placeholder worker\n");
+    }
+
+    switch (hartid) {
+        case 0: hart0_main(); break;
+        case 1: hart1_main(); break;
+        case 2: hart2_main(); break;
+        case 3: hart3_main(); break;
+        default:
+            while (1) { __asm__ volatile("wfi"); }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* HART0: coordinator                                                        */
+/* ------------------------------------------------------------------------- */
+
+static void start_other_harts(void)
+{
+    /* Start all other harts at the same entry (0x80000000). */
+    for (uint32_t h = 1; h < 4; h++) {
+        *H3_MBOX_START(h) = H3_SDRAM_BASE;  /* 0x80000000 */
+        *H3_MBOX_CMD(h)   = H3_MBOX_CMD_GO | H3_MBOX_CMD_CLEAR;
+    }
+}
+
+static void hart0_main(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    /* Use console selected in _start (only on hart0). */
+    h3_con_puts("HART0: initializing peripherals...\n");
+
+    if (h3_i2c_init(SYS_CLK_HZ, 100u) == H3_OK)
+        h3_con_puts("HART0: I2C init OK\n");
+    else
+        h3_con_puts("HART0: I2C init FAILED\n");
+
+    h3_spi_init(SYS_CLK_HZ, 4u);
+    h3_con_puts("HART0: SPI init OK\n");
+
+    /* GPIO LED on bit18 as before. */
+    uint32_t led_mask = (1u << 18);
+    h3_gpio_set_dir(led_mask, led_mask);
+
+    h3_con_puts("HART0: starting HART1–HART3 via mailbox...\n");
+    start_other_harts();
+
+    /* Set up periodic timer for HART0 using CLINT: every ~50M ticks (~1s). */
+    uint64_t now = h3_clint_mtime_read();
+    uint64_t period = 50000000ull;
+    h3_clint_set_mtimecmp(0, now + period);
+
+    while (1) {
+        /* Poll timer interrupt in software: check MTIME vs MTIMECMP. */
+        uint64_t t_now = h3_clint_mtime_read();
+        uint64_t cmp   = ((uint64_t)H3_CLINT_MTIMECMP_HI(0) << 32) |
+                         H3_CLINT_MTIMECMP_LO(0);
+        if (t_now >= cmp) {
+            /* "Timer event": log and toggle LED. */
+            h3_con_puts("HART0: timer tick, toggling LED\n");
+            static int led_on = 0;
+            led_on = !led_on;
+            h3_gpio_write(led_mask, led_on ? led_mask : 0u);
+
+            /* Also poke HART1 with software interrupt as a demo. */
+            h3_con_puts("HART0: raising MSIP for HART1\n");
+            h3_clint_set_msip(1, 1);
+
+            /* Schedule next event. */
+            h3_clint_set_mtimecmp(0, t_now + period);
+        }
+
+        __asm__ volatile("wfi");
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* HART1: timer worker                                                       */
+/* ------------------------------------------------------------------------- */
+
+static void hart1_main(void)
+{
+    /* HART1 will mostly react to MSIP/timer; here we just log periodically. */
+    /* For now, we don't configure interrupts; we just spin & check MSIP bit. */
+
+    h3_con_puts("HART1: started\n");
+
+    while (1) {
+        /* Simple MSIP polling. */
+        if (H3_CLINT_MSIP(1) & 1u) {
+            h3_con_puts("HART1: observed MSIP from HART0\n");
+            /* Clear MSIP. */
+            h3_clint_set_msip(1, 0);
+        }
+
+        /* Soft periodic log using mcycle. */
+        static uint32_t last = 0;
+        uint32_t now = h3_read_mcycle();
+        if ((now - last) > 50000000u) {
+            h3_con_puts("HART1: periodic heartbeat\n");
+            last = now;
+        }
+
+        __asm__ volatile("wfi");
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* HART2: GPIO blinker                                                       */
+/* ------------------------------------------------------------------------- */
+
+static void hart2_main(void)
+{
+    /* GPIO LED on bit18; HART0 already set direction, but we can ensure it. */
+    uint32_t led_mask = (1u << 18);
+    h3_gpio_set_dir(led_mask, led_mask);
+
+    h3_con_puts("HART2: GPIO blinker started\n");
+
+    int state = 0;
+    while (1) {
+        state = !state;
+        h3_gpio_write(led_mask, state ? led_mask : 0u);
+        h3_con_puts(state ? "HART2: LED ON\n" : "HART2: LED OFF\n");
+        h3_delay_cycles(5000000u);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* HART3: SPI/I2C placeholder worker                                         */
+/* ------------------------------------------------------------------------- */
+
+static void hart3_main(void)
+{
+    h3_con_puts("HART3: started (SPI/I2C worker placeholder)\n");
+
+    while (1) {
+        /* Example: just report that we're alive occasionally. */
+        static uint32_t last = 0;
+        uint32_t now = h3_read_mcycle();
+        if ((now - last) > 100000000u) {
+            h3_con_puts("HART3: alive\n");
+            last = now;
+        }
+        __asm__ volatile("wfi");
+    }
+}
+
+================================================================================
+STEP 3 — BUILD & LOAD (NO RTL CHANGES REQUIRED IN THIS PHASE)
+================================================================================
+
+1. Ensure h3_soc.h contains:
+   - mhartid helpers
+   - CLINT + mailbox macros (from Step 1)
+   - Existing HAL content from Phase 1J.
+
+2. Ensure h3_soc.c is unchanged from Phase 1J (UART/I2C/SPI/GPIO/JTAG-UART).
+
+3. Ensure linker_app.ld and Makefile from Phase 1K are still present.
+
+4. Build firmware:
+
+   cd ~/hazard3_fw/app
+   make
+
+   - Produces firmware.elf, firmware.bin, checksum.
+
+5. Load via H3BT:
+   - HART0 bootloader in ROM (Phase 1I) is unchanged.
+   - Send:
+     - "H3BT"
+     - addr = 0x80000000
+     - length = firmware.bin size
+     - checksum = sum of bytes
+     - payload = firmware.bin
+
+6. Boot sequence:
+   - HART0 in ROM:
+     - Receives firmware, writes to SDRAM.
+     - Jumps to 0x80000000 (this firmware).
+   - HART0 in SDRAM:
+     - Initializes peripherals.
+     - Starts HART1–3 via mailbox.
+     - Sets its own timer via CLINT.
+   - HART1–3 in ROM:
+     - See GO in mailbox.
+     - Jump into SDRAM `_start`.
+     - Each runs its own hartX_main().
+
+7. Observations:
+   - Console (UART0 or JTAG-UART) shows:
+     - Multi-hart banner.
+     - HARTx logs (start, heartbeat, LED toggles).
+   - LED bit18 blinks, influenced by both HART0 (timer tick) and HART2 (blinker).
+
+================================================================================
+WHAT PHASE 2D GIVES YOU
+================================================================================
+
+- A fully functioning **multi-hart Hazard3 environment**:
+  - Hardware: 4 harts, mailbox, CLINT, SDRAM, peripherals.
+  - Boot: ROM bootloader + H3BT into SDRAM.
+  - Software: HAL with multi-hart awareness, example firmware with per-hart roles.
+- All under your constraints:
+  - Ephemeral configuration.
+  - Open, reproducible, non-destructive.
+
+From here you can:
+
+- Replace the example hart roles with real workloads.
+- Add more sophisticated synchronization (locks, queues, message passing).
+- Introduce per-hart stacks, context switching, or even a tiny RTOS if you want.
+
+If you want to go further:
+-  define a lock-free queue between harts.
+- Sketch a tiny cooperative scheduler across HART1–3.
+- pivot to accelerators / PMOD integration on top of this multicore base.
