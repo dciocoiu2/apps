@@ -1467,4 +1467,4 @@ WHAT PHASE 2D GIVES YOU
   - Ephemeral configuration.
   - Open, reproducible, non-destructive.
 
-########END P2E########
+########END P2D########
