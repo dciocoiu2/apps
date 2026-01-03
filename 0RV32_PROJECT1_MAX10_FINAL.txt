@@ -1,0 +1,109 @@
+============================================================
+PHASE 1 — LINUX VM + QUARTUS LITE + RISC‑V TOOLCHAIN SETUP
+============================================================
+
+----------------------------------------
+1. Install VirtualBox on Windows
+----------------------------------------
+Download: https://www.virtualbox.org/wiki/Downloads
+Install “Windows hosts” package with defaults.
+
+----------------------------------------
+2. Download Ubuntu 22.04.5 LTS ISO
+----------------------------------------
+Download: https://ubuntu.com/download/desktop
+File: ubuntu-22.04.5-desktop-amd64.iso
+
+----------------------------------------
+3. Create VM in VirtualBox
+----------------------------------------
+Name: Ubuntu-Quartus
+Type: Linux
+Version: Ubuntu (64-bit)
+Memory: 8192 MB (or 4096 MB minimum)
+CPUs: 2+
+Disk: 80 GB VDI, dynamically allocated
+Attach ISO: Settings → Storage → Empty → Choose ISO
+
+----------------------------------------
+4. Install Ubuntu
+----------------------------------------
+Boot VM → Install Ubuntu
+Normal installation
+Install third-party software
+Erase disk (virtual disk only)
+Create user:
+  Name: quartususer
+  Username: quartususer
+  Password: your choice
+Finish installation → Reboot
+
+----------------------------------------
+5. Install VirtualBox Guest Additions
+----------------------------------------
+Inside Ubuntu:
+sudo apt update
+sudo apt install -y build-essential dkms linux-headers-$(uname -r)
+VirtualBox menu → Devices → Insert Guest Additions CD
+If not auto-run:
+cd /media/$USER/VBox_GAs_*/
+sudo ./VBoxLinuxAdditions.run
+sudo reboot
+
+----------------------------------------
+6. Install Quartus Prime Lite (Linux)
+----------------------------------------
+Download from Intel:
+https://www.intel.com/content/www/us/en/software-kit/795330/intel-quartus-prime-lite-edition-design-software-version.html
+Download Linux installer:
+QuartusLiteSetup-XX.Xstd.X.X-linux.run
+
+Make executable:
+cd ~/Downloads
+chmod +x QuartusLiteSetup-*-linux.run
+
+Run installer:
+./QuartusLiteSetup-*-linux.run
+Install Quartus Prime Lite + MAX 10 device support.
+
+----------------------------------------
+7. Install Quartus dependencies
+----------------------------------------
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  libx11-6 libxext6 libxft2 libxrender1 libxtst6 \
+  libgtk2.0-0 libncurses5 libtinfo5 libxau6 libxdmcp6 \
+  git curl wget unzip python3 python3-pip
+
+----------------------------------------
+8. Add Quartus to PATH
+----------------------------------------
+echo 'export PATH="$HOME/intelFPGA_lite/22.1std/quartus/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+----------------------------------------
+9. Install RISC‑V GCC Toolchain (RV32IM)
+----------------------------------------
+cd ~
+git clone https://github.com/riscv-collab/riscv-gnu-toolchain.git
+cd riscv-gnu-toolchain
+sudo apt install -y gawk bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev
+./configure --prefix=$HOME/riscv --with-arch=rv32im --with-abi=ilp32 --disable-linux
+make newlib -j$(nproc)
+
+Add to PATH:
+echo 'export PATH="$HOME/riscv/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+Verify:
+riscv32-unknown-elf-gcc -v
+
+----------------------------------------
+10. Install Python UART uploader dependencies
+----------------------------------------
+pip3 install pyserial
+
+============================================================
+END OF PHASE 1
+============================================================
