@@ -650,3 +650,384 @@ You now have:
 
 This is the minimal, clean, reproducible multi‑hart bring‑up mechanism.
 ########END P2B########
+================================================================================
+PHASE 2C: CLINT-LITE (MSIP + MTIME) FOR MULTI-HART HAZARD3
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Add a minimal **CLINT-like** block that provides:
+
+- **MSIP** (software interrupt) bits per hart:
+  - Used to wake harts from WFI and signal events.
+- **MTIME** (global cycle/tick counter).
+- **MTIMECMP[h]** (per-hart compare registers):
+  - When MTIME >= MTIMECMP[h], hart h gets a timer interrupt.
+
+We will:
+
+- Implement a simple CLINT-lite on Wishbone.
+- Map it at **0x1000_0600**.
+- Wire its interrupt outputs into each Hazard3 tile’s machine external/timer interrupt inputs (or reuse a generic IRQ input if that’s how your tile is configured).
+- Provide a minimal HAL-facing register map so firmware can:
+  - Trigger software interrupts.
+  - Program timers per hart.
+  - Use MSIP to wake harts instead of pure polling.
+
+Still:
+
+- No flash programming.
+- `.sof` only into FPGA SRAM.
+- Power-cycle → factory demo.
+
+================================================================================
+CLINT-LITE REGISTER MAP
+================================================================================
+
+Base address: **0x1000_0600**
+
+We’ll follow a simplified RISC-V CLINT style (but on Wishbone):
+
+- Global:
+
+  - 0x00: MTIME_LO   (RW, 32-bit)
+  - 0x04: MTIME_HI   (RW, 32-bit)
+
+- Per-hart (h = 0..3):
+
+  - MSIP[h]:
+    - 0x10 + 0x04 * h: MSIP[h] (RW, 32-bit; bit0 is msip)
+  - MTIMECMP[h]:
+    - 0x30 + 0x08 * h: MTIMECMP_LO[h] (RW, 32-bit)
+    - 0x34 + 0x08 * h: MTIMECMP_HI[h] (RW, 32-bit)
+
+Behavior:
+
+- MTIME: increments every clock tick (or every N clocks if you want prescale).
+- MSIP[h]:
+  - When bit0 = 1 → software interrupt pending for hart h.
+- MTIMECMP[h]:
+  - When MTIME >= MTIMECMP[h] → timer interrupt pending for hart h.
+
+We’ll provide two output vectors:
+
+- `msip_irq[0..3]`
+- `mtime_irq[0..3]`
+
+You can map these to Hazard3’s interrupt inputs (e.g., machine software interrupt, machine timer interrupt).
+
+================================================================================
+CLINT-LITE WISHBONE SLAVE RTL
+================================================================================
+
+File: rtl/soc/clint_wb.sv
+
+module clint_wb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // Outputs to harts
+    output wire [3:0]  msip_irq,
+    output wire [3:0]  mtime_irq
+);
+
+    assign wb_err_o = 1'b0;
+
+    // MTIME
+    reg [31:0] mtime_lo;
+    reg [31:0] mtime_hi;
+
+    // MSIP
+    reg [31:0] msip   [0:3];
+
+    // MTIMECMP
+    reg [31:0] mtimecmp_lo [0:3];
+    reg [31:0] mtimecmp_hi [0:3];
+
+    integer i;
+
+    // MTIME increment (simple, every clock)
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            mtime_lo <= 32'h0;
+            mtime_hi <= 32'h0;
+        end else begin
+            {mtime_hi, mtime_lo} <= {mtime_hi, mtime_lo} + 64'd1;
+        end
+    end
+
+    // Interrupt generation
+    genvar h;
+    generate
+        for (h = 0; h < 4; h = h + 1) begin : gen_irq
+            wire [63:0] now   = {mtime_hi, mtime_lo};
+            wire [63:0] cmp_h = {mtimecmp_hi[h], mtimecmp_lo[h]};
+
+            assign msip_irq[h]  = msip[h][0];
+            assign mtime_irq[h] = (now >= cmp_h);
+        end
+    endgenerate
+
+    // Wishbone access
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+            for (i = 0; i < 4; i = i + 1) begin
+                msip[i]        <= 32'h0;
+                mtimecmp_lo[i] <= 32'hFFFF_FFFF;
+                mtimecmp_hi[i] <= 32'hFFFF_FFFF;
+            end
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (wb_adr_i[7:2])
+                        // MTIME
+                        6'h00: mtime_lo <= wb_dat_i;
+                        6'h01: mtime_hi <= wb_dat_i;
+
+                        // MSIP[h]: 0x10 + 4*h
+                        6'h04: msip[0]  <= wb_dat_i;
+                        6'h05: msip[1]  <= wb_dat_i;
+                        6'h06: msip[2]  <= wb_dat_i;
+                        6'h07: msip[3]  <= wb_dat_i;
+
+                        // MTIMECMP[h]: 0x30 + 8*h
+                        6'h0C: mtimecmp_lo[0] <= wb_dat_i;
+                        6'h0D: mtimecmp_hi[0] <= wb_dat_i;
+                        6'h0E: mtimecmp_lo[1] <= wb_dat_i;
+                        6'h0F: mtimecmp_hi[1] <= wb_dat_i;
+                        6'h10: mtimecmp_lo[2] <= wb_dat_i;
+                        6'h11: mtimecmp_hi[2] <= wb_dat_i;
+                        6'h12: mtimecmp_lo[3] <= wb_dat_i;
+                        6'h13: mtimecmp_hi[3] <= wb_dat_i;
+
+                        default: ;
+                    endcase
+                end else begin
+                    case (wb_adr_i[7:2])
+                        // MTIME
+                        6'h00: wb_dat_o <= mtime_lo;
+                        6'h01: wb_dat_o <= mtime_hi;
+
+                        // MSIP[h]
+                        6'h04: wb_dat_o <= msip[0];
+                        6'h05: wb_dat_o <= msip[1];
+                        6'h06: wb_dat_o <= msip[2];
+                        6'h07: wb_dat_o <= msip[3];
+
+                        // MTIMECMP[h]
+                        6'h0C: wb_dat_o <= mtimecmp_lo[0];
+                        6'h0D: wb_dat_o <= mtimecmp_hi[0];
+                        6'h0E: wb_dat_o <= mtimecmp_lo[1];
+                        6'h0F: wb_dat_o <= mtimecmp_hi[1];
+                        6'h10: wb_dat_o <= mtimecmp_lo[2];
+                        6'h11: wb_dat_o <= mtimecmp_hi[2];
+                        6'h12: wb_dat_o <= mtimecmp_lo[3];
+                        6'h13: wb_dat_o <= mtimecmp_hi[3];
+
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+
+endmodule
+
+Notes:
+- `wb_adr_i[7:2]` gives a 4‑byte word index inside 0x1000_0600 region.
+- MTIMECMP defaults to max so no timer IRQ until firmware programs it.
+
+================================================================================
+WB INTERCONNECT + TOP_SOC INTEGRATION
+================================================================================
+
+We add CLINT as another Wishbone slave (say s7) decoded at:
+
+- 0x1000_0600 – 0x1000_06FF
+
+### 1. In wb_interconnect.sv
+
+- Add s7 ports.
+- Add decode:
+
+  sel_s7 = (m_adr_i[31:8] == 24'h100006);
+
+- Route s7_* in the muxes, same pattern as s0..s6.
+
+### 2. In top_soc.sv
+
+Add WB signals:
+
+wire [31:0] s7_adr_o, s7_dat_o, s7_dat_i;
+wire        s7_we_o, s7_cyc_o, s7_stb_o;
+wire [3:0]  s7_sel_o;
+wire        s7_ack_i, s7_err_i;
+
+Add CLINT outputs:
+
+wire [3:0] clint_msip_irq;
+wire [3:0] clint_mtime_irq;
+
+Instantiate CLINT:
+
+clint_wb u_clint (
+    .clk       (clk),
+    .rst       (rst),
+    .wb_adr_i  (s7_adr_o),
+    .wb_dat_i  (s7_dat_o),
+    .wb_dat_o  (s7_dat_i),
+    .wb_we_i   (s7_we_o),
+    .wb_sel_i  (s7_sel_o),
+    .wb_cyc_i  (s7_cyc_o),
+    .wb_stb_i  (s7_stb_o),
+    .wb_ack_o  (s7_ack_i),
+    .wb_err_o  (s7_err_i),
+    .msip_irq  (clint_msip_irq),
+    .mtime_irq (clint_mtime_irq)
+);
+
+================================================================================
+CONNECTING CLINT INTERRUPTS TO HAZARD3 TILES
+================================================================================
+
+This depends on your Hazard3 tile interface. Conceptually:
+
+- Each hart has inputs:
+  - `msip_i` (machine software interrupt)
+  - `mtip_i` (machine timer interrupt)
+
+If your `hazard3_tile` has such inputs, wire:
+
+- For HART0:
+
+  .msip_i(clint_msip_irq[0]),
+  .mtip_i(clint_mtime_irq[0]),
+
+- For HART1:
+
+  .msip_i(clint_msip_irq[1]),
+  .mtip_i(clint_mtime_irq[1]),
+
+- etc.
+
+If instead you have a generic IRQ input, you can OR msip + mtime:
+
+wire [3:0] hart_irq;
+assign hart_irq[0] = clint_msip_irq[0] | clint_mtime_irq[0];
+...
+
+and connect `.irq_i(hart_irq[0])` or similar.
+
+The key is: CLINT output -> Hart interrupt input.
+
+================================================================================
+FIRMWARE/HAL VIEW (IN SDRAM FIRMWARE)
+================================================================================
+
+We expose CLINT registers to software.
+
+In h3_soc.h:
+
+#define H3_CLINT_BASE      0x10000600u
+#define H3_CLINT_MTIME_LO  (*(volatile uint32_t *)(H3_CLINT_BASE + 0x00))
+#define H3_CLINT_MTIME_HI  (*(volatile uint32_t *)(H3_CLINT_BASE + 0x04))
+
+#define H3_CLINT_MSIP(h)   (*(volatile uint32_t *)(H3_CLINT_BASE + 0x10 + 4u*(h)))
+
+#define H3_CLINT_MTIMECMP_LO(h) (*(volatile uint32_t *)(H3_CLINT_BASE + 0x30 + 8u*(h)))
+#define H3_CLINT_MTIMECMP_HI(h) (*(volatile uint32_t *)(H3_CLINT_BASE + 0x34 + 8u*(h)))
+
+Simple helper functions:
+
+static inline void h3_clint_software_irq(uint32_t hartid, int enable)
+{
+    if (enable)
+        H3_CLINT_MSIP(hartid) = 1u;
+    else
+        H3_CLINT_MSIP(hartid) = 0u;
+}
+
+static inline void h3_clint_set_timer(uint32_t hartid, uint64_t tick)
+{
+    H3_CLINT_MTIMECMP_LO(hartid) = (uint32_t)(tick & 0xFFFFFFFFu);
+    H3_CLINT_MTIMECMP_HI(hartid) = (uint32_t)(tick >> 32);
+}
+
+================================================================================
+USAGE PATTERNS
+================================================================================
+
+1) Wake a hart from WFI via software interrupt:
+
+- From HART0:
+
+  h3_clint_software_irq(1, 1);  // set MSIP for hart1
+
+- In HART1 firmware:
+  - Enable machine software interrupt (mstatus, mie).
+  - WFI will wake when MSIP is set.
+  - ISR clears MSIP and continues.
+
+2) Periodic timer on a hart:
+
+- Get current MTIME:
+
+  uint64_t now = ((uint64_t)H3_CLINT_MTIME_HI << 32) | H3_CLINT_MTIME_LO;
+
+- Set MTIMECMP for hart h:
+
+  h3_clint_set_timer(h, now + delta);
+
+- When MTIME >= MTIMECMP[h], timer interrupt asserts.
+
+================================================================================
+QUARTUS + FLOW
+================================================================================
+
+1. Add clint_wb.sv to the project.
+2. Update wb_interconnect.sv with s7 decode at 0x1000_0600.
+3. Update top_soc.sv:
+   - Add s7_* wires.
+   - Instantiate u_clint.
+   - Connect interrupts to each hart.
+4. Optionally update HAL (`h3_soc.h`) with CLINT register macros and helpers.
+5. Rebuild bootrom only if you plan to use CLINT from ROM (not required yet).
+6. Recompile project, program .sof to SRAM over JTAG.
+7. Power-cycle → still factory demo by default.
+
+================================================================================
+RESULT OF PHASE 2C
+================================================================================
+
+You now have:
+
+- A multi-hart Hazard3 SoC with:
+  - Mailbox (Phase 2B) for explicit start addresses.
+  - CLINT-lite (Phase 2C) for:
+    - software interrupts (MSIP)
+    - per-hart timers (MTIMECMP + MTIME)
+- A real path to:
+  - Wake harts from WFI.
+  - Implement preemption, time slicing, or simple scheduling.
+  - Stay fully ephemeral and reproducible.
+
+########END P2C########
