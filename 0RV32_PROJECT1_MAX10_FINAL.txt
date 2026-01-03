@@ -4512,4 +4512,262 @@ You won’t yet send firmware (that’s Phase 9), but this confirms:
 END OF PHASE 8
 ============================================================
 
+============================================================
+PHASE 9 — HOST UART LOADER TOOL (SENDS app.bin TO BOOTLOADER)
+============================================================
+
+Goal:
+- Implement a **host-side tool** that:
+  - Connects to the DE10-Lite’s UART.
+  - Waits for the bootloader banner (optional but nice).
+  - Sends:
+    1) 4-byte little-endian length of the firmware (app.bin).
+    2) The raw app.bin bytes.
+  - Optionally prints bootloader responses (“OK”, “RX…”, “JMP”).
+- This completes the end-to-end flow:
+  - You JTAG-load the .sof (Phase 8).
+  - Bootloader (Phase 5) runs from Boot ROM.
+  - Host tool (Phase 9) sends app.bin (Phase 7).
+  - SoC executes app from Instruction SRAM.
+
+We’ll implement this in **Python 3** using `pyserial` (simple, portable).
+
+------------------------------------------------------------
+1. Install host dependencies
+------------------------------------------------------------
+
+On your development machine (can be same Linux VM or your host OS):
+
+1) Install Python 3 (if not already installed).
+2) Install pyserial:
+
+   pip3 install pyserial
+
+3) Know the serial device name for DE10-Lite UART:
+   - On Linux: often `/dev/ttyUSB0` or `/dev/ttyACM0`.
+   - On Windows: `COM3`, `COM4`, etc.
+   - On macOS: `/dev/tty.usbserial-XXXX`.
+
+You’ll plug a USB-UART adapter to the Arduino-header pins you mapped as UART RX/TX in Phase 8.
+
+------------------------------------------------------------
+2. Python UART loader script: h3_uart_loader.py
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/tools/h3_uart_loader.py
+
+Create directory:
+
+  mkdir -p ~/h3_quad_de10lite/tools
+  cd ~/h3_quad_de10lite/tools
+
+Then create the script:
+
+----------------------------------------
+h3_uart_loader.py
+----------------------------------------
+#!/usr/bin/env python3
+import sys
+import struct
+import time
+import serial
+
+def wait_for_banner(ser, timeout=5.0):
+    """Wait for 'H3-BOOT' from the bootloader, or timeout."""
+    ser.timeout = 0.1
+    deadline = time.time() + timeout
+    buf = b""
+    target = b"H3-BOOT"
+    while time.time() < deadline:
+        chunk = ser.read(64)
+        if chunk:
+            buf += chunk
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+            if target in buf:
+                return True
+    return False
+
+def send_firmware(ser, firmware_path):
+    with open(firmware_path, "rb") as f:
+        data = f.read()
+
+    length = len(data)
+    print(f"\n[INFO] Firmware size: {length} bytes")
+
+    if length == 0:
+        print("[ERROR] Firmware file is empty.")
+        return False
+
+    if length > 64 * 1024:
+        print("[WARNING] Firmware is larger than 64KB; bootloader might reject it.")
+
+    length_bytes = struct.pack("<I", length)
+    ser.write(length_bytes)
+    ser.flush()
+    print("[INFO] Sent length header.")
+
+    time.sleep(0.1)
+
+    ser.write(data)
+    ser.flush()
+    print("[INFO] Sent firmware data.")
+
+    time.sleep(0.5)
+    leftover = ser.read(1024)
+    if leftover:
+        sys.stdout.buffer.write(leftover)
+        sys.stdout.flush()
+
+    return True
+
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: h3_uart_loader.py <serial_port> <baud> <firmware.bin>")
+        print("Example: h3_uart_loader.py /dev/ttyUSB0 115200 app.bin")
+        sys.exit(1)
+
+    port = sys.argv[1]
+    baud = int(sys.argv[2])
+    firmware_path = sys.argv[3]
+
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.5
+        )
+    except Exception as e:
+        print(f"[ERROR] Unable to open serial port {port}: {e}")
+        sys.exit(1)
+
+    print(f"[INFO] Opened {port} at {baud} baud.")
+    print("[INFO] Waiting for bootloader banner (H3-BOOT)...")
+
+    if not wait_for_banner(ser, timeout=5.0):
+        print("[WARNING] Did not see 'H3-BOOT' banner within timeout.")
+        print("[INFO] You may still try sending firmware, but check reset / connections.")
+    else:
+        print("\n[INFO] Bootloader banner detected.")
+
+    print("[INFO] Sending firmware...")
+    ok = send_firmware(ser, firmware_path)
+    if not ok:
+        print("[ERROR] Failed to send firmware.")
+        ser.close()
+        sys.exit(1)
+
+    print("[INFO] Firmware send complete.")
+    print("[INFO] If bootloader prints 'JMP', your app should now be running.")
+    ser.close()
+
+if __name__ == "__main__":
+    main()
+----------------------------------------
+
+Make it executable:
+
+  cd ~/h3_quad_de10lite/tools
+  chmod +x h3_uart_loader.py
+
+------------------------------------------------------------
+3. Wiring recap: UART between host and DE10-Lite
+------------------------------------------------------------
+
+From Phase 8:
+- `uart_tx` from SoC → Arduino header pin mapped to host RX.
+- `uart_rx` to SoC  → Arduino header pin mapped to host TX.
+- GND shared between DE10-Lite and USB-UART adapter.
+
+So, on your USB-UART adapter:
+- TX → Arduino pin for uart_rx.
+- RX → Arduino pin for uart_tx.
+- GND → DE10-Lite GND.
+
+Baud rate:
+- In Phase 5, bootloader configured UART with a particular divisor (DLL=1, etc.).
+- The effective baud depends on your UART clock, but we’re assuming ~115200 for now, matching `Serial_begin(115200)` later.
+- If you see gibberish, adjust baud rate accordingly.
+
+------------------------------------------------------------
+4. Full end-to-end usage
+------------------------------------------------------------
+
+1) Build the Boot ROM:
+
+   cd ~/h3_quad_de10lite/soc/sw/boot_rom
+   make
+
+   This produces boot_rom.hex.
+
+2) Build the HAL library:
+
+   cd ~/h3_quad_de10lite/soc/sw/arduino_api
+   make
+
+   This produces libarduino_api.a.
+
+3) Build the application firmware:
+
+   cd ~/h3_quad_de10lite/soc/sw/apps/blinky_serial
+   make
+
+   This produces app.bin.
+
+4) Ensure `boot_rom.hex` is symlinked/available in RTL dir:
+
+   cd ~/h3_quad_de10lite/soc/rtl
+   ln -sf ../sw/boot_rom/boot_rom.hex .
+
+5) In Quartus:
+   - Compile the project from Phase 8.
+   - Ensure h3_quad_mcu.sof is generated.
+
+6) Program the FPGA SRAM with .sof:
+
+   cd ~/h3_quad_de10lite/soc/quartus/output_files
+   quartus_pgm -m jtag -o "p;h3_quad_mcu.sof"
+
+7) Connect USB-UART to the Arduino UART pins on DE10-Lite.
+
+8) Run the loader:
+
+   cd ~/h3_quad_de10lite/tools
+   ./h3_uart_loader.py /dev/ttyUSB0 115200 ../soc/sw/apps/blinky_serial/app.bin
+
+   Adjust:
+   - `/dev/ttyUSB0` to your actual serial port.
+   - `115200` if needed.
+
+9) Observe on the serial terminal (or via the loader’s console output):
+
+   - Bootloader: “H3-BOOT”, “LEN?” (from Phase 5).
+   - Loader: sends length + firmware.
+   - Bootloader: “OK”, “RX...”, “JMP” (from Phase 5).
+   - Application: “H3 App: booted from Instr SRAM.” and “App alive...” messages, plus echo behavior.
+
+------------------------------------------------------------
+5. Ephemeral behavior confirmation
+------------------------------------------------------------
+
+To verify your hard requirement — **no persistent state**:
+
+1) Power-cycle the DE10-Lite.
+2) Observe:
+   - FPGA configuration is lost; SoC is gone.
+   - No Boot ROM, no firmware, no SoC behavior.
+3) Re-load .sof via JTAG.
+   - Bootloader returns.
+4) Re-run `h3_uart_loader.py` to send firmware.
+
+At no point is on-board flash programmed:
+- Only the **SRAM-based FPGA configuration** and BRAM-based ROM + SRAM-based firmware are used.
+- Power-cycle always restores a blank FPGA state, and nothing persists.
+
+============================================================
+END OF PHASE 9
+============================================================
 
