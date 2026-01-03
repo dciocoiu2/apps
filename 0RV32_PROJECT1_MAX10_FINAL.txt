@@ -336,3 +336,625 @@ If everything matches, you are ready for RTL integration.
 ============================================================
 END OF PHASE 2
 ============================================================
+============================================================
+PHASE 3 — HAZARD3 QUAD-CORE + AHB + MEMORIES (NO BOARD PINS)
+============================================================
+
+All files in this phase live under:
+  ~/h3_quad_de10lite/soc/rtl
+
+Assumptions from earlier phases:
+- Boot ROM:         0x0000_0000, 16 KB
+- Instruction SRAM: 0x0001_0000, 64 KB
+- Data SRAM:        0x1000_0000, 64 KB
+- APB window:       0x4000_0000+
+
+You must adapt Hazard3 core port names if they differ in the actual repo.
+The structure (signals, directions, widths) is what matters.
+
+----------------------------------------
+1. Hazard3 configuration header
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_config_quad.vh
+
+----------------------------------------
+h3_config_quad.vh
+----------------------------------------
+`ifndef H3_CONFIG_QUAD_VH
+`define H3_CONFIG_QUAD_VH
+
+`define H3_HAVE_M_EXTENSION          1
+`define H3_HAVE_A_EXTENSION          0
+`define H3_HAVE_C_EXTENSION          0
+`define H3_HAVE_ZICSR                1
+`define H3_HAVE_ZIFENCEI             0
+`define H3_HAVE_ZICNTR               1
+`define H3_HAVE_DEBUG                0
+
+`define H3_NUM_IRQS                  16
+
+`define H3_ICACHE_SIZE_WORDS         0
+`define H3_DCACHE_SIZE_WORDS         0
+
+`endif
+----------------------------------------
+
+----------------------------------------
+2. AHB-Lite arbiter (4 masters → 1 slave)
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_arbiter.v
+
+----------------------------------------
+h3_ahb_arbiter.v
+----------------------------------------
+module h3_ahb_arbiter #(
+    parameter NUM_MASTERS = 4
+) (
+    input  wire                        clk,
+    input  wire                        rst_n,
+
+    input  wire [NUM_MASTERS-1:0]      m_hsel,
+    input  wire [NUM_MASTERS-1:0]      m_hwrite,
+    input  wire [NUM_MASTERS*2-1:0]    m_htrans,
+    input  wire [NUM_MASTERS*3-1:0]    m_hsize,
+    input  wire [NUM_MASTERS*32-1:0]   m_haddr,
+    input  wire [NUM_MASTERS*32-1:0]   m_hwdata,
+    output reg  [NUM_MASTERS-1:0]      m_hready,
+    output reg  [NUM_MASTERS*32-1:0]   m_hrdata,
+    output reg  [NUM_MASTERS-1:0]      m_hresp,
+
+    output reg                         s_hsel,
+    output reg  [31:0]                 s_haddr,
+    output reg  [1:0]                  s_htrans,
+    output reg                         s_hwrite,
+    output reg  [2:0]                  s_hsize,
+    output reg  [31:0]                 s_hwdata,
+    input  wire                        s_hready,
+    input  wire [31:0]                 s_hrdata,
+    input  wire                        s_hresp
+);
+
+    reg [1:0] current;
+    integer i;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            current <= 2'd0;
+        else if (s_hready)
+            current <= current + 2'd1;
+    end
+
+    always @(*) begin
+        s_hsel   = 1'b0;
+        s_haddr  = 32'h0;
+        s_htrans = 2'b00;
+        s_hwrite = 1'b0;
+        s_hsize  = 3'b010;
+        s_hwdata = 32'h0;
+
+        for (i = 0; i < NUM_MASTERS; i = i + 1) begin
+            m_hready[i] = 1'b0;
+            m_hresp[i]  = 1'b0;
+        end
+        m_hrdata = {NUM_MASTERS{32'h0}};
+
+        s_hsel   = m_hsel[current];
+        s_hwrite = m_hwrite[current];
+        s_htrans = m_htrans[current*2 +: 2];
+        s_hsize  = m_hsize[current*3 +: 3];
+        s_haddr  = m_haddr[current*32 +: 32];
+        s_hwdata = m_hwdata[current*32 +: 32];
+
+        m_hready[current]         = s_hready;
+        m_hresp[current]          = s_hresp;
+        m_hrdata[current*32 +:32] = s_hrdata;
+    end
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+3. AHB-Lite Boot ROM (16 KB at 0x0000_0000)
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_boot_rom.v
+
+This expects a Verilog hex file named boot_rom.hex in the same directory.
+
+----------------------------------------
+h3_ahb_boot_rom.v
+----------------------------------------
+module h3_ahb_boot_rom #(
+    parameter ADDR_BASE = 32'h0000_0000,
+    parameter BYTES     = 16384
+) (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire        hsel,
+    input  wire [31:0] haddr,
+    input  wire [1:0]  htrans,
+    input  wire        hwrite,
+    input  wire [2:0]  hsize,
+    input  wire [31:0] hwdata,
+    output reg         hready,
+    output reg  [31:0] hrdata,
+    output reg         hresp
+);
+
+    localparam WORDS = BYTES / 4;
+    reg [31:0] mem [0:WORDS-1];
+
+    initial begin
+        $readmemh("boot_rom.hex", mem);
+    end
+
+    wire access = hsel && htrans[1];
+    wire [31:0] addr_off   = haddr - ADDR_BASE;
+    wire [31:0] word_index = addr_off[17:2];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+            hrdata <= 32'h0;
+        end else begin
+            if (access && !hwrite) begin
+                if (word_index < WORDS)
+                    hrdata <= mem[word_index];
+                else
+                    hrdata <= 32'hDEAD_BEEF;
+            end
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+        end
+    end
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+4. AHB-Lite Instruction SRAM (64 KB at 0x0001_0000)
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_instr_sram.v
+
+----------------------------------------
+h3_ahb_instr_sram.v
+----------------------------------------
+module h3_ahb_instr_sram #(
+    parameter ADDR_BASE = 32'h0001_0000,
+    parameter BYTES     = 65536
+) (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire        hsel,
+    input  wire [31:0] haddr,
+    input  wire [1:0]  htrans,
+    input  wire        hwrite,
+    input  wire [2:0]  hsize,
+    input  wire [31:0] hwdata,
+    output reg         hready,
+    output reg  [31:0] hrdata,
+    output reg         hresp
+);
+
+    localparam WORDS = BYTES / 4;
+    reg [31:0] mem [0:WORDS-1];
+
+    wire access = hsel && htrans[1];
+    wire [31:0] addr_off   = haddr - ADDR_BASE;
+    wire [31:0] word_index = addr_off[17:2];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+            hrdata <= 32'h0;
+        end else begin
+            if (access) begin
+                if (hwrite) begin
+                    if (word_index < WORDS)
+                        mem[word_index] <= hwdata;
+                end else begin
+                    if (word_index < WORDS)
+                        hrdata <= mem[word_index];
+                    else
+                        hrdata <= 32'hBAD0_0000;
+                end
+            end
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+        end
+    end
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+5. AHB-Lite Data SRAM (64 KB at 0x1000_0000)
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_data_sram.v
+
+----------------------------------------
+h3_ahb_data_sram.v
+----------------------------------------
+module h3_ahb_data_sram #(
+    parameter ADDR_BASE = 32'h1000_0000,
+    parameter BYTES     = 65536
+) (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire        hsel,
+    input  wire [31:0] haddr,
+    input  wire [1:0]  htrans,
+    input  wire        hwrite,
+    input  wire [2:0]  hsize,
+    input  wire [31:0] hwdata,
+    output reg         hready,
+    output reg  [31:0] hrdata,
+    output reg         hresp
+);
+
+    localparam WORDS = BYTES / 4;
+    reg [31:0] mem [0:WORDS-1];
+
+    wire access = hsel && htrans[1];
+    wire [31:0] addr_off   = haddr - ADDR_BASE;
+    wire [31:0] word_index = addr_off[17:2];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+            hrdata <= 32'h0;
+        end else begin
+            if (access) begin
+                if (hwrite) begin
+                    if (word_index < WORDS)
+                        mem[word_index] <= hwdata;
+                end else begin
+                    if (word_index < WORDS)
+                        hrdata <= mem[word_index];
+                    else
+                        hrdata <= 32'hDA7A_0000;
+                end
+            end
+            hready <= 1'b1;
+            hresp  <= 1'b0;
+        end
+    end
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+6. AHB-to-APB bridge
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_ahb_to_apb.v
+
+----------------------------------------
+h3_ahb_to_apb.v
+----------------------------------------
+module h3_ahb_to_apb (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire        hsel,
+    input  wire [31:0] haddr,
+    input  wire [1:0]  htrans,
+    input  wire        hwrite,
+    input  wire [2:0]  hsize,
+    input  wire [31:0] hwdata,
+    output reg         hready,
+    output reg  [31:0] hrdata,
+    output reg         hresp,
+
+    output reg  [31:0] paddr,
+    output reg         pwrite,
+    output reg  [31:0] pwdata,
+    output reg         psel,
+    output reg         penable,
+    input  wire [31:0] prdata,
+    input  wire        pready,
+    input  wire        pslverr
+);
+
+    localparam IDLE   = 2'd0;
+    localparam SETUP  = 2'd1;
+    localparam ACCESS = 2'd2;
+
+    reg [1:0] state, next_state;
+    reg [31:0] addr_r, wdata_r;
+    reg write_r;
+
+    wire ahb_valid = hsel && htrans[1];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state   <= IDLE;
+            addr_r  <= 32'h0;
+            wdata_r <= 32'h0;
+            write_r <= 1'b0;
+        end else begin
+            state <= next_state;
+            if (ahb_valid && state == IDLE) begin
+                addr_r  <= haddr;
+                wdata_r <= hwdata;
+                write_r <= hwrite;
+            end
+        end
+    end
+
+    always @(*) begin
+        next_state = state;
+        case (state)
+            IDLE:   if (ahb_valid) next_state = SETUP;
+            SETUP:  next_state = ACCESS;
+            ACCESS: if (pready) next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    always @(*) begin
+        hready  = 1'b0;
+        hresp   = 1'b0;
+        hrdata  = 32'h0;
+
+        paddr   = 32'h0;
+        pwrite  = 1'b0;
+        pwdata  = 32'h0;
+        psel    = 1'b0;
+        penable = 1'b0;
+
+        case (state)
+            IDLE: begin
+                hready = !ahb_valid;
+            end
+            SETUP: begin
+                paddr   = addr_r;
+                pwrite  = write_r;
+                pwdata  = wdata_r;
+                psel    = 1'b1;
+                penable = 1'b0;
+            end
+            ACCESS: begin
+                paddr   = addr_r;
+                pwrite  = write_r;
+                pwdata  = wdata_r;
+                psel    = 1'b1;
+                penable = 1'b1;
+                hready  = pready;
+                hrdata  = prdata;
+                hresp   = pslverr;
+            end
+        endcase
+    end
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+7. Quad-core Hazard3 SoC (no board pins)
+----------------------------------------
+File: ~/h3_quad_de10lite/soc/rtl/h3_quad_soc.v
+
+This module instantiates:
+- 4× Hazard3 cores as AHB masters
+- AHB arbiter
+- Boot ROM, Instruction SRAM, Data SRAM
+- AHB-to-APB bridge
+- APB peripheral bus (UART, GPIO, SPI, I2C, PWM will be added in Phase 4)
+
+For now, we wire APB outward as generic signals; Phase 4 will attach peripherals.
+
+----------------------------------------
+h3_quad_soc.v
+----------------------------------------
+`include "h3_config_quad.vh"
+
+module h3_quad_soc #(
+    parameter N_CORES = 4
+)(
+    input  wire         clk,
+    input  wire         rst_n,
+
+    output wire [31:0]  apb_paddr,
+    output wire         apb_pwrite,
+    output wire [31:0]  apb_pwdata,
+    output wire         apb_psel,
+    output wire         apb_penable,
+    input  wire [31:0]  apb_prdata,
+    input  wire         apb_pready,
+    input  wire         apb_pslverr,
+
+    output wire [31:0]  core_hartid_dbg
+);
+
+    wire [N_CORES-1:0]     core_hsel;
+    wire [N_CORES-1:0]     core_hwrite;
+    wire [N_CORES*2-1:0]   core_htrans;
+    wire [N_CORES*3-1:0]   core_hsize;
+    wire [N_CORES*32-1:0]  core_haddr;
+    wire [N_CORES*32-1:0]  core_hwdata;
+    wire [N_CORES-1:0]     core_hready;
+    wire [N_CORES*32-1:0]  core_hrdata;
+    wire [N_CORES-1:0]     core_hresp;
+
+    genvar i;
+    generate
+        for (i = 0; i < N_CORES; i = i + 1) begin : G_CORES
+            hazard3_core u_core (
+                .clk           (clk),
+                .rst_n         (rst_n),
+
+                .haddr         (core_haddr[i*32 +: 32]),
+                .hwrite        (core_hwrite[i]),
+                .htrans        (core_htrans[i*2 +: 2]),
+                .hsize         (core_hsize[i*3 +: 3]),
+                .hwdata        (core_hwdata[i*32 +: 32]),
+                .hrdata        (core_hrdata[i*32 +: 32]),
+                .hready        (core_hready[i]),
+                .hresp         (core_hresp[i]),
+
+                .irq           (16'h0000),
+                .mhartid       (i[31:0])
+            );
+            assign core_hsel[i] = 1'b1;
+        end
+    endgenerate
+
+    assign core_hartid_dbg = {28'h0, 4'hF};
+
+    wire        s_hsel;
+    wire [31:0] s_haddr;
+    wire [1:0]  s_htrans;
+    wire        s_hwrite;
+    wire [2:0]  s_hsize;
+    wire [31:0] s_hwdata;
+    wire        s_hready;
+    wire [31:0] s_hrdata;
+    wire        s_hresp;
+
+    h3_ahb_arbiter #(
+        .NUM_MASTERS(N_CORES)
+    ) u_arbiter (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .m_hsel    (core_hsel),
+        .m_hwrite  (core_hwrite),
+        .m_htrans  (core_htrans),
+        .m_hsize   (core_hsize),
+        .m_haddr   (core_haddr),
+        .m_hwdata  (core_hwdata),
+        .m_hready  (core_hready),
+        .m_hrdata  (core_hrdata),
+        .m_hresp   (core_hresp),
+        .s_hsel    (s_hsel),
+        .s_haddr   (s_haddr),
+        .s_htrans  (s_htrans),
+        .s_hwrite  (s_hwrite),
+        .s_hsize   (s_hsize),
+        .s_hwdata  (s_hwdata),
+        .s_hready  (s_hready),
+        .s_hrdata  (s_hrdata),
+        .s_hresp   (s_hresp)
+    );
+
+    wire hsel_boot   = s_hsel && (s_haddr[31:16] == 16'h0000);
+    wire hsel_instr  = s_hsel && (s_haddr[31:16] == 16'h0001);
+    wire hsel_data   = s_hsel && (s_haddr[31:16] == 16'h1000);
+    wire hsel_apb    = s_hsel && (s_haddr[31:16] == 16'h4000);
+
+    wire [31:0] hrdata_boot, hrdata_instr, hrdata_data, hrdata_apb;
+    wire        hready_boot, hready_instr, hready_data, hready_apb;
+    wire        hresp_boot,  hresp_instr,  hresp_data,  hresp_apb;
+
+    assign s_hrdata = hsel_boot  ? hrdata_boot  :
+                      hsel_instr ? hrdata_instr :
+                      hsel_data  ? hrdata_data  :
+                      hsel_apb   ? hrdata_apb   : 32'h0;
+
+    assign s_hready = hsel_boot  ? hready_boot  :
+                      hsel_instr ? hready_instr :
+                      hsel_data  ? hready_data  :
+                      hsel_apb   ? hready_apb   : 1'b1;
+
+    assign s_hresp  = hsel_boot  ? hresp_boot   :
+                      hsel_instr ? hresp_instr  :
+                      hsel_data  ? hresp_data   :
+                      hsel_apb   ? hresp_apb    : 1'b0;
+
+    h3_ahb_boot_rom #(
+        .ADDR_BASE(32'h0000_0000),
+        .BYTES(16384)
+    ) u_boot_rom (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .hsel   (hsel_boot),
+        .haddr  (s_haddr),
+        .htrans (s_htrans),
+        .hwrite (s_hwrite),
+        .hsize  (s_hsize),
+        .hwdata (s_hwdata),
+        .hready (hready_boot),
+        .hrdata (hrdata_boot),
+        .hresp  (hresp_boot)
+    );
+
+    h3_ahb_instr_sram #(
+        .ADDR_BASE(32'h0001_0000),
+        .BYTES(65536)
+    ) u_instr_sram (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .hsel   (hsel_instr),
+        .haddr  (s_haddr),
+        .htrans (s_htrans),
+        .hwrite (s_hwrite),
+        .hsize  (s_hsize),
+        .hwdata (s_hwdata),
+        .hready (hready_instr),
+        .hrdata (hrdata_instr),
+        .hresp  (hresp_instr)
+    );
+
+    h3_ahb_data_sram #(
+        .ADDR_BASE(32'h1000_0000),
+        .BYTES(65536)
+    ) u_data_sram (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .hsel   (hsel_data),
+        .haddr  (s_haddr),
+        .htrans (s_htrans),
+        .hwrite (s_hwrite),
+        .hsize  (s_hsize),
+        .hwdata (s_hwdata),
+        .hready (hready_data),
+        .hrdata (hrdata_data),
+        .hresp  (hresp_data)
+    );
+
+    h3_ahb_to_apb u_ahb2apb (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .hsel    (hsel_apb),
+        .haddr   (s_haddr),
+        .htrans  (s_htrans),
+        .hwrite  (s_hwrite),
+        .hsize   (s_hsize),
+        .hwdata  (s_hwdata),
+        .hready  (hready_apb),
+        .hrdata  (hrdata_apb),
+        .hresp   (hresp_apb),
+        .paddr   (apb_paddr),
+        .pwrite  (apb_pwrite),
+        .pwdata  (apb_pwdata),
+        .psel    (apb_psel),
+        .penable (apb_penable),
+        .prdata  (apb_prdata),
+        .pready  (apb_pready),
+        .pslverr (apb_pslverr)
+    );
+
+endmodule
+----------------------------------------
+
+----------------------------------------
+8. Next step
+----------------------------------------
+
+At this point you have:
+- Quad-core Hazard3 SoC backbone (no peripherals attached yet).
+- Boot ROM, Instruction SRAM, Data SRAM mapped at the correct addresses.
+- AHB-to-APB bridge with external APB master signals.
+
+Phase 4 will:
+- Implement APB UART, GPIO, SPI, I2C, PWM.
+- Add an APB decoder beneath h3_quad_soc.
+- Introduce a board-level top for DE10-Lite that exposes UART pins, GPIO LEDs, etc.
+
+============================================================
+END OF PHASE 3
+============================================================
