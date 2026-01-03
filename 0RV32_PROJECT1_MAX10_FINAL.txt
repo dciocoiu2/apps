@@ -197,3 +197,471 @@ At the end of Phase 1, verify:
 ============================================================
 END OF PHASE 1
 ============================================================
+============================================================
+PHASE 2 — MEMORY MAP, INTERRUPT MAP, AND ARDUINO-HEADER I/O MODEL
+============================================================
+
+Goal:
+- Define a **complete, fixed memory map** for the SoC (no placeholders).
+- Define the **interrupt architecture** (sources, controller, how they reach Hazard3 cores).
+- Define a **logical Arduino header I/O model** for:
+  - GPIO (with interrupts + debounce)
+  - UART
+  - SPI
+  - I2C
+  - PWM
+  - Fault inputs / external interrupt lines
+- All of this will be implemented concretely in later RTL phases and bound to **actual DE10-Lite Arduino pins** in Phase 8.
+
+We will **not guess** the exact FPGA pin names in this phase; instead, we define the logical MCU pinout (D0/D1, SPI pins, etc.) and ensure the SoC exposes signals that can be cleanly mapped to those Arduino pads.
+
+------------------------------------------------------------
+0. Top-level SoC model (conceptual)
+------------------------------------------------------------
+
+SoC: “H3-Quad MCU”
+
+- CPU:
+  - 4 × Hazard3 RV32IM cores
+- Buses:
+  - AHB-Lite backbone (Hazard3 data + instruction masters, DMA master)
+  - AHB→APB bridge (for low-speed peripheral CSRs)
+  - APB→Wishbone bridge (to talk to OpenCores Wishbone peripherals)
+- Memories:
+  - Boot ROM (AHB, 16 KB, @0x0000_0000)
+  - Instruction SRAM (AHB, 64 KB, @0x0001_0000)
+  - Data SRAM (AHB, 64 KB, @0x1000_0000)
+- System services:
+  - IRQ controller (APB-mapped, routes peripheral IRQs to cores)
+  - DMA controller (AHB master, APB/WB-configured)
+- Peripherals (APB→WB):
+  - UART16550
+  - SPI master
+  - I2C master
+  - GPIO (with interrupts)
+  - PWM (multi-channel, with advanced features via RTL)
+- I/O:
+  - All main I/O signals exported as “MCU pins” intended to be driven to DE10-Lite Arduino headers.
+
+------------------------------------------------------------
+1. Global address map (final, not a placeholder)
+------------------------------------------------------------
+
+We define the **static 32-bit address space** as follows:
+
+1) **Boot ROM** (AHB, execute-only):
+   - Base:  0x0000_0000
+   - Size:  16 KB
+   - Range: 0x0000_0000 – 0x0000_3FFF
+   - Contents: UART bootloader code (Phase 5), RISC-V RV32IM.
+
+2) **Instruction SRAM** (AHB, executable):
+   - Base:  0x0001_0000
+   - Size:  64 KB
+   - Range: 0x0001_0000 – 0x0001_FFFF
+   - Contents: user firmware loaded over UART (Phase 5/9).
+
+3) **Data SRAM** (AHB, read/write):
+   - Base:  0x1000_0000
+   - Size:  64 KB
+   - Range: 0x1000_0000 – 0x1000_FFFF
+   - Usage: runtime stack, global/static data, heap (if any).
+
+4) **APB / peripheral region** (AHB→APB bridge window):
+   - Base:  0x4000_0000
+   - Size:  512 KB block reserved (more than we need for now).
+   - Actual used sub-ranges (each 4 KB aligned):
+
+   - 0x4000_0000 – 0x4000_0FFF : UART16550
+   - 0x4000_1000 – 0x4000_1FFF : GPIO
+   - 0x4000_2000 – 0x4000_2FFF : SPI master
+   - 0x4000_3000 – 0x4000_3FFF : I2C master
+   - 0x4000_4000 – 0x4000_4FFF : PWM
+   - 0x4000_5000 – 0x4000_5FFF : IRQ controller
+   - 0x4000_6000 – 0x4000_6FFF : DMA controller
+
+   The remaining space `0x4000_7000`–`0x4007_FFFF` is reserved for future peripherals (timers, extra UARTs, etc.).
+
+5) **Reserved regions**:
+   - `0x2000_0000` – `0x3FFF_FFFF`: reserved for future external memories / mapping.
+   - `0x8000_0000` and above: not used in this SoC; reserved for future on-chip expansion or external bus mapping.
+
+This map will be honored **exactly** in RTL and software.
+
+------------------------------------------------------------
+2. Interrupt architecture
+------------------------------------------------------------
+
+We want:
+
+- Interrupt-driven UART, GPIO, DMA, etc.
+- A central **IRQ controller** that collects peripheral interrupts and feeds them to Hazard3 cores.
+- A simple, deterministic scheme suitable for bare-metal firmware.
+
+We define:
+
+1) **Interrupt sources (lines)**
+
+- IRQ0: UART16550
+- IRQ1: GPIO
+- IRQ2: SPI master
+- IRQ3: I2C master
+- IRQ4: PWM
+- IRQ5: DMA controller
+- IRQ6–IRQ15: reserved for future (timers, extra UARTs, etc.)
+
+2) **IRQ controller (h3_irq_ctrl)**
+
+- APB-mapped at `0x4000_5000`.
+- Exposes:
+  - Pending register
+  - Enable/mask register
+  - Per-core routing/masking (simplified)
+- Implements up to 16 interrupt lines internally.
+- Aggregates them into:
+
+  - For simplicity, a single external interrupt line per core:
+    - CORE0_IRQ_EXT
+    - CORE1_IRQ_EXT
+    - CORE2_IRQ_EXT
+    - CORE3_IRQ_EXT
+
+- Hazard3 cores will be configured so that this external interrupt maps to the standard machine/external interrupt cause (through CSRs).
+
+3) **Interrupt priority / routing**
+
+- Phase 3/4 will implement:
+  - A simple fixed priority scheme (IRQ0 highest, IRQ15 lowest) inside h3_irq_ctrl.
+  - A register that reports the active IRQ ID.
+  - Per-core enable bits (so some cores can be “quiet”).
+
+Software model (Phase 6):
+- `irq_init()` configures the controller.
+- `irq_enable_line(line)` enables a specific IRQ line globally.
+- `irq_route_to_core(line, core_id)` decides which core receives that line.
+- The HAL will set up an interrupt handler table in RAM and a single trap handler.
+
+------------------------------------------------------------
+3. DMA architecture
+------------------------------------------------------------
+
+We want:
+
+- DMA that can move data between:
+  - Memory ↔ peripherals (e.g., UART RX/TX FIFO, SPI FIFO)
+  - Memory ↔ memory (Instr/Data SRAM)
+
+We define:
+
+1) **DMA controller (DMA0)**
+
+- APB-mapped CSRs at `0x4000_6000`.
+- AHB master port to access Boot ROM, Instruction SRAM, Data SRAM, and the APB/WB peripheral window (through bus hierarchy).
+- Internally:
+  - One or more DMA channels (we’ll start with 1 channel for clarity).
+  - Control registers:
+    - SRC_ADDR, DST_ADDR, LEN, CTRL, STATUS, IRQ_ENABLE
+  - Supports:
+    - Incrementing addresses for memory.
+    - Optional fixed destination/source for peripheral FIFOs.
+
+2) **DMA IRQ**
+
+- DMA0 uses IRQ5 to signal:
+  - Completion.
+  - Error/abort.
+
+3) **Usage expectations**
+
+- Early boot (Boot ROM): we will **not** depend on DMA; the bootloader will stay simple and polling-based.
+- Application firmware (Phase 7+): can use DMA for:
+  - High throughput UART RX/TX.
+  - SPI bursts.
+  - Buffered logging or streaming.
+
+------------------------------------------------------------
+4. Peripherals: register map granularity (non-placeholder)
+------------------------------------------------------------
+
+We fix the **base addresses** here and commit to them. Exact internal register bits will follow from OpenCores specs + our own wrappers in Phase 4 and HAL in Phase 6.
+
+1) UART16550 @ 0x4000_0000
+
+- Typical 16550 register file in 8-bit lanes, but we will access via 32-bit words at:
+  - 0x4000_0000: RBR/THR/DLL
+  - 0x4000_0004: IER/DLM
+  - 0x4000_0008: IIR/FCR
+  - 0x4000_000C: LCR
+  - 0x4000_0010: MCR
+  - 0x4000_0014: LSR
+  - 0x4000_0018: MSR
+  - 0x4000_001C: SCR
+- Interrupt output:
+  - `uart_irq` → IRQ0 in h3_irq_ctrl.
+
+2) GPIO @ 0x4000_1000
+
+- Core registers (examples, exact names depend on OpenCores GPIO):
+  - 0x4000_1000: DATA_OUT
+  - 0x4000_1004: DATA_DIR
+  - 0x4000_1008: DATA_IN
+  - 0x4000_100C: IRQ_MASK
+  - 0x4000_1010: IRQ_TYPE (edge/level, rising/falling)
+  - 0x4000_1014: IRQ_STATUS
+  - 0x4000_1018: (optional) DEBOUNCE_CFG
+- Interrupt output:
+  - `gpio_irq` → IRQ1.
+
+3) SPI master @ 0x4000_2000
+
+- Registers (typical OpenCores SPI):
+  - 0x4000_2000: RX/TX data
+  - 0x4000_2004: Control (CPOL, CPHA, bits per word, enable, interrupt, CS mode)
+  - 0x4000_2008: Status (busy, RX ready, TX empty, IRQ flags)
+  - 0x4000_200C: Divider (SCLK rate)
+  - 0x4000_2010: Chip select / manual CS override
+- Interrupt output:
+  - `spi_irq` → IRQ2.
+
+4) I2C master @ 0x4000_3000
+
+- OpenCores I2C standard map:
+  - 0x4000_3000: PRER_LO (prescaler low)
+  - 0x4000_3004: PRER_HI
+  - 0x4000_3008: CTR (enable, interrupt enable)
+  - 0x4000_300C: TXR/RXR
+  - 0x4000_3010: CR/SR (start/stop, read/write, ACK/NACK, arbitration lost, TIP, etc.)
+- Interrupt output:
+  - `i2c_irq` → IRQ3.
+
+5) PWM @ 0x4000_4000
+
+- We define a richer register set:
+  - Per channel (0..3):
+    - PERIOD
+    - DUTY
+    - PHASE
+    - DEADTIME
+    - CTRL (enable, polarity, fault behavior)
+  - Global:
+    - FAULT_STATUS
+    - FAULT_MASK
+- Interrupt output:
+  - `pwm_irq` → IRQ4.
+- Fault inputs:
+  - External signals from Arduino header (e.g., emergency stop input).
+
+6) IRQ controller @ 0x4000_5000
+
+- Registers:
+  - PENDING
+  - ENABLE
+  - ROUTE_CORE0
+  - ROUTE_CORE1
+  - ROUTE_CORE2
+  - ROUTE_CORE3
+  - CLAIM/COMPLETE style or simple “active IRQ ID” field.
+
+7) DMA controller @ 0x4000_6000
+
+- Registers:
+  - CH0_SRC_ADDR
+  - CH0_DST_ADDR
+  - CH0_LEN
+  - CH0_CTRL (start, direction, increment flags)
+  - CH0_STATUS (busy, error)
+  - CH0_IRQ_ENABLE
+
+------------------------------------------------------------
+5. Logical Arduino I/O model (non-skeletal, but board-pin-agnostic)
+------------------------------------------------------------
+
+We must avoid inventing fake DE10-Lite pin numbers; instead, we define the **_irq` → IRQ0 in h3_irq_ctrl.
+
+2) GPIO @ 0x4000_1000
+
+- Core registers (examples, exact names depend on OpenCores GPIO):
+  - 0x4000_1000: DATA_OUT
+  - 0x4000_1004: DATA_DIR
+  - 0x4000_1008: DATA_IN
+  - 0x4000_100C: IRQ_MASK
+  - 0x4000_1010: IRQ_TYPE (edge/level, rising/falling)
+  - 0x4000_1014: IRQ_STATUS
+  - 0x4000_1018: (optional) DEBOUNCE_CFG
+- Interrupt output:
+  - `gpio_irq` → IRQ1.
+
+3) SPI master @ 0x4000_2000
+
+- Registers (typical OpenCores SPI):
+  - 0x4000_2000: RX/TX data
+  - 0x4000_2004: Control (CPOL, CPHA, bits per word, enable, interrupt, CS mode)
+  - 0x4000_2008: Status (busy, RX ready, TX empty, IRQ flags)
+  - 0x4000_200C: Divider (SCLK rate)
+  - 0x4000_2010: Chip select / manual CS override
+- Interrupt output:
+  - `spi_irq` → IRQ2.
+
+4) I2C master @ 0x4000_3000
+
+- OpenCores I2C standard map:
+  - 0x4000_3000: PRER_LO (prescaler low)
+  - 0x4000_3004: PRER_HI
+  - 0x4000_3008: CTR (enable, interrupt enable)
+  - 0x4000_300C: TXR/RXR
+  - 0x4000_3010: CR/SR (start/stop, read/write, ACK/NACK, arbitration lost, TIP, etc.)
+- Interrupt output:
+  - `i2c_irq` → IRQ3.
+
+5) PWM @ 0x4000_4000
+
+- We define a richer register set:
+  - Per channel (0..3):
+    - PERIOD
+    - DUTY
+    - PHASE
+    - DEADTIME
+    - CTRL (enable, polarity, fault behavior)
+  - Global:
+    - FAULT_STATUS
+    - FAULT_MASK
+- Interrupt output:
+  - `pwm_irq` → IRQ4.
+- Fault inputs:
+  - External signals from Arduino header (e.g., emergency stop input).
+
+6) IRQ controller @ 0x4000_5000
+
+- Registers:
+  - PENDING
+  - ENABLE
+  - ROUTE_CORE0
+  - ROUTE_CORE1
+  - ROUTE_CORE2
+  - ROUTE_CORE3
+  - CLAIM/COMPLETE style or simple “active IRQ ID” field.
+
+7) DMA controller @ 0x4000_6000
+
+- Registers:
+  - CH0_SRC_ADDR
+  - CH0_DST_ADDR
+  - CH0_LEN
+  - CH0_CTRL (start, direction, increment flags)
+  - CH0_STATUS (busy, error)
+  - CH0_IRQ_ENABLE
+
+------------------------------------------------------------
+5. Logical Arduino I/O model (non-skeletal, but board-pin-agnostic)
+------------------------------------------------------------
+
+We must avoid inventing fake DE10-Lite pin numbers; instead, we define the **MCU-side logical pins** that will later be mapped to physical Arduino header pads on the DE10-Lite.
+
+1) Logical Arduino digital pins
+
+We define 16 logical digital pins:
+
+- D0..D15 → 16 GPIO-capable pins.
+
+The SoC will expose:
+
+- `gpio_out[15:0]`
+- `gpio_in[15:0]`
+- `gpio_dir[15:0]`
+
+These 16 bits will be wired to **Arduino header digital pins** in Phase 8.
+
+2) UART pins
+
+We define:
+
+- `uart_rx` and `uart_tx` as the SoC UART pins.
+
+They will be assigned to a pair of Arduino digital pins (e.g., D0/D1) in Phase 8.
+
+3) SPI pins
+
+We define:
+
+- `spi_sclk`
+- `spi_mosi`
+- `spi_miso`
+- `spi_cs[3:0]` (4 chip-selects)
+
+They will be mapped to Arduino digital pins that are typically used for SPI (e.g., D10–D13 style mapping, but we’ll respect DE10-Lite’s actual Arduino header capabilities in Phase 8).
+
+4) I2C pins
+
+We define:
+
+- `i2c_scl`
+- `i2c_sda` (bidirectional)
+
+These will be mapped to Arduino header pins typically reserved for I2C (SCL/SDA signals).
+
+5) PWM outputs
+
+We define:
+
+- `pwm_out[3:0]` (4 PWM channels)
+
+These will be mapped to Arduino digital pins that hardware users can treat as PWM pins.
+
+6) Fault inputs / extra interrupt lines
+
+We define:
+
+- `fault_in[3:0]` — external fault lines (from Arduino header pins) for PWM kill/emergency stop.
+- `ext_irq_in[3:0]` — extra external interrupt lines (optional) for future use (e.g., dedicated external IRQ pins independent of GPIO).
+
+7) Debounce and edge detection
+
+- Debounce will be implemented either:
+  - Inside the GPIO core (if supported), or
+  - In a small wrapper that processes `gpio_in[15:0]` before GPIO registers see changes.
+- GPIO interrupts can be configured per pin for rising/falling/both edges via GPIO registers.
+
+------------------------------------------------------------
+6. CPU view vs. board view (how firmware sees pins)
+------------------------------------------------------------
+
+From **firmware’s perspective**, using the Arduino-like HAL (Phase 6):
+
+- `pinMode(pin, mode)` uses:
+  - `pin` ∈ [0..15] mapping to `gpio_*[15:0]`.
+- `digitalWrite(pin, value)` and `digitalRead(pin)` operate on `gpio_*[15:0]`.
+- `Serial` uses `uart_rx/uart_tx` pins (logical mapping documented).
+- `SPI` uses `spi_sclk`, `spi_mosi`, `spi_miso`, `spi_cs[x]`.
+- `Wire` uses `i2c_scl`, `i2c_sda`.
+- `analogWrite(pin, value)` uses PWM outputs mapped to specific pins.
+
+In **docs/pinmap/arduino_de10lite_pinout.md**, we will later fill in:
+
+- A table: logical MCU pin (D0, D1, etc.) → DE10-Lite Arduino header pin labeling → FPGA pin name.
+
+Phase 8 will implement the exact `set_location_assignment` constraints using Quartus and the official DE10-Lite documentation.
+
+------------------------------------------------------------
+7. Summary of committed interfaces for later phases
+------------------------------------------------------------
+
+- **Memory map** is fully specified and will not change:
+  - ROM, Instr SRAM, Data SRAM, and all APB peripheral bases fixed.
+
+- **Interrupt model**:
+  - IRQ0–IRQ5 reserved for UART, GPIO, SPI, I2C, PWM, DMA.
+  - IRQ controller at 0x4000_5000 feeds 1 external interrupt per Hazard3 core.
+
+- **DMA model**:
+  - Single DMA engine at 0x4000_6000 with AHB master access to all important regions.
+
+- **Arduino I/O model**:
+  - 16 GPIO pins (D0..D15).
+  - Dedicated signals for UART, SPI (with 4 CS), I2C, 4 PWM outputs, 4 fault inputs, and optional external interrupt lines.
+  - These will be physically mapped to DE10-Lite Arduino header pads in Phase 8, with documentation.
+
+All subsequent phases (3–9+) will respect this structure exactly.
+
+============================================================
+END OF PHASE 2
+============================================================
