@@ -1467,13 +1467,4 @@ WHAT PHASE 2D GIVES YOU
   - Ephemeral configuration.
   - Open, reproducible, non-destructive.
 
-From here you can:
-
-- Replace the example hart roles with real workloads.
-- Add more sophisticated synchronization (locks, queues, message passing).
-- Introduce per-hart stacks, context switching, or even a tiny RTOS if you want.
-
-If you want to go further:
--  define a lock-free queue between harts.
-- Sketch a tiny cooperative scheduler across HART1–3.
-- pivot to accelerators / PMOD integration on top of this multicore base.
+########END P2E########
