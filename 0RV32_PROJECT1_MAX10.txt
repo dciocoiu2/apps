@@ -1,3 +1,5 @@
+
+*MAX® 10 10M50DAF484C7G De10-lite not de0
 For opencore urls see 0RV32_PROJECT1_OCURLS.txt
 ================================================================================
 PHASE 1A: QUAD-CORE-READY SINGLE-HART HAZARD3 SoC SKELETON ON DE0-LITE
