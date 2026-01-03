@@ -4770,4 +4770,580 @@ At no point is on-board flash programmed:
 ============================================================
 END OF PHASE 9
 ============================================================
+============================================================
+PHASE 10 — MULTI-CORE RUNTIME: USING ALL 4 HAZARD3 CORES
+============================================================
+
+Goal:
+- Turn your SoC from “single-core in a quad-core shell” into a **true 4-core system**.
+- Concretely:
+  - All 4 Hazard3 cores boot correctly.
+  - Each core gets its **own stack** in Data SRAM.
+  - Each core enters **shared firmware** in Instr SRAM but branches by `mhartid`.
+  - IRQ controller routes interrupts to **specific cores**, not just core 0.
+  - The example app spreads work across cores (even in a simple way).
+
+We will:
+1) Update the boot ROM so **every core** jumps into the application firmware.
+2) Define **per-core stack layout** in Data SRAM.
+3) Provide a **multi-core aware startup** in the application.
+4) Add a simple **work split** example across the 4 cores.
+
+You already have:
+- Quad Hazard3 cores.
+- Shared Instr SRAM @ 0x0001_0000.
+- Shared Data SRAM @ 0x1000_0000.
+- IRQ controller with per-core routing.
+
+We’re just turning that into a real runtime.
+
+------------------------------------------------------------
+1. Per-core stack layout in Data SRAM
+------------------------------------------------------------
+
+Data SRAM:
+- Base:  0x1000_0000
+- Size:  64 KB
+- End:   0x1000_FFFF
+
+We’ll assign **16 KB per core**:
+
+- Core 0:
+  - Stack top: 0x1000_FFFF
+  - Stack base (approx): 0x1000_C000
+
+- Core 1:
+  - Stack top: 0x1000_BFFF
+  - Stack base: 0x1000_8000
+
+- Core 2:
+  - Stack top: 0x1000_7FFF
+  - Stack base: 0x1000_4000
+
+- Core 3:
+  - Stack top: 0x1000_3FFF
+  - Stack base: 0x1000_0000
+
+We only need the **top address** for each stack (grows downward). The linker will still treat DATA as one region; we’re just manually partitioning stacks by core ID.
+
+------------------------------------------------------------
+2. Update Boot ROM: all cores jump to firmware
+------------------------------------------------------------
+
+Currently, Boot ROM only implicitly thinks about “one core”. We’ll make it explicitly **multi-core aware**.
+
+Concept:
+- All cores execute the same Boot ROM code.
+- Only **core 0**:
+  - Runs the UART bootloader.
+  - Receives app.bin.
+  - Loads it into Instr SRAM.
+  - Signals completion (simple shared flag).
+- Cores 1–3:
+  - Wait until core 0 finishes loading firmware.
+- Then *all cores* jump to the same firmware entry at 0x0001_0000.
+
+We’ll:
+- Add a small shared flag in **Data SRAM** at a fixed address.
+- Use `mhartid` to decide role.
+
+We’ll modify `boot_rom.c` and `start.S`.
+
+------------------------------------------------------------
+2.1. Shared flag for “firmware ready”
+------------------------------------------------------------
+
+Choose a fixed address in Data SRAM for a ready flag:
+- Let’s use: 0x1000_0000 (start of Data SRAM).
+
+We’ll define:
+
+- `BOOT_FLAG_ADDR = 0x10000000u`
+- When bootloader finishes, it writes `1` there.
+- Other cores spin until they see `1`, then they jump.
+
+------------------------------------------------------------
+2.2. New start.S for Boot ROM (multi-core aware)
+------------------------------------------------------------
+
+We need access to `mhartid`. Hazard3 is RISC-V compatible, so:
+
+- `csrr a0, mhartid` to read hart ID.
+- Use that to choose stack.
+
+File: ~/h3_quad_de10lite/soc/sw/boot_rom/start.S (replace previous one)
+
+----------------------------------------
+start.S
+----------------------------------------
+    .section .init, "ax"
+    .globl _start
+    .globl boot_main
+    .globl app_entry
+
+    .equ CORE0_STACK_TOP, 0x1000FFFF
+    .equ CORE1_STACK_TOP, 0x1000BFFF
+    .equ CORE2_STACK_TOP, 0x10007FFF
+    .equ CORE3_STACK_TOP, 0x10003FFF
+
+_start:
+    csrr a0, mhartid
+
+    li   t0, 0
+    beq  a0, t0, 1f
+
+    li   t0, 1
+    beq  a0, t0, 2f
+
+    li   t0, 2
+    beq  a0, t0, 3f
+
+    li   t0, 3
+    beq  a0, t0, 4f
+
+    j    4f
+
+1:  la   sp, CORE0_STACK_TOP
+    j    boot_main
+
+2:  la   sp, CORE1_STACK_TOP
+    j    boot_main
+
+3:  la   sp, CORE2_STACK_TOP
+    j    boot_main
+
+4:  la   sp, CORE3_STACK_TOP
+    j    boot_main
+----------------------------------------
+
+Note:
+- All cores call `boot_main()`, but `boot_main` will branch based on hart ID (core ID).
+
+------------------------------------------------------------
+2.3. New boot_rom.c (core 0: loader, others: wait)
+------------------------------------------------------------
+
+We modify `boot_rom.c` to:
+- Read `mhartid` via inline assembly.
+- If hart == 0:
+  - Run the UART loader (exactly as before).
+  - Set BOOT_FLAG = 1.
+  - Jump to app.
+- If hart != 0:
+  - Spin until BOOT_FLAG == 1.
+  - Jump to app.
+
+File: ~/h3_quad_de10lite/soc/sw/boot_rom/boot_rom.c (replace previous)
+
+----------------------------------------
+boot_rom.c
+----------------------------------------
+#include <stdint.h>
+
+#define UART_BASE       0x40000000u
+
+#define UART_RBR        (*(volatile uint32_t *)(UART_BASE + 0x00))
+#define UART_THR        (*(volatile uint32_t *)(UART_BASE + 0x00))
+#define UART_IER        (*(volatile uint32_t *)(UART_BASE + 0x04))
+#define UART_IIR        (*(volatile uint32_t *)(UART_BASE + 0x08))
+#define UART_FCR        (*(volatile uint32_t *)(UART_BASE + 0x08))
+#define UART_LCR        (*(volatile uint32_t *)(UART_BASE + 0x0C))
+#define UART_MCR        (*(volatile uint32_t *)(UART_BASE + 0x10))
+#define UART_LSR        (*(volatile uint32_t *)(UART_BASE + 0x14))
+
+#define INSTR_SRAM_BASE 0x00010000u
+#define INSTR_SRAM_MAX  0x0001FFFFu
+
+#define BOOT_FLAG_ADDR  0x10000000u
+#define BOOT_FLAG       (*(volatile uint32_t *)BOOT_FLAG_ADDR)
+
+static inline uint32_t read_mhartid(void) {
+    uint32_t hart;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(hart));
+    return hart;
+}
+
+static void uart_init(void) {
+    UART_IER = 0x00;
+    UART_LCR = 0x80;
+    UART_RBR = 0x01;
+    UART_IER = 0x00;
+    UART_LCR = 0x03;
+    UART_FCR = 0x07;
+    UART_MCR = 0x00;
+}
+
+static void uart_putc(uint8_t ch) {
+    while ((UART_LSR & 0x20) == 0) {
+    }
+    UART_THR = ch;
+}
+
+static uint8_t uart_getc(void) {
+    while ((UART_LSR & 0x01) == 0) {
+    }
+    return (uint8_t)(UART_RBR & 0xFF);
+}
+
+static void uart_puts(const char *s) {
+    while (*s) {
+        uart_putc((uint8_t)*s++);
+    }
+}
+
+static uint32_t read_u32_le(void) {
+    uint32_t b0 = uart_getc();
+    uint32_t b1 = uart_getc();
+    uint32_t b2 = uart_getc();
+    uint32_t b3 = uart_getc();
+    return (b0) | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+void boot_main(void) {
+    uint32_t hart = read_mhartid();
+
+    if (hart == 0) {
+        BOOT_FLAG = 0;
+
+        uart_init();
+        uart_puts("H3-BOOT\r\n");
+        uart_puts("LEN?\r\n");
+
+        uint32_t len = read_u32_le();
+
+        if (len == 0) {
+            uart_puts("ERR:LEN=0\r\n");
+            while (1) { }
+        }
+
+        uint32_t max_len = (INSTR_SRAM_MAX - INSTR_SRAM_BASE + 1u);
+        if (len > max_len) {
+            uart_puts("ERR:LEN>SRAM\r\n");
+            while (1) { }
+        }
+
+        uart_puts("OK\r\n");
+        uart_puts("RX...\r\n");
+
+        volatile uint8_t *dst = (volatile uint8_t *)INSTR_SRAM_BASE;
+        for (uint32_t i = 0; i < len; i++) {
+            uint8_t b = uart_getc();
+            dst[i] = b;
+        }
+
+        uart_puts("JMP\r\n");
+
+        BOOT_FLAG = 1;
+
+        void (*entry)(void) = (void (*)(void))INSTR_SRAM_BASE;
+        entry();
+    } else {
+        while (BOOT_FLAG == 0) {
+        }
+        void (*entry)(void) = (void (*)(void))INSTR_SRAM_BASE;
+        entry();
+    }
+
+    while (1) { }
+}
+----------------------------------------
+
+Rebuild Boot ROM:
+
+  cd ~/h3_quad_de10lite/soc/sw/boot_rom
+  make
+
+Re-link boot_rom.hex into RTL and recompile Quartus as before.
+
+------------------------------------------------------------
+3. Multi-core application startup (Instr SRAM)
+------------------------------------------------------------
+
+Now all 4 cores will jump to the same entry at 0x0001_0000. We need:
+
+- A **startup.S** that:
+  - Reads `mhartid`.
+  - Chooses the correct stack top for that core.
+  - Jumps into a shared C `main()` (which then branches by hart), or per-core entry.
+
+- A **main.c** that:
+  - Reads `mhartid`.
+  - Routes to `core0_main()`, `core1_main()`, etc.
+
+We’ll modify the Phase 7 app.
+
+------------------------------------------------------------
+3.1. New startup.S for apps/blinky_serial
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/sw/apps/blinky_serial/startup.S (replace)
+
+----------------------------------------
+startup.S
+----------------------------------------
+    .section .init, "ax"
+    .globl _start
+    .globl main
+
+    .equ CORE0_STACK_TOP, 0x1000FFFF
+    .equ CORE1_STACK_TOP, 0x1000BFFF
+    .equ CORE2_STACK_TOP, 0x10007FFF
+    .equ CORE3_STACK_TOP, 0x10003FFF
+
+_start:
+    csrr a0, mhartid
+
+    li   t0, 0
+    beq  a0, t0, 1f
+
+    li   t0, 1
+    beq  a0, t0, 2f
+
+    li   t0, 2
+    beq  a0, t0, 3f
+
+    li   t0, 3
+    beq  a0, t0, 4f
+
+    j    4f
+
+1:  la   sp, CORE0_STACK_TOP
+    j    main
+
+2:  la   sp, CORE1_STACK_TOP
+    j    main
+
+3:  la   sp, CORE2_STACK_TOP
+    j    main
+
+4:  la   sp, CORE3_STACK_TOP
+    j    main
+----------------------------------------
+
+------------------------------------------------------------
+3.2. Multi-core main.c: split work across cores
+------------------------------------------------------------
+
+We’ll:
+- Define `coreN_main()` for N = 0..3.
+- Route them by `mhartid`.
+- Use the HAL as-is, but **avoid all cores initializing peripherals twice**.
+
+Policy:
+- Core 0:
+  - Initializes IRQ/Serial/GPIO/PWM/SPI/I2C (global init).
+  - Handles UART echo + “App alive…” messages.
+- Core 1:
+  - Toggles LED via GPIO at a different rate.
+- Core 2:
+  - Adjusts PWM duty cycle periodically (e.g., a simple “breathing” waveform).
+- Core 3:
+  - Runs a background memory test using dma_memcpy (just as a workload).
+
+We also need `read_mhartid()` in app side.
+
+File: ~/h3_quad_de10lite/soc/sw/apps/blinky_serial/main.c (replace)
+
+----------------------------------------
+main.c
+----------------------------------------
+#include <stdint.h>
+#include "arduino_hal.h"
+
+static inline uint32_t read_mhartid(void) {
+    uint32_t hart;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(hart));
+    return hart;
+}
+
+static void delay_cycles(volatile uint32_t cycles) {
+    while (cycles--) {
+        __asm__ volatile ("nop");
+    }
+}
+
+static void core0_main(void) {
+    irq_init();
+    Serial_begin(115200);
+    Serial_println("H3 App (core0): booted.");
+
+    gpio_init_irq();
+
+    uint8_t led_pin = 13;
+    pinMode(led_pin, OUTPUT);
+    digitalWrite(led_pin, LOW);
+
+    analogWrite(0, 512);
+
+    SPI_begin(4, 0, 8);
+    SPI_setCS(0, 0);
+
+    Wire_begin(100);
+
+    Serial_println("Core0 init done.");
+
+    while (1) {
+        int avail = Serial_available();
+        while (avail-- > 0) {
+            uint8_t b = Serial_read_byte_blocking();
+            Serial_write_byte(b);
+        }
+
+        static uint32_t counter = 0;
+        counter++;
+        if ((counter & 0x7FFFu) == 0u) {
+            Serial_println("Core0 alive...");
+        }
+
+        delay_cycles(50000);
+    }
+}
+
+static void core1_main(void) {
+    uint8_t led_pin = 12;
+    pinMode(led_pin, OUTPUT);
+    while (1) {
+        digitalWrite(led_pin, HIGH);
+        delay_cycles(200000);
+        digitalWrite(led_pin, LOW);
+        delay_cycles(200000);
+    }
+}
+
+static void core2_main(void) {
+    uint16_t duty = 0;
+    int dir = 1;
+    while (1) {
+        analogWrite(1, duty);
+        duty = (uint16_t)(duty + (dir ? 8 : -8));
+        if (duty >= 1000) {
+            duty = 1000;
+            dir = 0;
+        } else if (duty <= 0) {
+            duty = 0;
+            dir = 1;
+        }
+        delay_cycles(50000);
+    }
+}
+
+static void core3_main(void) {
+    static uint8_t buf_a[256];
+    static uint8_t buf_b[256];
+
+    for (uint32_t i = 0; i < sizeof(buf_a); i++) {
+        buf_a[i] = (uint8_t)i;
+        buf_b[i] = 0;
+    }
+
+    while (1) {
+        dma_memcpy(buf_b, buf_a, sizeof(buf_a));
+
+        int ok = 1;
+        for (uint32_t i = 0; i < sizeof(buf_a); i++) {
+            if (buf_b[i] != buf_a[i]) {
+                ok = 0;
+                break;
+            }
+        }
+
+        (void)ok;
+
+        delay_cycles(200000);
+    }
+}
+
+int main(void) {
+    uint32_t hart = read_mhartid();
+
+    switch (hart) {
+    case 0:
+        core0_main();
+        break;
+    case 1:
+        core1_main();
+        break;
+    case 2:
+        core2_main();
+        break;
+    case 3:
+        core3_main();
+        break;
+    default:
+        while (1) { }
+    }
+
+    return 0;
+}
+----------------------------------------
+
+Rebuild the app:
+
+  cd ~/h3_quad_de10lite/soc/sw/apps/blinky_serial
+  make
+
+Then use Phase 9’s loader to send the new app.bin after reconfiguring the FPGA with the updated bitstream (containing the new boot_rom.hex).
+
+------------------------------------------------------------
+4. IRQ routing per core (optional tuning)
+------------------------------------------------------------
+
+Right now in `irq_init()` we:
+
+- Enable all lines.
+- Route all lines to core 0 via `IRQ_ROUTE_CORE0 = 0xFFFF`.
+
+You can now refine this:
+
+Example (multi-core IRQ distribution):
+
+- UART → core 0
+- GPIO → core 1
+- SPI  → core 2
+- PWM  → core 3
+- DMA  → core 0 (for now)
+
+Rewrite `irq_init()` in `irq.c` like:
+
+- IRQ_ROUTE_CORE0 = (1 << IRQ_LINE_UART) | (1 << IRQ_LINE_DMA);
+- IRQ_ROUTE_CORE1 = (1 << IRQ_LINE_GPIO);
+- IRQ_ROUTE_CORE2 = (1 << IRQ_LINE_SPI);
+- IRQ_ROUTE_CORE3 = (1 << IRQ_LINE_PWM);
+
+All still FOSS, all under your control.
+
+------------------------------------------------------------
+5. What you have now, behaviorally
+------------------------------------------------------------
+
+After this phase:
+
+- **Core 0**:
+  - Handles bootloader.
+  - Initializes HAL.
+  - Owns UART, SPI, I2C, base PWM.
+  - Runs the UART echo loop + status prints.
+
+- **Core 1**:
+  - Blinks a different GPIO pin at a different cadence.
+
+- **Core 2**:
+  - Modulates PWM duty on channel 1 (“breathing” style).
+
+- **Core 3**:
+  - Exercises DMA with memory copies in the background.
+
+All 4 cores are:
+- Running from the same **Instr SRAM** image.
+- Using distinct **stacks** in Data SRAM.
+- Sharing peripherals via the HAL and interconnect.
+
+This is a true multi-core embedded environment, still:
+- Fully **ephemeral**.
+- Fully **FOSS**.
+- Fully under your control.
+
+============================================================
+END OF PHASE 10
+============================================================
 
