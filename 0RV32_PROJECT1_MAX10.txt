@@ -3081,3 +3081,542 @@ WHAT PHASE 1E GIVES YOU TOWARD THE QUAD-CORE GOAL
   - Building bootloader (1I) and HAL (1J).
   - Scaling to multiple Hazard3 tiles sharing this same memory/peripheral fabric.
 #########END PHASE1F############
+================================================================================
+PHASE 1G: REAL GPIO BLOCK ON WISHBONE s4 @ 0x1000_0300 (ARDUINO + LEDS)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1G
+----------------
+Extend the SoC from Phase 1F (Hazard3 + SDRAM + UART + I2C + SPI) by:
+
+- Replacing the GPIO stub on Wishbone s4 with a **real GPIO block**.
+- Mapping GPIO @ 0x1000_0300.
+- Providing proper direction control and input sampling.
+- Mapping GPIO bits to:
+  - Arduino digital pins (D2–D13).
+  - Optionally on-board LEDs (for quick visual blink).
+- Adding a ROM-based test that:
+  - Configures one GPIO pin as output (e.g., D2).
+  - Toggles it in a small loop.
+  - Prints status over UART0.
+
+All while preserving:
+- Only `.sof` via JTAG to **SRAM** (never flash; ephemeral).
+- Board returns to factory demo on power-cycle.
+
+ASSUMPTIONS
+-----------
+From previous phases you already have:
+
+- Hazard3 tile and 4-master AHB fabric with HART0 on M0.
+- Boot ROM @ 0x2000_0000 (bootrom.hex).
+- AHB→WB bridge.
+- WB interconnect with s0..s5.
+- Real OpenCores:
+  - SDRAM controller on s0 @ 0x8000_0000.
+  - UART16550 on s1 @ 0x1000_0000.
+  - I2C master on s2 @ 0x1000_0100.
+  - SPI master on s3 @ 0x1000_0200.
+- Stubbed GPIO (s4) and JTAG-UART (s5).
+- Boot ROM printing over UART and testing I2C+SPI.
+
+We’ll now replace the s4 stub with a real Wishbone GPIO peripheral.
+
+================================================================================
+STEP 1 — DEFINE A SIMPLE, COMPLETE GPIO WISHBONE PERIPHERAL (s4)
+================================================================================
+
+We’ll implement a small, self-contained GPIO block with:
+
+- Registers (word-aligned, 32-bit):
+  - 0x00: DATA_OUT   (RW)  — output data.
+  - 0x04: DATA_IN    (RO)  — sampled input data.
+  - 0x08: DIR        (RW)  — 1 = output, 0 = input.
+  - 0x0C: PULLUP     (RW)  — 1 = enable pull-up (for input pins; logic-only here).
+- 20 GPIO bits:
+  - gpio[19:0] mapped to Arduino D2–D13, A0–A5 (for example).
+
+We’ll drive outputs and read inputs via an inout bus `gpio_pins[19:0]`.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/gpio_wb.sv ----------------------------
+
+module gpio_wb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // 20 GPIO pins
+    inout  wire [19:0] gpio_pins
+);
+
+    assign wb_err_o = 1'b0;
+
+    reg [19:0] data_out;
+    reg [19:0] dir;
+    reg [19:0] pullup;
+
+    wire [19:0] data_in;
+
+    genvar i;
+    generate
+        for (i = 0; i < 20; i = i + 1) begin : gpio_buf
+            assign gpio_pins[i] = dir[i] ? data_out[i] : 1'bz;
+            assign data_in[i]   = gpio_pins[i];
+        end
+    endgenerate
+
+    wire [3:0] reg_sel = wb_adr_i[5:2];
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            data_out <= 20'h00000;
+            dir      <= 20'h00000;
+            pullup   <= 20'h00000;
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (reg_sel)
+                        4'h0: data_out <= wb_dat_i[19:0];
+                        4'h2: dir      <= wb_dat_i[19:0];
+                        4'h3: pullup   <= wb_dat_i[19:0];
+                        default: ;
+                    endcase
+                end else begin
+                    case (reg_sel)
+                        4'h0: wb_dat_o <= {12'h0, data_out};
+                        4'h1: wb_dat_o <= {12'h0, data_in};
+                        4'h2: wb_dat_o <= {12'h0, dir};
+                        4'h3: wb_dat_o <= {12'h0, pullup};
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+
+endmodule
+
+NOTES:
+- This block is simple but complete: it supports reads/writes, direction, and input sampling.
+- PULLUP is stored but not physically enforced; external pull-ups are still needed for some uses.
+
+================================================================================
+STEP 2 — UPDATE top_soc.sv TO INSTANTIATE GPIO (s4) + EXPOSE GPIO PINS
+================================================================================
+
+We’ll:
+
+- Add `gpio_pins[19:0]` to top_soc ports.
+- Replace the s4 stub with a gpio_wb instance.
+- Map GPIO bits to physical pins (DE0-Lite Arduino header + LEDs) via pin assignments.
+
+Proposed mapping (logical, final mapping via QSF):
+
+- gpio_pins[0]  → Arduino D2
+- gpio_pins[1]  → D3
+- gpio_pins[2]  → D4
+- gpio_pins[3]  → D5
+- gpio_pins[4]  → D6
+- gpio_pins[5]  → D7
+- gpio_pins[6]  → D8
+- gpio_pins[7]  → D9
+- gpio_pins[8]  → D10 (but watch out: already used as SPI SS0; you may choose not to share)
+- gpio_pins[9]  → D11 (SPI MOSI; again be careful about sharing)
+- gpio_pins[10] → D12
+- gpio_pins[11] → D13
+- gpio_pins[12] → A0
+- gpio_pins[13] → A1
+- gpio_pins[14] → A2
+- gpio_pins[15] → A3
+- gpio_pins[16] → A4 (shared with I2C SDA; probably not used as generic GPIO)
+- gpio_pins[17] → A5 (shared with I2C SCL)
+- gpio_pins[18] → LED0
+- gpio_pins[19] → LED1
+
+You can fine-tune this mapping later. For now, we just define the bus and use a couple of bits.
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv --------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq,
+
+    // UART0 pins
+    input  wire        uart0_rx,
+    output wire        uart0_tx,
+
+    // I2C0 pins
+    inout  wire        i2c_sda,
+    inout  wire        i2c_scl,
+
+    // SPI0 pins
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire        spi_sck,
+    output wire        spi_ss0,
+
+    // GPIO pins (to Arduino header + LEDs)
+    inout  wire [19:0] gpio_pins
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    // (UNCHANGED) AHB master/slave signals, Hazard3 tile, AHB interconnect,
+    // Boot ROM, AHB→WB bridge, WB interconnect, SDRAM, UART, I2C, SPI.
+
+    // ...
+    // All previous declarations/instantiations from Phase 1F remain here.
+    // Only s4 hookup changes.
+    // ...
+
+    // SDRAM (s0): u_sdram_wb
+    // UART0 (s1): u_uart0
+    // I2C0  (s2): u_i2c0
+    // SPI0  (s3): u_spi0
+
+    // GPIO on s4: real WB GPIO
+    gpio_wb u_gpio (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s4_adr_o),
+        .wb_dat_i   (s4_dat_o),
+        .wb_dat_o   (s4_dat_i),
+        .wb_we_i    (s4_we_o),
+        .wb_sel_i   (s4_sel_o),
+        .wb_cyc_i   (s4_cyc_o),
+        .wb_stb_i   (s4_stb_o),
+        .wb_ack_o   (s4_ack_i),
+        .wb_err_o   (s4_err_i),
+
+        .gpio_pins  (gpio_pins)
+    );
+
+    // Keep s5 as JTAG-UART stub for now
+    assign s5_dat_i = 32'hJTAG_000;  assign s5_ack_i = s5_cyc_o & s5_stb_o; assign s5_err_i = 1'b0;
+
+endmodule
+
+(Remember to keep all other signals and modules from Phase 1F intact.)
+
+================================================================================
+STEP 3 — BOOT ROM GPIO TEST (TOGGLE A GPIO + PRINT STATUS)
+================================================================================
+
+We’ll extend bootrom.c again:
+
+- UART init (as before).
+- I2C + SPI init (as in Phase 1F, or we can leave them; they do not interfere).
+- GPIO test:
+  - Set GPIO bit for a chosen pin as output (e.g. gpio_pins[18] → LED).
+  - Toggle it a few times with a delay.
+  - Print messages over UART.
+
+GPIO register base and offsets:
+
+- Base:  0x1000_0300
+- 0x00: DATA_OUT
+- 0x04: DATA_IN
+- 0x08: DIR
+- 0x0C: PULLUP
+
+We’ll use bit 18 as LED0.
+
+----- UPDATED FILE: ~/hazard3_fw/bootrom/bootrom.c ----------------------------
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+#define UART_RBR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_THR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_IER     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_FCR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_LCR     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_MCR     (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_LSR     (*(volatile uint32_t *)(UART0_BASE + 0x14))
+
+#define UART_LSR_DR   (1u << 0)
+#define UART_LSR_THRE (1u << 5)
+
+#define I2C0_BASE    0x10000100u
+#define I2C_PRER_LO  (*(volatile uint32_t *)(I2C0_BASE + 0x00))
+#define I2C_PRER_HI  (*(volatile uint32_t *)(I2C0_BASE + 0x04))
+#define I2C_CTR      (*(volatile uint32_t *)(I2C0_BASE + 0x08))
+#define I2C_TXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_RXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_CR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+#define I2C_SR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+
+#define I2C_CTR_EN   (1u << 7)
+#define I2C_CR_STA   (1u << 7)
+#define I2C_CR_STO   (1u << 6)
+#define I2C_CR_RD    (1u << 5)
+#define I2C_CR_WR    (1u << 4)
+#define I2C_CR_ACK   (1u << 3)
+
+#define I2C_SR_RXACK (1u << 7)
+#define I2C_SR_TIP   (1u << 1)
+
+#define SPI0_BASE      0x10000200u
+#define SPI_RXTX       (*(volatile uint32_t *)(SPI0_BASE + 0x00))
+#define SPI_STATUS     (*(volatile uint32_t *)(SPI0_BASE + 0x04))
+#define SPI_CTRL       (*(volatile uint32_t *)(SPI0_BASE + 0x08))
+#define SPI_DIVIDER    (*(volatile uint32_t *)(SPI0_BASE + 0x0C))
+#define SPI_SS         (*(volatile uint32_t *)(SPI0_BASE + 0x10))
+
+#define SPI_CTRL_GO     (1u << 0)
+#define SPI_CTRL_RXNEG  (1u << 1)
+#define SPI_CTRL_TXNEG  (1u << 2)
+#define SPI_CTRL_LSBF   (1u << 3)
+#define SPI_CTRL_IE     (1u << 4)
+#define SPI_CTRL_ASS    (1u << 5)
+
+#define GPIO_BASE      0x10000300u
+#define GPIO_DATA_OUT  (*(volatile uint32_t *)(GPIO_BASE + 0x00))
+#define GPIO_DATA_IN   (*(volatile uint32_t *)(GPIO_BASE + 0x04))
+#define GPIO_DIR       (*(volatile uint32_t *)(GPIO_BASE + 0x08))
+#define GPIO_PULLUP    (*(volatile uint32_t *)(GPIO_BASE + 0x0C))
+
+static void uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+    UART_LCR = 0x80u;
+    UART_THR = (divisor & 0xFFu);
+    UART_IER = ((divisor >> 8) & 0xFFu);
+    UART_LCR = 0x03u;
+    UART_FCR = 0x07u;
+    UART_MCR = 0x08u;
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_LSR & UART_LSR_THRE)) { }
+    UART_THR = (uint8_t)c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+static void uart_put_hex8(uint8_t v)
+{
+    const char hex[] = "0123456789ABCDEF";
+    uart_putc(hex[(v >> 4) & 0xF]);
+    uart_putc(hex[v & 0xF]);
+}
+
+static void i2c_init(uint32_t sys_clk_hz, uint32_t bus_khz)
+{
+    uint32_t freq = bus_khz * 1000u;
+    uint32_t presc = (sys_clk_hz / (5u * freq)) - 1u;
+    I2C_PRER_LO = (presc & 0xFFu);
+    I2C_PRER_HI = ((presc >> 8) & 0xFFu);
+    I2C_CTR     = I2C_CTR_EN;
+}
+
+static int i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t data)
+{
+    I2C_TXR = (uint32_t)((addr7 << 1) | 0u);
+    I2C_CR  = I2C_CR_STA | I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -1;
+
+    I2C_TXR = reg;
+    I2C_CR  = I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -2;
+
+    I2C_TXR = data;
+    I2C_CR  = I2C_CR_WR | I2C_CR_STO;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -3;
+
+    return 0;
+}
+
+static void spi_init(uint32_t sys_clk_hz)
+{
+    uint32_t div = 4u;
+    SPI_DIVIDER = div;
+    uint32_t ctrl = 0;
+    ctrl |= SPI_CTRL_ASS;
+    SPI_CTRL = ctrl;
+    SPI_SS   = 1u;
+}
+
+static uint8_t spi_transfer(uint8_t data)
+{
+    SPI_RXTX = data;
+    SPI_CTRL = SPI_CTRL | SPI_CTRL_GO;
+    while (SPI_CTRL & SPI_CTRL_GO) { }
+    return (uint8_t)(SPI_RXTX & 0xFFu);
+}
+
+static void delay(volatile uint32_t cycles)
+{
+    while (cycles--) {
+        __asm__ volatile("nop");
+    }
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    uart_init(SYS_CLK_HZ, 115200u);
+    uart_puts("Hazard3 Phase 1G: GPIO test\n");
+
+    i2c_init(SYS_CLK_HZ, 100u);
+    uart_puts("I2C initialized\n");
+
+    int rc = i2c_write_byte(0x68, 0x00, 0x55);
+    if (rc == 0) {
+        uart_puts("I2C write to 0x68 succeeded\n");
+    } else {
+        uart_puts("I2C write to 0x68 failed\n");
+    }
+
+    spi_init(SYS_CLK_HZ);
+    uart_puts("SPI initialized\n");
+    uint8_t resp = spi_transfer(0x9F);
+    uart_puts("SPI transfer 0x9F returned 0x");
+    uart_put_hex8(resp);
+    uart_putc('\n');
+
+    // GPIO test: use bit 18 as LED output
+    uart_puts("Configuring GPIO bit 18 as output (LED)\n");
+    GPIO_DIR    |= (1u << 18);
+    GPIO_PULLUP &= ~(1u << 18);
+
+    for (int i = 0; i < 10; i++) {
+        uart_puts("LED ON\n");
+        GPIO_DATA_OUT |= (1u << 18);
+        delay(5000000u);
+
+        uart_puts("LED OFF\n");
+        GPIO_DATA_OUT &= ~(1u << 18);
+        delay(5000000u);
+    }
+
+    uart_puts("GPIO blink test done\n");
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+Rebuild bootrom:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+Copy/refresh bootrom.hex into the Quartus project directory (or ensure boot_rom.sv points to this updated file).
+
+================================================================================
+STEP 4 — QUARTUS: ADD GPIO MODULE, MAP PINS, COMPILE, PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Add GPIO RTL:
+   - In Quartus → Add/Remove Files:
+     - ../rtl/soc/gpio_wb.sv
+     - Updated ../rtl/soc/top_soc.sv
+
+2. Pin mappings:
+   - Map gpio_pins[] bits to physical pins:
+     - At minimum map gpio_pins[18] to one of the DE0-Lite LEDs or Arduino pins
+       you can see easily (e.g., LED0).
+     - Map others according to your desired Arduino layout later.
+   - Use the DE0-Lite user manual to assign correct FPGA pins in the .qsf.
+
+3. Boot ROM:
+   - Ensure the new bootrom.hex is accessible to boot_rom.sv.
+
+4. Compile:
+   - Processing → Start Compilation.
+
+5. Program SRAM only:
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - File: h3_phase1_sc.sof.
+     - Mode: JTAG, “Program/Configure” checked.
+     - START.
+   - Do NOT generate or program any .pof; do NOT program configuration flash.
+   - Power-cycle → board returns to factory demo.
+
+6. Run-time check:
+   - Connect UART0 to USB-serial at 115200 8N1 and watch output.
+   - Program .sof into SRAM.
+   - Reset board.
+   - You should see:
+
+     Hazard3 Phase 1G: GPIO test
+     I2C initialized
+     I2C write to 0x68 ...
+     SPI initialized
+     SPI transfer 0x9F returned 0xXX
+     Configuring GPIO bit 18 as output (LED)
+     LED ON
+     LED OFF
+     ... (repeats 10 times)
+     GPIO blink test done
+
+   - And the mapped LED should visibly blink.
+
+================================================================================
+WHAT PHASE 1G GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A real, memory-mapped GPIO peripheral behind the same WB fabric as SDRAM/UART/I2C/SPI.
+- Clean Arduino/LED-level control via registers at 0x1000_0300.
+- Verified that the SoC now exercises:
+  - Instruction fetch in ROM.
+  - Peripheral access over AHB→WB to SDRAM, UART, I2C, SPI, GPIO.
+- The architecture remains:
+  - Quad-core-ready at the AHB level (M0..M3).
+  - Ephemeral configuration (SRAM-only, revert to factory on power-cycle).
+
+Next, we can:
+- 1H: integrate JTAG-UART as a WB slave on s5.
+- 1I: introduce a dual-path bootloader (UART0 + JTAG-UART) loading firmware into SDRAM.
+- 1J: build a HAL using these peripherals.
+- 1K: move to SDRAM-resident user firmware and then start multi-core work
+
+##############End Phase 1G########
+
