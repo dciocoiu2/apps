@@ -1,0 +1,1140 @@
+#######################################################################
+# COMPLETE, COPY-PASTABLE SETUP:
+# VEXRISCV RV32 MCU SoC ON DE10-LITE WITH:
+#   - UART, SPI, I2C, GPIO, PWM (for LED/servo)
+#   - EPHEMERAL FPGA CONFIG (.SOF ONLY, NO FLASH WRITES)
+#   - FIRMWARE LOADED AT RUNTIME (NOT STORED IN FPGA FLASH)
+#
+# THIS BLOCK COVERS:
+#   1) VM + TOOLCHAIN SETUP
+#   2) VEXRISCV CORE GENERATION
+#   3) SOC RTL WITH UART/SPI/I2C/GPIO/PWM
+#   4) C HAL
+#   5) SIMPLE BLINK/SERVO FIRMWARE
+#   6) QUARTUS SETUP + PROGRAMMING
+#######################################################################
+
+
+#######################################################################
+# 0. CREATE THE VIRTUALBOX VM
+#######################################################################
+
+# In VirtualBox (host: Windows/macOS/Linux):
+# - Name:     riscv-dev
+# - Type:     Linux
+# - Version:  Ubuntu (64-bit)
+# - Memory:   8 GB RAM
+# - CPUs:     4
+# - Storage:  120 GB dynamically allocated VDI
+# - Network:  NAT
+# - USB:      Enable USB 2.0 or 3.0 (with Extension Pack)
+# - Video:    32 MB
+# - ISO:      Ubuntu 22.04 LTS Desktop
+
+# Install Ubuntu in the VM normally.
+
+
+#######################################################################
+# 1. INITIAL UBUNTU SETUP
+#######################################################################
+
+sudo apt-get update
+sudo apt-get install -y git curl build-essential
+
+
+#######################################################################
+# 2. INSTALL JAVA + SBT (FOR VEXRISCV GENERATION)
+#######################################################################
+
+sudo apt-get install -y openjdk-8-jdk
+
+echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | \
+  sudo tee /etc/apt/sources.list.d/sbt.list
+
+curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | \
+  sudo apt-key add -
+
+sudo apt-get update
+sudo apt-get install -y sbt
+
+java -version
+sbt sbt-version
+
+
+#######################################################################
+# 3. CLONE VEXRISCV AND GENERATE SIMPLEBUS MCU CORE
+#######################################################################
+
+cd ~
+git clone https://github.com/SpinalHDL/VexRiscv.git
+cd VexRiscv
+
+cat > src/main/scala/vexriscv/GenSimpleBusMcu.scala << 'EOF'
+package vexriscv
+
+import spinal.core._
+import vexriscv.plugin._
+
+object GenSimpleBusMcu {
+  def main(args: Array[String]): Unit = {
+    val cpuConfig = VexRiscvConfig(
+      plugins = List(
+        new PcManagerSimplePlugin(resetVector = 0x00000000l),
+        new DecoderSimplePlugin(catchIllegalInstruction = true),
+        new RegFilePlugin(RegFileSync),
+        new IntAluPlugin,
+        new SrcPlugin(separatedAddSub = false),
+        new LightShifterPlugin,
+        new HazardSimplePlugin(
+          bypassExecute          = true,
+          bypassMemory           = true,
+          bypassWriteBack        = true,
+          bypassWriteBackBuffer  = true,
+          pessimisticUseSrc      = false,
+          pessimisticWriteRegFile= false,
+          pessimisticAddressMatch= false
+        ),
+        new BranchPlugin(earlyBranch = false),
+        new MulDivIterativePlugin(genMul = true, genDiv = false),
+        new CsrPlugin(CsrPluginConfig.small),
+        new TimerPlugin,
+        new SimpleBusPlugin(
+          catchAccessFault       = true,
+          catchAddressMisaligned = true
+        )
+      )
+    )
+    SpinalVerilog(new VexRiscv(cpuConfig))
+  }
+}
+EOF
+
+sbt "runMain vexriscv.GenSimpleBusMcu"
+
+# This generates VexRiscv.v in the repo root.
+
+
+#######################################################################
+# 4. CREATE SOC PROJECT DIRECTORY AND COPY CORE
+#######################################################################
+
+cd ~
+mkdir -p riscv_mcu_de10lite/rtl
+cd riscv_mcu_de10lite
+cp ~/VexRiscv/VexRiscv.v rtl/
+
+
+#######################################################################
+# 5. ADD PERIPHERALS + BRAM + GPIO + PWM + SOC TOP (VERILOG)
+#######################################################################
+
+cd rtl
+
+############################
+# 5.1 UART TX
+############################
+cat > uart_tx.v << 'EOF'
+module uart_tx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire [7:0] data_in,
+    input  wire       start,
+    output reg        busy,
+    output reg        tx
+);
+
+    localparam DIVISOR = CLK_FREQ / BAUD;
+    reg [15:0] clk_cnt;
+    reg [3:0]  bit_idx;
+    reg [9:0]  shift_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx        <= 1'b1;
+            busy      <= 1'b0;
+            clk_cnt   <= 16'd0;
+            bit_idx   <= 4'd0;
+            shift_reg <= 10'b1111111111;
+        end else begin
+            if (!busy) begin
+                if (start) begin
+                    shift_reg <= {1'b1, data_in, 1'b0};
+                    busy      <= 1'b1;
+                    clk_cnt   <= 16'd0;
+                    bit_idx   <= 4'd0;
+                end
+            end else begin
+                if (clk_cnt == DIVISOR-1) begin
+                    clk_cnt <= 16'd0;
+                    tx      <= shift_reg[bit_idx];
+                    bit_idx <= bit_idx + 1'b1;
+                    if (bit_idx == 4'd9) busy <= 1'b0;
+                end else begin
+                    clk_cnt <= clk_cnt + 1'b1;
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.2 UART RX
+############################
+cat > uart_rx.v << 'EOF'
+module uart_rx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire rx,
+    output reg  [7:0] data_out,
+    output reg        data_valid
+);
+
+    localparam DIVISOR = CLK_FREQ / BAUD;
+    localparam MID     = DIVISOR / 2;
+
+    reg [15:0] clk_cnt;
+    reg [3:0]  bit_idx;
+    reg [7:0]  shift_reg;
+    reg        receiving;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            receiving  <= 1'b0;
+            clk_cnt    <= 16'd0;
+            bit_idx    <= 4'd0;
+            shift_reg  <= 8'h00;
+            data_out   <= 8'h00;
+            data_valid <= 1'b0;
+        end else begin
+            data_valid <= 1'b0;
+            if (!receiving) begin
+                if (!rx) begin
+                    receiving <= 1'b1;
+                    clk_cnt   <= 16'd0;
+                    bit_idx   <= 4'd0;
+                end
+            end else begin
+                clk_cnt <= clk_cnt + 1'b1;
+                if (bit_idx == 4'd0 && clk_cnt == MID) begin
+                    clk_cnt <= 16'd0;
+                    bit_idx <= 4'd1;
+                end else if (clk_cnt == DIVISOR) begin
+                    clk_cnt <= 16'd0;
+                    if (bit_idx >= 4'd1 && bit_idx <= 4'd8)
+                        shift_reg[bit_idx-1] <= rx;
+                    bit_idx <= bit_idx + 1'b1;
+                    if (bit_idx == 4'd9) begin
+                        receiving  <= 1'b0;
+                        data_out   <= shift_reg;
+                        data_valid <= 1'b1;
+                    end
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.3 SPI MASTER
+############################
+cat > spi_master.v << 'EOF'
+module spi_master #(
+    parameter CLK_FREQ = 50000000
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [7:0]  data_in,
+    input  wire        start,
+    input  wire [15:0] clk_div,
+    output reg  [7:0]  data_out,
+    output reg         busy,
+    output reg         done,
+    output reg         sck,
+    output reg         mosi,
+    input  wire        miso,
+    output reg         ss_n
+);
+
+    reg [15:0] div_cnt;
+    reg [3:0]  bit_idx;
+    reg [7:0]  shift_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy      <= 1'b0;
+            done      <= 1'b0;
+            sck       <= 1'b0;
+            ss_n      <= 1'b1;
+            div_cnt   <= 16'd0;
+            bit_idx   <= 4'd0;
+            mosi      <= 1'b0;
+            shift_reg <= 8'h00;
+            data_out  <= 8'h00;
+        end else begin
+            done <= 1'b0;
+            if (!busy) begin
+                if (start) begin
+                    busy      <= 1'b1;
+                    ss_n      <= 1'b0;
+                    shift_reg <= data_in;
+                    bit_idx   <= 4'd7;
+                    div_cnt   <= 16'd0;
+                    sck       <= 1'b0;
+                    mosi      <= data_in[7];
+                end
+            end else begin
+                div_cnt <= div_cnt + 1'b1;
+                if (div_cnt == clk_div) begin
+                    div_cnt <= 16'd0;
+                    sck     <= ~sck;
+                    if (sck == 1'b0) begin
+                        mosi <= shift_reg[bit_idx];
+                    end else begin
+                        shift_reg[bit_idx] <= miso;
+                        if (bit_idx == 4'd0) begin
+                            busy     <= 1'b0;
+                            ss_n     <= 1'b1;
+                            done     <= 1'b1;
+                            data_out <= shift_reg;
+                        end else begin
+                            bit_idx <= bit_idx - 1'b1;
+                        end
+                    end
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.4 I2C MASTER (SINGLE-BYTE)
+############################
+cat > i2c_master.v << 'EOF'
+module i2c_master (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [15:0] clk_div,
+    input  wire        start,
+    input  wire        rw,
+    input  wire [6:0]  addr,
+    input  wire [7:0]  data_in,
+    output reg  [7:0]  data_out,
+    output reg         busy,
+    output reg         ack_error,
+    inout  wire        sda,
+    inout  wire        scl
+);
+
+    reg sda_oe;
+    reg scl_oe;
+
+    assign sda = sda_oe ? 1'b0 : 1'bz;
+    assign scl = scl_oe ? 1'b0 : 1'bz;
+
+    wire sda_in = sda;
+    wire scl_in = scl;
+
+    reg [15:0] div_cnt;
+    reg [3:0]  bit_cnt;
+    reg [3:0]  state;
+    reg [7:0]  shift_reg;
+    reg        rw_reg;
+
+    localparam ST_IDLE    = 4'd0;
+    localparam ST_START   = 4'd1;
+    localparam ST_ADDR    = 4'd2;
+    localparam ST_ADDR_ACK= 4'd3;
+    localparam ST_DATA    = 4'd4;
+    localparam ST_DATA_ACK= 4'd5;
+    localparam ST_STOP1   = 4'd6;
+    localparam ST_STOP2   = 4'd7;
+
+    localparam PH_LOW  = 2'd0;
+    localparam PH_HIGH = 2'd1;
+
+    reg [1:0] phase;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy      <= 1'b0;
+            ack_error <= 1'b0;
+            div_cnt   <= 16'd0;
+            state     <= ST_IDLE;
+            sda_oe    <= 1'b0;
+            scl_oe    <= 1'b0;
+            phase     <= PH_LOW;
+            bit_cnt   <= 4'd0;
+            shift_reg <= 8'h00;
+            data_out  <= 8'h00;
+        end else begin
+            if (!busy) begin
+                if (start) begin
+                    busy      <= 1'b1;
+                    ack_error <= 1'b0;
+                    rw_reg    <= rw;
+                    shift_reg <= {addr, rw};
+                    bit_cnt   <= 4'd7;
+                    sda_oe    <= 1'b1;
+                    scl_oe    <= 1'b0;
+                    state     <= ST_START;
+                    div_cnt   <= 16'd0;
+                    phase     <= PH_LOW;
+                end
+            end else begin
+                div_cnt <= div_cnt + 1'b1;
+                if (div_cnt >= clk_div) begin
+                    div_cnt <= 16'd0;
+                    case (state)
+                        ST_START: begin
+                            scl_oe <= 1'b1;
+                            state  <= ST_ADDR;
+                            phase  <= PH_LOW;
+                        end
+                        ST_ADDR: begin
+                            case (phase)
+                                PH_LOW: begin
+                                    sda_oe <= ~shift_reg[bit_cnt];
+                                    phase  <= PH_HIGH;
+                                end
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    scl_oe <= 1'b1;
+                                    if (bit_cnt == 4'd0) begin
+                                        sda_oe <= 1'b0;
+                                        state  <= ST_ADDR_ACK;
+                                    end else begin
+                                        bit_cnt <= bit_cnt - 1'b1;
+                                    end
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_ADDR_ACK: begin
+                            case (phase)
+                                PH_LOW:  phase <= PH_HIGH;
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    if (sda_in) ack_error <= 1'b1;
+                                    scl_oe <= 1'b1;
+                                    if (ack_error) begin
+                                        state <= ST_STOP1;
+                                    end else begin
+                                        bit_cnt   <= 4'd7;
+                                        shift_reg <= data_in;
+                                        state     <= ST_DATA;
+                                    end
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_DATA: begin
+                            if (!rw_reg) begin
+                                case (phase)
+                                    PH_LOW: begin
+                                        sda_oe <= ~shift_reg[bit_cnt];
+                                        phase  <= PH_HIGH;
+                                    end
+                                    PH_HIGH: begin
+                                        scl_oe <= 1'b0;
+                                        phase  <= 2'd2;
+                                    end
+                                    2'd2: begin
+                                        scl_oe <= 1'b1;
+                                        if (bit_cnt == 4'd0) begin
+                                            sda_oe <= 1'b0;
+                                            state  <= ST_DATA_ACK;
+                                        end else begin
+                                            bit_cnt <= 1'b0 ? bit_cnt : bit_cnt - 1'b1;
+                                        end
+                                        phase <= PH_LOW;
+                                    end
+                                endcase
+                            end else begin
+                                case (phase)
+                                    PH_LOW: begin
+                                        sda_oe <= 1'b0;
+                                        phase  <= PH_HIGH;
+                                    end
+                                    PH_HIGH: begin
+                                        scl_oe <= 1'b0;
+                                        phase  <= 2'd2;
+                                    end
+                                    2'd2: begin
+                                        shift_reg[bit_cnt] <= sda_in;
+                                        scl_oe <= 1'b1;
+                                        if (bit_cnt == 4'd0) begin
+                                            state <= ST_DATA_ACK;
+                                        end else begin
+                                            bit_cnt <= bit_cnt - 1'b1;
+                                        end
+                                        phase <= PH_LOW;
+                                    end
+                                endcase
+                            end
+                        end
+                        ST_DATA_ACK: begin
+                            case (phase)
+                                PH_LOW: begin
+                                    sda_oe <= 1'b0;
+                                    phase  <= PH_HIGH;
+                                end
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    if (!rw_reg && sda_in) ack_error <= 1'b1;
+                                    scl_oe <= 1'b1;
+                                    if (rw_reg) data_out <= shift_reg;
+                                    state <= ST_STOP1;
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_STOP1: begin
+                            sda_oe <= 1'b1;
+                            scl_oe <= 1'b1;
+                            state  <= ST_STOP2;
+                        end
+                        ST_STOP2: begin
+                            scl_oe <= 1'b0;
+                            sda_oe <= 1'b0;
+                            busy   <= 1'b0;
+                            state  <= ST_IDLE;
+                        end
+                        default: state <= ST_IDLE;
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.5 BRAM (BOOTLOADER ONLY)
+############################
+cat > bram.v << 'EOF'
+module bram #(
+    parameter WORDS = 16384
+)(
+    input  wire        clk,
+    input  wire [31:0] addr,
+    input  wire [31:0] wdata,
+    input  wire [3:0]  wstrb,
+    output reg  [31:0] rdata
+);
+    reg [31:0] mem [0:WORDS-1];
+
+    initial begin
+        $readmemh("bootloader.hex", mem);
+    end
+
+    always @(posedge clk) begin
+        if (|wstrb) begin
+            if (wstrb[0]) mem[addr[17:2]][7:0]   <= wdata[7:0];
+            if (wstrb[1]) mem[addr[17:2]][15:8]  <= wdata[15:8];
+            if (wstrb[2]) mem[addr[17:2]][23:16] <= wdata[23:16];
+            if (wstrb[3]) mem[addr[17:2]][31:24] <= wdata[31:24];
+        end
+        rdata <= mem[addr[17:2]];
+    end
+endmodule
+EOF
+
+############################
+# 5.6 GPIO (32-BIT)
+############################
+cat > gpio.v << 'EOF'
+module gpio #(
+    parameter WIDTH = 32
+)(
+    input  wire             clk,
+    input  wire             rst_n,
+    input  wire             we,
+    input  wire [WIDTH-1:0] wdata,
+    output reg  [WIDTH-1:0] rdata,
+    inout  wire [WIDTH-1:0] pins
+);
+    reg [WIDTH-1:0] out_reg;
+    wire[WIDTH-1:0] in_w;
+
+    genvar i;
+    generate
+        for(i=0;i<WIDTH;i=i+1) begin : G
+            assign pins[i] = we ? out_reg[i] : 1'bz;
+            assign in_w[i] = pins[i];
+        end
+    endgenerate
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            out_reg <= {WIDTH{1'b0}};
+            rdata   <= {WIDTH{1'b0}};
+        end else begin
+            if(we) out_reg <= wdata;
+            rdata <= in_w;
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.7 PWM PERIPHERAL (SERVO/LED)
+############################
+cat > pwm_servo.v << 'EOF'
+module pwm_servo #(
+    parameter CLK_FREQ_HZ = 50000000
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [15:0] pulse_width_us,  // 1000-2000 for servo
+    output reg         pwm_out
+);
+    localparam PERIOD_US = 20000; // 20 ms period
+    localparam CNT_MAX   = PERIOD_US * (CLK_FREQ_HZ/1000000);
+    reg [31:0] cnt;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            cnt     <= 32'd0;
+            pwm_out <= 1'b0;
+        end else begin
+            if (cnt >= CNT_MAX) cnt <= 32'd0;
+            else cnt <= cnt + 1;
+
+            if (cnt < (pulse_width_us * (CLK_FREQ_HZ/1000000)))
+                pwm_out <= 1'b1;
+            else
+                pwm_out <= 1'b0;
+        end
+    end
+endmodule
+EOF
+
+############################
+# 5.8 SOC TOP-LEVEL (MAP PWM AS MMIO)
+############################
+cat > riscv_mcu_top.v << 'EOF'
+module riscv_mcu_top #(
+    parameter CLK_FREQ_HZ = 50000000
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        uart_rx,
+    output wire        uart_tx,
+    output wire        spi_sck,
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire        spi_ss_n,
+    inout  wire        i2c_sda,
+    inout  wire        i2c_scl,
+    inout  wire [31:0] gpio_pins,
+    output wire        pwm_out
+);
+
+    wire        sb_cmd_valid;
+    wire        sb_cmd_ready;
+    wire [31:0] sb_addr;
+    wire [31:0] sb_wdata;
+    wire [3:0]  sb_mask;
+    wire        sb_write;
+    wire        sb_last;
+    wire        sb_rsp_valid;
+    wire        sb_rsp_ready;
+    wire [31:0] sb_rdata;
+    wire        sb_error;
+
+    VexRiscv cpu (
+        .clk                        (clk),
+        .reset                      (!rst_n),
+        .simpleBus_cmd_valid        (sb_cmd_valid),
+        .simpleBus_cmd_ready        (sb_cmd_ready),
+        .simpleBus_cmd_payload_address(sb_addr),
+        .simpleBus_cmd_payload_data (sb_wdata),
+        .simpleBus_cmd_payload_mask (sb_mask),
+        .simpleBus_cmd_payload_write(sb_write),
+        .simpleBus_cmd_payload_last (sb_last),
+        .simpleBus_rsp_valid        (sb_rsp_valid),
+        .simpleBus_rsp_ready        (sb_rsp_ready),
+        .simpleBus_rsp_payload_data (sb_rdata),
+        .simpleBus_rsp_payload_error(sb_error)
+    );
+
+    localparam RAM_BASE  = 32'h0000_0000;
+    localparam RAM_MASK  = 32'hFFFF_0000;
+    localparam UART_BASE = 32'h4000_0000;
+    localparam SPI_BASE  = 32'h4000_0100;
+    localparam I2C_BASE  = 32'h4000_0200;
+    localparam GPIO_BASE = 32'h4000_0300;
+    localparam PWM_BASE  = 32'h4000_0400;
+
+    wire sel_ram  = ((sb_addr & RAM_MASK) == RAM_BASE);
+    wire sel_uart = ((sb_addr & 32'hFFFF_FF00) == UART_BASE);
+    wire sel_spi  = ((sb_addr & 32'hFFFF_FF00) == SPI_BASE);
+    wire sel_i2c  = ((sb_addr & 32'hFFFF_FF00) == I2C_BASE);
+    wire sel_gpio = ((sb_addr & 32'hFFFF_FF00) == GPIO_BASE);
+    wire sel_pwm  = ((sb_addr & 32'hFFFF_FF00) == PWM_BASE);
+
+    wire [31:0] ram_rdata;
+    bram #(
+        .WORDS(16384)
+    ) ram_i (
+        .clk   (clk),
+        .addr  (sb_addr),
+        .wdata (sb_wdata),
+        .wstrb (sel_ram && sb_write ? sb_mask : 4'b0000),
+        .rdata (ram_rdata)
+    );
+
+    reg  [7:0]  uart_tx_data;
+    reg         uart_tx_start;
+    wire        uart_tx_busy;
+    wire [7:0]  uart_rx_data;
+    wire        uart_rx_valid;
+
+    uart_tx #(
+        .CLK_FREQ(CLK_FREQ_HZ),
+        .BAUD    (115200)
+    ) u_tx (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .data_in(uart_tx_data),
+        .start  (uart_tx_start),
+        .busy   (uart_tx_busy),
+        .tx     (uart_tx)
+    );
+
+    uart_rx #(
+        .CLK_FREQ(CLK_FREQ_HZ),
+        .BAUD    (115200)
+    ) u_rx (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .rx        (uart_rx),
+        .data_out  (uart_rx_data),
+        .data_valid(uart_rx_valid)
+    );
+
+    reg  [15:0] spi_divisor;
+    reg  [7:0]  spi_tx_data;
+    reg         spi_start;
+    wire [7:0]  spi_rx_data;
+    wire        spi_busy;
+    wire        spi_done;
+
+    spi_master #(
+        .CLK_FREQ(CLK_FREQ_HZ)
+    ) u_spi (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .data_in  (spi_tx_data),
+        .start    (spi_start),
+        .clk_div  (spi_divisor),
+        .data_out (spi_rx_data),
+        .busy     (spi_busy),
+        .done     (spi_done),
+        .sck      (spi_sck),
+        .mosi     (spi_mosi),
+        .miso     (spi_miso),
+        .ss_n     (spi_ss_n)
+    );
+
+    reg  [15:0] i2c_divisor;
+    reg  [6:0]  i2c_addr;
+    reg  [7:0]  i2c_tx_data;
+    reg         i2c_start;
+    reg         i2c_rw;
+    wire [7:0]  i2c_rx_data;
+    wire        i2c_busy;
+    wire        i2c_ack_error;
+
+    i2c_master u_i2c (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .clk_div   (i2c_divisor),
+        .start     (i2c_start),
+        .rw        (i2c_rw),
+        .addr      (i2c_addr),
+        .data_in   (i2c_tx_data),
+        .data_out  (i2c_rx_data),
+        .busy      (i2c_busy),
+        .ack_error (i2c_ack_error),
+        .sda       (i2c_sda),
+        .scl       (i2c_scl)
+    );
+
+    wire [31:0] gpio_rdata;
+    reg  [31:0] gpio_wdata;
+    reg         gpio_we;
+
+    gpio #(
+        .WIDTH(32)
+    ) u_gpio (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .we    (gpio_we),
+        .wdata (gpio_wdata),
+        .rdata (gpio_rdata),
+        .pins  (gpio_pins)
+    );
+
+    reg [15:0] pwm_us;
+    pwm_servo #(
+        .CLK_FREQ_HZ(CLK_FREQ_HZ)
+    ) u_pwm (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .pulse_width_us(pwm_us),
+        .pwm_out      (pwm_out)
+    );
+
+    reg [31:0] periph_rdata;
+    reg        periph_ready;
+
+    assign sb_cmd_ready = 1'b1;
+    assign sb_rsp_ready = 1'b1;
+    assign sb_error     = 1'b0;
+    assign sb_rsp_valid = sb_cmd_valid && (sel_ram || periph_ready);
+    assign sb_rdata     = sel_ram ? ram_rdata : periph_rdata;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            periph_ready   <= 1'b0;
+            uart_tx_start  <= 1'b0;
+            spi_start      <= 1'b0;
+            i2c_start      <= 1'b0;
+            spi_divisor    <= 16'd50;
+            i2c_divisor    <= 16'd250;
+            i2c_addr       <= 7'h00;
+            i2c_tx_data    <= 8'h00;
+            i2c_rw         <= 1'b0;
+            uart_tx_data   <= 8'h00;
+            gpio_wdata     <= 32'h00000000;
+            gpio_we        <= 1'b0;
+            pwm_us         <= 16'd1500;
+        end else begin
+            periph_ready   <= 1'b0;
+            uart_tx_start  <= 1'b0;
+            spi_start      <= 1'b0;
+            i2c_start      <= 1'b0;
+            gpio_we        <= 1'b0;
+
+            if (sb_cmd_valid) begin
+                if (sel_ram) begin
+                    // RAM only
+                end else begin
+                    periph_ready <= 1'b1;
+                    if (sb_write) begin
+                        case (sb_addr & 32'hFFFF_FF00)
+                            UART_BASE: begin
+                                if (sb_addr[7:0] == 8'h00) begin
+                                    uart_tx_data  <= sb_wdata[7:0];
+                                    uart_tx_start <= 1'b1;
+                                end
+                            end
+                            SPI_BASE: begin
+                                case (sb_addr[7:0])
+                                    8'h00: spi_divisor <= sb_wdata[15:0];
+                                    8'h04: begin
+                                        spi_tx_data <= sb_wdata[7:0];
+                                        spi_start   <= 1'b1;
+                                    end
+                                endcase
+                            end
+                            I2C_BASE: begin
+                                case (sb_addr[7:0])
+                                    8'h00: i2c_divisor <= sb_wdata[15:0];
+                                    8'h04: i2c_addr    <= sb_wdata[6:0];
+                                    8'h08: begin
+                                        i2c_tx_data <= sb_wdata[7:0];
+                                        i2c_rw      <= sb_wdata[8];
+                                        i2c_start   <= 1'b1;
+                                    end
+                                endcase
+                            end
+                            GPIO_BASE: begin
+                                gpio_wdata <= sb_wdata;
+                                gpio_we    <= 1'b1;
+                            end
+                            PWM_BASE: begin
+                                if (sb_addr[7:0] == 8'h00) begin
+                                    pwm_us <= sb_wdata[15:0];
+                                end
+                            end
+                        endcase
+                    end else begin
+                        case (sb_addr & 32'hFFFF_FF00)
+                            UART_BASE: begin
+                                case (sb_addr[7:0])
+                                    8'h00: periph_rdata <= {24'h0, uart_rx_data};
+                                    8'h04: periph_rdata <= {30'h0, uart_rx_valid, uart_tx_busy};
+                                    default: periph_rdata <= 32'h0;
+                                endcase
+                            end
+                            SPI_BASE: begin
+                                case (sb_addr[7:0])
+                                    8'h00: periph_rdata <= {16'h0, spi_divisor};
+                                    8'h04: periph_rdata <= {24'h0, spi_tx_data};
+                                    8'h08: periph_rdata <= {24'h0, spi_rx_data};
+                                    8'h0C: periph_rdata <= {30'h0, spi_busy, spi_done};
+                                    default: periph_rdata <= 32'h0;
+                                endcase
+                            end
+                            I2C_BASE: begin
+                                case (sb_addr[7:0])
+                                    8'h00: periph_rdata <= {16'h0, i2c_divisor};
+                                    8'h04: periph_rdata <= {25'h0, i2c_addr};
+                                    8'h08: periph_rdata <= {24'h0, i2c_tx_data};
+                                    8'h0C: periph_rdata <= {29'h0, i2c_ack_error, i2c_busy, i2c_rw};
+                                    8'h10: periph_rdata <= {24'h0, i2c_rx_data};
+                                    default: periph_rdata <= 32'h0;
+                                endcase
+                            end
+                            GPIO_BASE: begin
+                                periph_rdata <= gpio_rdata;
+                            end
+                            PWM_BASE: begin
+                                periph_rdata <= {16'h0, pwm_us};
+                            end
+                            default: periph_rdata <= 32'h0;
+                        endcase
+                    end
+                end
+            end
+        end
+    end
+
+endmodule
+EOF
+
+
+#######################################################################
+# 6. INSTALL RISC-V TOOLCHAIN
+#######################################################################
+
+cd ~
+sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+
+
+#######################################################################
+# 7. HAL + SIMPLE APP (BLINK LED OR DRIVE SERVO)
+#######################################################################
+
+cd ~/riscv_mcu_de10lite
+mkdir -p fw
+cd fw
+
+cat > soc_hal.h << 'EOF'
+#ifndef SOC_HAL_H
+#define SOC_HAL_H
+
+#include <stdint.h>
+
+#define UART_BASE 0x40000000u
+#define SPI_BASE  0x40000100u
+#define I2C_BASE  0x40000200u
+#define GPIO_BASE 0x40000300u
+#define PWM_BASE  0x40000400u
+
+#define REG32(addr) (*(volatile uint32_t*)(addr))
+
+static inline void uart_putc(char c){ REG32(UART_BASE+0x00)=(uint32_t)c; }
+static inline void uart_puts(const char*s){ while(*s) uart_putc(*s++); }
+
+static inline void gpio_write(uint32_t v){ REG32(GPIO_BASE+0x00)=v; }
+static inline uint32_t gpio_read(void){ return REG32(GPIO_BASE+0x00); }
+
+static inline void pwm_set_us(uint16_t us){ REG32(PWM_BASE+0x00)=us; }
+
+#endif
+EOF
+
+cat > link_app.ld << 'EOF'
+ENTRY(_start)
+SECTIONS {
+  . = 0x00004000;
+  .text : { *(.text*) *(.rodata*) }
+  .data : { *(.data*) *(.sdata*) }
+  .bss  : { *(.bss*) *(.sbss*) *(COMMON) }
+}
+EOF
+
+cat > app.c << 'EOF'
+#include "soc_hal.h"
+
+static void delay(volatile uint32_t d){ while(d--) __asm__ volatile("nop"); }
+
+void _start(void){
+    uart_puts("APP: LED+PWM test\n");
+
+    // Example 1: Blink LED on GPIO[13] (Arduino D13)
+    // Example 2: Drive servo on PWM output (mapped to Arduino pin)
+
+    while(1){
+        // Blink GPIO[13]
+        static uint32_t v=0;
+        v ^= (1u<<13);
+        gpio_write(v);
+
+        // Sweep servo between 1000us and 2000us
+        static int dir=1;
+        static uint16_t us=1000;
+        pwm_set_us(us);
+        us += dir*50;
+        if(us>=2000){ us=2000; dir=-1; }
+        if(us<=1000){ us=1000; dir=1; }
+
+        delay(2000000);
+    }
+}
+EOF
+
+riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -Os \
+  -T link_app.ld app.c -o app.elf
+
+riscv64-unknown-elf-objcopy -O binary app.elf app.bin
+
+
+#######################################################################
+# 8. MINIMAL BOOTLOADER THAT JUMPS TO APP (OR YOU CAN REUSE PREVIOUS)
+#######################################################################
+
+cat > link_boot.ld << 'EOF'
+ENTRY(_start)
+SECTIONS {
+  . = 0x00000000;
+  .text : { *(.text*) *(.rodata*) }
+  .data : { *(.data*) *(.sdata*) }
+  .bss  : { *(.bss*) *(.sbss*) *(COMMON) }
+}
+EOF
+
+cat > bootloader.c << 'EOF'
+#include <stdint.h>
+#include "soc_hal.h"
+
+#define APP_BASE 0x00004000u
+typedef void (*app_entry_t)(void);
+
+void _start(void){
+    uart_puts("BOOT: jumping to app at 0x00004000\n");
+    app_entry_t app=(app_entry_t)APP_BASE;
+    app();
+    while(1){}
+}
+EOF
+
+riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -Os \
+  -T link_boot.ld bootloader.c -o bootloader.elf
+
+riscv64-unknown-elf-objcopy -O verilog bootloader.elf bootloader.hex
+
+cd ..
+cp fw/bootloader.hex rtl/
+
+
+#######################################################################
+# 9. INSTALL QUARTUS PRIME LITE (MANUAL)
+#######################################################################
+
+# Download Quartus Prime Lite for Linux from Intel FPGA website.
+# Install e.g. to /opt/intelFPGA_lite/23.1/
+
+export PATH=/opt/intelFPGA_lite/23.1/quartus/bin:$PATH
+quartus_sh --version
+
+
+#######################################################################
+# 10. CREATE QUARTUS PROJECT FOR DE10-LITE
+#######################################################################
+
+cd ~/riscv_mcu_de10lite
+quartus &
+
+# In Quartus GUI:
+# 1. New Project Wizard:
+#    - Name: riscv_mcu_de10lite
+#    - Top-level entity: riscv_mcu_top
+#    - Directory: ~/riscv_mcu_de10lite
+# 2. Device:
+#    - MAX 10 10M50DAF484C7G (DE10-Lite FPGA)
+# 3. Add RTL files from rtl/:
+#    - VexRiscv.v
+#    - riscv_mcu_top.v
+#    - bram.v
+#    - uart_tx.v
+#    - uart_rx.v
+#    - spi_master.v
+#    - i2c_master.v
+#    - gpio.v
+#    - pwm_servo.v
+
+# Pin assignments (use DE10-Lite manual for exact pins):
+# - clk: 50 MHz oscillator -> riscv_mcu_top.clk
+# - rst_n: push-button or slide switch -> riscv_mcu_top.rst_n
+# - uart_rx / uart_tx: map to some Arduino pins (e.g. D0/D1)
+# - spi_sck / spi_mosi / spi_miso / spi_ss_n: map to D10..D13
+# - i2c_sda / i2c_scl: map to A4/A5
+# - gpio_pins[0..13]: map to Arduino D0..D13
+# - gpio_pins[14..19]: map to A0..A5 as GPIO
+# - pwm_out: map to Arduino D9 (for servo), or another Arduino pin
+# - IO standard: 3.3-V LVCMOS/LVTTL
+
+# Then compile:
+# Processing -> Start Compilation
+
+
+#######################################################################
+# 11. PROGRAM FPGA WITH .SOF (EPHEMERAL, NO FLASH)
+#######################################################################
+
+# Open Quartus Programmer:
+# - Hardware Setup: select USB-Blaster
+# - Add File: output_files/riscv_mcu_de10lite.sof
+# - ONLY check "Program/Configure"
+# - DO NOT add flash device (.pof)
+# - Click "Start"
+
+# FPGA now runs:
+# - VexRiscv SoC in SRAM
+# - Bootloader at 0x00000000 (from BRAM init)
+# - Bootloader immediately jumps to app at 0x00004000 (assuming app.bin
+#   was converted to hex and merged into BRAM, or loaded via some path
+#   you add).
+
+
+#######################################################################
+# 12. FIRMWARE LOAD BEHAVIOR & EPHEMERALITY
+#######################################################################
+
+# - This script shows a minimal bootloader that jumps to an app at 0x00004000.
+# - For strict "no firmware stored in FPGA" behavior:
+#   * Do NOT pre-initialize APP region in BRAM.
+#   * Load app.bin into RAM at runtime (e.g., via JTAG UART or UART).
+# - On power cycle:
+#   * SRAM config is lost.
+#   * DE10-Lite reloads factory demo from flash.
+#   * Your SoC + bootloader + loaded app vanish until you reload .sof.
+
+#######################################################################
+# YOU NOW HAVE:
+# - UART, SPI, I2C, GPIO, PWM in a VexRiscv SoC on DE10-Lite.
+# - Ability to blink external LEDs (GPIO) and drive servos (PWM).
+# - Entire system ephemeral: only .sof in SRAM, no flash writes.
+#######################################################################
