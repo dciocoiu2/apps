@@ -1,0 +1,42 @@
+================================================================================
+PHASE 0 — BUILD VM SETUP (THE TRUE FIRST STEP)
+================================================================================
+
+1. Create a new VM (VirtualBox, VMware, QEMU, Hyper-V — your choice)
+   - 4 cores
+   - 8–16 GB RAM
+   - 80–120 GB disk
+   - Enable virtualization extensions (VT-x/AMD-V)
+
+2. Install Linux (recommended: Ubuntu 22.04 LTS)
+   - Minimal install
+   - OpenSSH server enabled
+   - No snaps needed
+
+3. Update system
+   sudo apt update && sudo apt upgrade -y
+
+4. Install essential build tools
+   sudo apt install -y build-essential git cmake python3 python3-pip \
+       libssl-dev libffi-dev pkg-config curl wget unzip
+
+5. Install Quartus Lite (Intel FPGA)
+   - Download: https://www.intel.com/content/www/us/en/software-kit/671488/intel-quartus-prime-lite-edition-design-software-version-22-1-2-for-linux.html
+   - Install to /opt/intelFPGA
+   - Add to PATH:
+     echo 'export PATH=/opt/intelFPGA/22.1/quartus/bin:$PATH' >> ~/.bashrc
+
+6. Install RISC-V GCC toolchain
+   sudo apt install gcc-riscv64-unknown-elf gdb-multiarch
+
+7. Create workspace directory
+   mkdir ~/h3soc
+   cd ~/h3soc
+
+8. Snapshot the VM
+   - Name: “clean-base”
+   - This becomes your reproducible starting point.
+
+================================================================================
+END OF PHASE 0
+================================================================================
