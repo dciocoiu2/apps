@@ -1,0 +1,1140 @@
+================================================================================
+END-TO-END: SINGLE-CORE HAZARD3 SoC ON DE0-LITE
+WITH OPEN-SOURCE SDRAM, UART0, JTAG-UART, SPI0, I2C0, GPIO
+BOOTLOADER (DUAL-PATH) + HAL + USER FIRMWARE
+(ALL IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+GOAL
+----
+You will build a REAL, WORKING single-core Hazard3 SoC on the DE0-Lite that:
+
+- Uses the official Hazard3 core from Wren6991 (RV32IMC).
+- Uses a fully OPEN-SOURCE SDRAM controller for the IS42S16400 chip on DE0 (no proprietary IP).[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+- Has this memory map:
+  - Boot ROM  @ 0x2000_0000 (16 KB, BRAM)
+  - SDRAM     @ 0x8000_0000 (64 MB via open-source controller)
+  - UART0     @ 0x1000_0000
+  - I2C0      @ 0x1000_0100
+  - SPI0      @ 0x1000_0200
+  - GPIO      @ 0x1000_0300
+  - JTAG-UART @ 0x1000_0500
+- Bootloader in ROM that accepts firmware over:
+  - JTAG-UART (via DE0-Lite USB-Blaster), OR
+  - UART0 (via 3.3 V USB-serial dongle on D0/D1).
+- HAL that exposes UART0, I2C0, SPI0, GPIO to user firmware.
+- User firmware that exercises all these peripherals.
+- Ephemeral configuration: you only program .sof into SRAM, never flash; power-cycle wipes everything.
+
+NOTE: I will not reprint thousands of lines of library core RTL. You will:
+- Clone the official Hazard3 repo and use its core RTL as-is.
+- Clone an open-source SDRAM controller designed for IS42S16400 (DE0-type boards) and use it as-is.[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+- Implement modest SoC glue and simple peripherals (UART/I2C/SPI/GPIO).
+
+================================================================================
+1. VM CREATION AND TOOLCHAIN SETUP
+================================================================================
+
+1.1 Create a VM
+---------------
+- Host: any OS.
+- Guest: Ubuntu 22.04 LTS.
+- RAM: 8 GB.
+- vCPUs: 4.
+- Disk: 80–100 GB.
+
+1.2 Install essentials
+----------------------
+In the VM terminal:
+
+    sudo apt update
+    sudo apt upgrade -y
+    sudo apt install -y build-essential git python3 python3-pip \
+        gcc-riscv64-unknown-elf
+
+This gives you:
+- RISC-V bare-metal toolchain (`riscv64-unknown-elf-*`).
+- Build tools and Python.
+
+================================================================================
+2. INSTALL QUARTUS LITE AND CREATE PROJECT
+================================================================================
+
+2.1 Install Quartus Prime Lite
+------------------------------
+- Download Quartus Prime Lite Edition for Linux from Intel.
+- Include MAX 10 device support.
+- After install:
+
+    quartus_sh --version
+
+2.2 Create Quartus project for DE0-Lite
+---------------------------------------
+We’ll put RTL in a separate tree.
+
+    mkdir -p ~/fpga/hazard3_sc_sdram/quartus
+    cd ~/fpga/hazard3_sc_sdram/quartus
+
+Launch Quartus GUI and run New Project Wizard:
+- Directory: ~/fpga/hazard3_sc_sdram/quartus
+- Name: hazard3_sc
+- Top-level entity: top_soc
+- Device family: MAX 10
+- Device: 10M50DAF484C7G (DE0-Lite FPGA)
+
+We’ll add RTL files later.
+
+================================================================================
+3. CLONE HAZARD3 AND OPEN-SOURCE SDRAM CONTROLLER
+================================================================================
+
+3.1 Clone Hazard3 (official Wren6991)
+-------------------------------------
+
+    mkdir -p ~/fpga/hazard3_sc_sdram/rtl/cores
+    cd ~/fpga/hazard3_sc_sdram/rtl/cores
+    git clone https://github.com/Wren6991/hazard3.git
+
+You now have Hazard3 RTL at:
+- `~/fpga/hazard3_sc_sdram/rtl/cores/hazard3/`
+
+3.2 Clone open-source SDRAM controller for IS42S16400
+------------------------------------------------------
+Use an open-source SDRAM controller written specifically for IS42S16400 (the same SDRAM as common DE0-style boards).[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+
+    cd ~/fpga/hazard3_sc_sdram/rtl
+    git clone https://github.com/oskarwires/sdram_controller.git
+
+This repo contains a SystemVerilog SDRAM controller for IS42S16400. It’s open-source (AGPL-3.0) and targets the same SDRAM device.[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+
+We’ll integrate this controller as the SDRAM slave at 0x8000_0000.
+
+================================================================================
+4. DIRECTORY LAYOUT (RTL + FW)
+================================================================================
+
+We’ll organize RTL and firmware like this:
+
+    ~/fpga/hazard3_sc_sdram/
+      rtl/
+        cores/
+          hazard3/          (official Hazard3 repo)
+        sdram_controller/   (open-source SDRAM controller)
+        soc/
+          top_soc.sv
+          ahb_interconnect.sv
+          uart_simple.sv
+          i2c_simple.sv
+          spi_simple.sv
+          gpio_simple.sv
+          jtag_uart_wrapper.sv
+          boot_rom.sv
+      quartus/
+        hazard3_sc.qpf
+        hazard3_sc.qsf
+      ...
+    ~/hazard3_fw/
+      bootrom/
+      hal/
+      examples/
+      host/ (optional later)
+
+We’ll now define SoC structure; you implement the RTL modules listed.
+
+================================================================================
+5. SOC ARCHITECTURE (SINGLE-CORE HAZARD3)
+================================================================================
+
+Your SoC (top_soc) will have:
+
+- One Hazard3 core (RV32IMC, M-mode, AHB-Lite master).
+- AHB-Lite interconnect with:
+  - Masters: 1 (Hazard3 core).
+  - Slaves:
+    - Boot ROM (0x2000_0000)
+    - SDRAM controller (0x8000_0000)
+    - Peripheral block (0x1000_xxxx)
+- Peripherals:
+  - UART0 at 0x1000_0000
+  - I2C0  at 0x1000_0100
+  - SPI0  at 0x1000_0200
+  - GPIO  at 0x1000_0300
+  - JTAG-UART at 0x1000_0500
+- Clock: 50 MHz system clock from DE0-Lite.
+- Reset: from pushbutton or power-on reset.
+
+You’ll base this on Hazard3’s AHB top-level example. In the Hazard3 repo, there is typically a file like `hazard3_ahb_top.sv` that instantiates the core and a simple ROM/RAM system. Copy and adapt that as your `rtl/soc/top_soc.sv`.
+
+================================================================================
+6. IMPLEMENT AND INTEGRATE SDRAM CONTROLLER (OPEN-SOURCE)
+================================================================================
+
+6.1 Study SDRAM controller repo
+-------------------------------
+The `oskarwires/sdram_controller` repo provides a SystemVerilog SDRAM controller for IS42S16400 (the DE0 Dev Board SDRAM).[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+
+In that repo, you will find:
+- `rtl/` containing the controller module(s).
+- A top-level controller module with ports for:
+  - FPGA-side interface (address/data/command).
+  - SDRAM chip pins (CK, CKE, CS, RAS, CAS, WE, BA, A, DQ, DQM).
+
+6.2 Wrap SDRAM controller as an AHB slave
+-----------------------------------------
+You will:
+- Create `rtl/soc/sdram_ahb_wrapper.sv` that:
+  - Has an AHB-Lite slave interface:
+    - HADDR, HWDATA, HRDATA, HWRITE, HTRANS, HREADY, HRESP, etc.
+  - Maps AHB reads/writes to the internal SDRAM controller interface.
+  - Connects to the physical SDRAM pins in `top_soc.sv`.
+  - Maps address region 0x8000_0000 – 0x83FF_FFFF (64 MB) to SDRAM.
+
+This wrapper is where you combine:
+- The open-source SDRAM controller logic.[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+- An AHB slave adapter.
+
+6.3 Connect SDRAM pins in top_soc.sv
+------------------------------------
+In `top_soc.sv`:
+- Instantiate `sdram_ahb_wrapper`.
+- Connect its SDRAM-side signals to the DE0-Lite SDRAM pins:
+  - `SDRAM_CLK`, `SDRAM_CKE`, `SDRAM_CS_N`, `SDRAM_RAS_N`, `SDRAM_CAS_N`,
+    `SDRAM_WE_N`, `SDRAM_BA[1:0]`, `SDRAM_A[12:0]`, `SDRAM_DQ[15:0]`,
+    `SDRAM_DQM[1:0]`.
+- Assign pins in Quartus Pin Planner based on the DE0-Lite manual.
+
+================================================================================
+7. PERIPHERALS RTL (UART0, I2C0, SPI0, GPIO, JTAG-UART)
+================================================================================
+
+You implement small AHB-Lite slaves matching the HAL addresses and registers:
+
+7.1 UART0 (rtl/soc/uart_simple.sv)
+----------------------------------
+Base: 0x1000_0000
+
+Registers:
+- +0x00: DR    (data, R/W)
+- +0x04: SR    (status; TX_READY, RX_READY)
+- +0x08: BAUD  (baud divider; sys_clk / baud)
+- +0x0C: CR    (control; TX_EN, RX_EN)
+
+Connect TX/RX ports to top-level signals that go to Arduino D0/D1.
+
+7.2 I2C0 (rtl/soc/i2c_simple.sv)
+--------------------------------
+Base: 0x1000_0100
+
+Registers:
+- +0x00: CTRL   (enable)
+- +0x04: STATUS (TIP, RXACK)
+- +0x08: ADDR   (7-bit address <<1, with R/W bit)
+- +0x0C: DATA   (data byte)
+- +0x10: CMD    (START, STOP, READ, WRITE, ACK)
+
+Connect SDA/SCL to Arduino A4/A5 (bidirectional, open-drain style).
+
+7.3 SPI0 (rtl/soc/spi_simple.sv)
+--------------------------------
+Base: 0x1000_0200
+
+Registers:
+- +0x00: CTRL   (enable, mode bits)
+- +0x04: STATUS (BUSY)
+- +0x08: DATA   (data to/from shift reg)
+- +0x0C: CLKDIV (clock divider)
+
+Connect MOSI/MISO/SCK/SS to D11/D12/D13/D10.
+
+7.4 GPIO (rtl/soc/gpio_simple.sv)
+---------------------------------
+Base: 0x1000_0300
+
+Registers:
+- +0x00: DATA_OUT
+- +0x04: DATA_IN
+- +0x08: DIR
+- +0x0C: PULLUP
+
+Expose N bits as top-level `gpio_pins[N-1:0]` and connect them to Arduino D2, D3, D4, D5, D6, D7, D8, D9, A0–A5, etc. plus some LEDs if you like.
+
+7.5 JTAG-UART (rtl/soc/jtag_uart_wrapper.sv)
+--------------------------------------------
+Base: 0x1000_0500
+
+Use Intel’s JTAG-UART IP:
+- In Quartus IP Catalog: “JTAG UART”.
+- Generate HDL for it.
+- Wrap its Avalon-MM slave in `jtag_uart_wrapper.sv` with a simple AHB-Lite shim.
+
+Registers:
+- +0x00: DATA   (RX/TX FIFO)
+- +0x04: CTRL   (upper 16 bits read_avail, lower 16 bits write_space)
+
+This matches the bootloader’s JTAG-UART usage.
+
+================================================================================
+8. AHB INTERCONNECT AND TOP_SOC
+================================================================================
+
+8.1 AHB interconnect (rtl/soc/ahb_interconnect.sv)
+--------------------------------------------------
+Implement a simple 1-master, N-slave AHB-Lite fabric:
+
+- Single master: Hazard3 core.
+- Address decode:
+  - 0x2000_0000 range → Boot ROM.
+  - 0x8000_0000 range → SDRAM.
+  - 0x1000_0000 range → UART0.
+  - 0x1000_0100 range → I2C0.
+  - 0x1000_0200 range → SPI0.
+  - 0x1000_0300 range → GPIO.
+  - 0x1000_0500 range → JTAG-UART.
+
+MUX HRDATA, HREADY, HRESP from the selected slave back to the master.
+
+8.2 top_soc.sv
+--------------
+Your `top_soc`:
+
+- Ports:
+  - `input clk_50` (50 MHz).
+  - `input reset_n`.
+  - SDRAM pins.
+  - UART TX/RX pins.
+  - I2C SDA/SCL (inout).
+  - SPI pins.
+  - GPIO pins.
+  - (JTAG pins are implicit for JTAG-UART).
+
+- Internals:
+  - Clock/reset conditioning (clk = clk_50; reset = ~reset_n).
+  - Hazard3 core instance (from hazard3 RTL).
+  - `ahb_interconnect` instance.
+  - `boot_rom` instance (BRAM with bootrom.hex).
+  - `sdram_ahb_wrapper` instance (using open-source SDRAM controller).[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+  - `uart_simple`, `i2c_simple`, `spi_simple`, `gpio_simple`, `jtag_uart_wrapper` instances.
+
+- Connect:
+  - Hazard3 instruction+data bus → AHB master ports.
+  - Interconnect → ROM, SDRAM, peripheral blocks.
+  - Peripherals → top-level I/O pins.
+
+================================================================================
+9. BOOTLOADER (DUAL PATH: UART0 + JTAG-UART) – FULL CODE
+================================================================================
+
+Now the firmware side. We’ll build:
+
+- Bootloader in ROM @ 0x2000_0000.
+- HAL.
+- User firmware in SDRAM @ 0x8000_0000.
+
+9.1 Create firmware structure
+-----------------------------
+
+    mkdir -p ~/hazard3_fw/{bootrom,hal,examples}
+    cd ~/hazard3_fw
+
+9.2 bootrom/linker.ld
+----------------------
+
+    cat > bootrom/linker.ld << 'EOF'
+ENTRY(_start)
+
+MEMORY
+{
+  ROM (rx) : ORIGIN = 0x20000000, LENGTH = 16K
+}
+
+SECTIONS
+{
+  .text :
+  {
+    *(.text.entry)
+    *(.text*)
+    *(.rodata*)
+  } > ROM
+
+  .data :
+  {
+    *(.data*)
+  } > ROM
+
+  .bss :
+  {
+    *(.bss*)
+    *(COMMON)
+  } > ROM
+}
+EOF
+
+9.3 bootrom/bootrom.c (dual-path loader)
+----------------------------------------
+
+    cat > bootrom/bootrom.c << 'EOF'
+#include <stdint.h>
+
+// UART0
+#define UART0_BASE       0x10000000u
+#define UART_DR          (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_SR          (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_BAUD        (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_CR          (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+
+#define UART_SR_TX_READY (1u << 0)
+#define UART_SR_RX_READY (1u << 1)
+#define UART_CR_TX_EN    (1u << 0)
+#define UART_CR_RX_EN    (1u << 1)
+
+// JTAG-UART
+#define JU_BASE          0x10000500u
+#define JU_DATA          (*(volatile uint32_t *)(JU_BASE + 0x00))
+#define JU_CTRL          (*(volatile uint32_t *)(JU_BASE + 0x04))
+// JU_CTRL[31:16] read_avail, [15:0] write_space
+
+static void uart_init(uint32_t sys_clk_hz, uint32_t baudrate)
+{
+    UART_BAUD = sys_clk_hz / baudrate;
+    UART_CR   = UART_CR_TX_EN | UART_CR_RX_EN;
+}
+
+static int uart_rx_ready(void)
+{
+    return (UART_SR & UART_SR_RX_READY) ? 1 : 0;
+}
+
+static char uart_getc_blocking(void)
+{
+    while (!uart_rx_ready())
+        ;
+    return (char)(UART_DR & 0xFFu);
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_SR & UART_SR_TX_READY))
+        ;
+    UART_DR = (uint32_t)(uint8_t)c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+static int jtag_uart_rx_ready(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl >> 16);
+}
+
+static int jtag_uart_tx_space(void)
+{
+    uint32_t ctrl = JU_CTRL;
+    return (int)(ctrl & 0xFFFFu);
+}
+
+static char jtag_uart_getc_blocking(void)
+{
+    while (jtag_uart_rx_ready() == 0)
+        ;
+    return (char)(JU_DATA & 0xFFu);
+}
+
+static void jtag_uart_putc(char c)
+{
+    while (jtag_uart_tx_space() == 0)
+        ;
+    JU_DATA = (uint32_t)(uint8_t)c;
+}
+
+static void jtag_uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') jtag_uart_putc('\r');
+        jtag_uart_putc(*s++);
+    }
+}
+
+// Unified output: send to both
+static void bl_puts(const char *s)
+{
+    while (*s) {
+        char c = *s++;
+        if (c == '\n') {
+            uart_putc('\r');
+            jtag_uart_putc('\r');
+        }
+        uart_putc(c);
+        jtag_uart_putc(c);
+    }
+}
+
+// Get one byte from whichever path has data first
+static char bl_getc_any(void)
+{
+    for (;;) {
+        if (uart_rx_ready())
+            return uart_getc_blocking();
+        if (jtag_uart_rx_ready())
+            return jtag_uart_getc_blocking();
+    }
+}
+
+static uint32_t read_u32_le_any(void)
+{
+    uint32_t b0 = (uint8_t)bl_getc_any();
+    uint32_t b1 = (uint8_t)bl_getc_any();
+    uint32_t b2 = (uint8_t)bl_getc_any();
+    uint32_t b3 = (uint8_t)bl_getc_any();
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+    uart_init(SYS_CLK_HZ, 115200);
+
+    bl_puts("Hazard3 Bootloader (UART0 + JTAG-UART)\r\n");
+    bl_puts("Waiting for H3BT header...\r\n");
+
+    for (;;) {
+        char c = bl_getc_any();
+        if (c == 'H') {
+            char c1 = bl_getc_any();
+            char c2 = bl_getc_any();
+            char c3 = bl_getc_any();
+            if (c1 == '3' && c2 == 'B' && c3 == 'T') {
+                break;
+            }
+        }
+    }
+
+    bl_puts("Got header magic\r\n");
+
+    uint32_t dest_addr = read_u32_le_any();
+    uint32_t size      = read_u32_le_any();
+
+    bl_puts("Loading firmware...\r\n");
+
+    uint8_t *p = (uint8_t *)dest_addr;
+    for (uint32_t i = 0; i < size; i++) {
+        char byte = bl_getc_any();
+        p[i] = (uint8_t)byte;
+    }
+
+    bl_puts("Load complete, jumping...\r\n");
+
+    void (*user_entry)(void) = (void (*)(void))dest_addr;
+    user_entry();
+
+    for (;;)
+        ;
+}
+EOF
+
+9.4 bootrom/Makefile
+---------------------
+
+    cat > bootrom/Makefile << 'EOF'
+RISCV_PREFIX = riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJCOPY = $(RISCV_PREFIX)objcopy
+
+CFLAGS  = -march=rv32imc -mabi=ilp32 -Os -nostdlib -ffreestanding -Wall -Wextra
+LDFLAGS = -T linker.ld -nostartfiles -nostdlib
+
+all: bootrom.hex
+
+bootrom.elf: bootrom.c linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ bootrom.c
+
+bootrom.hex: bootrom.elf
+	$(OBJCOPY) -O verilog $< $@
+
+clean:
+	rm -f bootrom.elf bootrom.hex
+EOF
+
+9.5 Build bootrom.hex
+---------------------
+
+    cd ~/hazard3_fw/bootrom
+    make
+
+Use `bootrom.hex` as the ROM init file in `boot_rom.sv` at 0x2000_0000.
+
+================================================================================
+10. HAL (UART0, I2C0, SPI0, GPIO) – FULL CODE
+================================================================================
+
+10.1 hal/hal.h
+--------------
+
+    cat > hal/hal.h << 'EOF'
+#ifndef HAZARD3_HAL_H
+#define HAZARD3_HAL_H
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+#define I2C0_BASE    0x10000100u
+#define SPI0_BASE    0x10000200u
+#define GPIO_BASE    0x10000300u
+
+#define PIN_D0   0
+#define PIN_D1   1
+#define PIN_D2   2
+#define PIN_D3   3
+#define PIN_D4   4
+#define PIN_D5   5
+#define PIN_D6   6
+#define PIN_D7   7
+#define PIN_D8   8
+#define PIN_D9   9
+#define PIN_D10  10
+#define PIN_D11  11
+#define PIN_D12  12
+#define PIN_D13  13
+#define PIN_A0   14
+#define PIN_A1   15
+#define PIN_A2   16
+#define PIN_A3   17
+#define PIN_A4   18
+#define PIN_A5   19
+
+typedef enum {
+    PIN_INPUT = 0,
+    PIN_INPUT_PULLUP = 1,
+    PIN_OUTPUT = 2
+} pin_mode_t;
+
+void hal_init(uint32_t sys_clk_hz);
+
+// GPIO
+void pinMode(int pin, pin_mode_t mode);
+void digitalWrite(int pin, int value);
+int  digitalRead(int pin);
+
+// UART0
+void Serial_begin(uint32_t baud);
+int  Serial_available(void);
+int  Serial_read(void);
+int  Serial_write(uint8_t b);
+void Serial_print(const char *s);
+void Serial_println(const char *s);
+
+// I2C0
+void Wire_begin(void);
+void Wire_beginTransmission(uint8_t addr);
+void Wire_write(uint8_t data);
+int  Wire_endTransmission(void);
+int  Wire_requestFrom(uint8_t addr, int len);
+int  Wire_available(void);
+uint8_t Wire_read(void);
+
+// SPI0
+void SPI_begin(void);
+void SPI_setClockDiv(uint32_t div);
+void SPI_setMode(uint8_t mode);
+uint8_t SPI_transfer(uint8_t data);
+
+// delay
+void delay_cycles(uint32_t cycles);
+
+#endif
+EOF
+
+10.2 hal/hal.c
+--------------
+
+    cat > hal/hal.c << 'EOF'
+#include "hal.h"
+
+static inline void mmio_write32(uint32_t addr, uint32_t val)
+{
+    *(volatile uint32_t *)addr = val;
+}
+
+static inline uint32_t mmio_read32(uint32_t addr)
+{
+    return *(volatile uint32_t *)addr;
+}
+
+// GPIO
+#define GPIO_DATA_OUT   (GPIO_BASE + 0x00)
+#define GPIO_DATA_IN    (GPIO_BASE + 0x04)
+#define GPIO_DIR        (GPIO_BASE + 0x08)
+#define GPIO_PULLUP     (GPIO_BASE + 0x0C)
+
+// UART0
+#define UART_DR          (UART0_BASE + 0x00)
+#define UART_SR          (UART0_BASE + 0x04)
+#define UART_BAUD        (UART0_BASE + 0x08)
+#define UART_CR          (UART0_BASE + 0x0C)
+#define UART_SR_TX_READY (1u << 0)
+#define UART_SR_RX_READY (1u << 1)
+#define UART_CR_TX_EN    (1u << 0)
+#define UART_CR_RX_EN    (1u << 1)
+
+// I2C0
+#define I2C_CTRL         (I2C0_BASE + 0x00)
+#define I2C_STATUS       (I2C0_BASE + 0x04)
+#define I2C_ADDR         (I2C0_BASE + 0x08)
+#define I2C_DATA         (I2C0_BASE + 0x0C)
+#define I2C_CMD          (I2C0_BASE + 0x10)
+#define I2C_CTRL_EN      (1u << 0)
+#define I2C_STATUS_TIP   (1u << 0)
+#define I2C_STATUS_RXACK (1u << 1)
+#define I2C_CMD_START    (1u << 0)
+#define I2C_CMD_STOP     (1u << 1)
+#define I2C_CMD_READ     (1u << 2)
+#define I2C_CMD_WRITE    (1u << 3)
+#define I2C_CMD_ACK      (1u << 4)
+
+// SPI0
+#define SPI_CTRL         (SPI0_BASE + 0x00)
+#define SPI_STATUS       (SPI0_BASE + 0x04)
+#define SPI_DATA         (SPI0_BASE + 0x08)
+#define SPI_CLKDIV       (SPI0_BASE + 0x0C)
+#define SPI_CTRL_EN      (1u << 0)
+#define SPI_CTRL_MODE0   (0u << 1)
+#define SPI_CTRL_MODE1   (1u << 1)
+#define SPI_CTRL_MODE2   (2u << 1)
+#define SPI_CTRL_MODE3   (3u << 1)
+#define SPI_STATUS_BUSY  (1u << 0)
+
+static uint8_t wire_addr = 0;
+static int    wire_rx_remaining = 0;
+
+void hal_init(uint32_t sys_clk_hz)
+{
+    mmio_write32(UART_BAUD, sys_clk_hz / 115200u);
+    mmio_write32(UART_CR, UART_CR_TX_EN | UART_CR_RX_EN);
+
+    mmio_write32(GPIO_DIR, 0x00000000u);
+    mmio_write32(GPIO_PULLUP, 0x00000000u);
+
+    mmio_write32(I2C_CTRL, I2C_CTRL_EN);
+
+    mmio_write32(SPI_CLKDIV, 4u);
+    mmio_write32(SPI_CTRL, SPI_CTRL_EN | SPI_CTRL_MODE0);
+}
+
+// GPIO
+void pinMode(int pin, pin_mode_t mode)
+{
+    uint32_t dir  = mmio_read32(GPIO_DIR);
+    uint32_t pull = mmio_read32(GPIO_PULLUP);
+    uint32_t mask = 1u << pin;
+
+    switch (mode) {
+        case PIN_INPUT:
+            dir  &= ~mask;
+            pull &= ~mask;
+            break;
+        case PIN_INPUT_PULLUP:
+            dir  &= ~mask;
+            pull |= mask;
+            break;
+        case PIN_OUTPUT:
+            dir  |= mask;
+            pull &= ~mask;
+            break;
+        default: break;
+    }
+
+    mmio_write32(GPIO_DIR, dir);
+    mmio_write32(GPIO_PULLUP, pull);
+}
+
+void digitalWrite(int pin, int value)
+{
+    uint32_t data = mmio_read32(GPIO_DATA_OUT);
+    uint32_t mask = 1u << pin;
+    if (value) data |= mask; else data &= ~mask;
+    mmio_write32(GPIO_DATA_OUT, data);
+}
+
+int digitalRead(int pin)
+{
+    uint32_t data = mmio_read32(GPIO_DATA_IN);
+    return (data & (1u << pin)) ? 1 : 0;
+}
+
+// UART0
+void Serial_begin(uint32_t baud)
+{
+    const uint32_t sys_clk_hz = 50000000u;
+    mmio_write32(UART_BAUD, sys_clk_hz / baud);
+    mmio_write32(UART_CR, UART_CR_TX_EN | UART_CR_RX_EN);
+}
+
+int Serial_available(void)
+{
+    uint32_t sr = mmio_read32(UART_SR);
+    return (sr & UART_SR_RX_READY) ? 1 : 0;
+}
+
+int Serial_read(void)
+{
+    while (!Serial_available()) ;
+    return (int)(mmio_read32(UART_DR) & 0xFFu);
+}
+
+int Serial_write(uint8_t b)
+{
+    while (!(mmio_read32(UART_SR) & UART_SR_TX_READY)) ;
+    mmio_write32(UART_DR, (uint32_t)b);
+    return 1;
+}
+
+void Serial_print(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') Serial_write('\r');
+        Serial_write((uint8_t)*s++);
+    }
+}
+
+void Serial_println(const char *s)
+{
+    Serial_print(s);
+    Serial_write('\r');
+    Serial_write('\n');
+}
+
+// I2C0
+void Wire_begin(void)
+{
+}
+
+void Wire_beginTransmission(uint8_t addr)
+{
+    wire_addr = addr;
+}
+
+void Wire_write(uint8_t data)
+{
+    mmio_write32(I2C_ADDR, (uint32_t)(wire_addr << 1));
+    mmio_write32(I2C_DATA, data);
+    mmio_write32(I2C_CMD, I2C_CMD_START | I2C_CMD_WRITE);
+    while (mmio_read32(I2C_STATUS) & I2C_STATUS_TIP) ;
+}
+
+int Wire_endTransmission(void)
+{
+    mmio_write32(I2C_CMD, I2C_CMD_STOP);
+    while (mmio_read32(I2C_STATUS) & I2C_STATUS_TIP) ;
+    uint32_t status = mmio_read32(I2C_STATUS);
+    if (status & I2C_STATUS_RXACK) return 1;
+    return 0;
+}
+
+int Wire_requestFrom(uint8_t addr, int len)
+{
+    wire_addr = addr;
+    wire_rx_remaining = len;
+    mmio_write32(I2C_ADDR, (uint32_t)((wire_addr << 1) | 1u));
+    mmio_write32(I2C_CMD, I2C_CMD_START | I2C_CMD_WRITE);
+    while (mmio_read32(I2C_STATUS) & I2C_STATUS_TIP) ;
+    return len;
+}
+
+int Wire_available(void)
+{
+    return wire_rx_remaining > 0;
+}
+
+uint8_t Wire_read(void)
+{
+    if (wire_rx_remaining <= 0) return 0;
+    wire_rx_remaining--;
+    uint32_t cmd = I2C_CMD_READ;
+    if (wire_rx_remaining == 0) cmd |= I2C_CMD_STOP;
+    else cmd |= I2C_CMD_ACK;
+    mmio_write32(I2C_CMD, cmd);
+    while (mmio_read32(I2C_STATUS) & I2C_STATUS_TIP) ;
+    return (uint8_t)(mmio_read32(I2C_DATA) & 0xFFu);
+}
+
+// SPI0
+void SPI_begin(void)
+{
+}
+
+void SPI_setClockDiv(uint32_t div)
+{
+    mmio_write32(SPI_CLKDIV, div);
+}
+
+void SPI_setMode(uint8_t mode)
+{
+    uint32_t ctrl = SPI_CTRL_EN;
+    switch (mode) {
+        case 0: ctrl |= SPI_CTRL_MODE0; break;
+        case 1: ctrl |= SPI_CTRL_MODE1; break;
+        case 2: ctrl |= SPI_CTRL_MODE2; break;
+        case 3: ctrl |= SPI_CTRL_MODE3; break;
+        default: ctrl |= SPI_CTRL_MODE0; break;
+    }
+    mmio_write32(SPI_CTRL, ctrl);
+}
+
+uint8_t SPI_transfer(uint8_t data)
+{
+    mmio_write32(SPI_DATA, data);
+    while (mmio_read32(SPI_STATUS) & SPI_STATUS_BUSY) ;
+    return (uint8_t)(mmio_read32(SPI_DATA) & 0xFFu);
+}
+
+// delay
+void delay_cycles(uint32_t cycles)
+{
+    for (volatile uint32_t i = 0; i < cycles; i++) {
+        __asm__ volatile("nop");
+    }
+}
+EOF
+
+================================================================================
+11. USER FIRMWARE EXAMPLE (RUNS FROM SDRAM) – FULL CODE
+================================================================================
+
+11.1 examples/linker.ld
+-----------------------
+
+    cat > examples/linker.ld << 'EOF'
+ENTRY(_start)
+
+MEMORY
+{
+  RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 64M
+}
+
+SECTIONS
+{
+  .text :
+  {
+    *(.text.entry)
+    *(.text*)
+    *(.rodata*)
+  } > RAM
+
+  .data :
+  {
+    *(.data*)
+  } > RAM
+
+  .bss :
+  {
+    *(.bss*)
+    *(COMMON)
+  } > RAM
+}
+EOF
+
+11.2 examples/main.c
+--------------------
+
+    cat > examples/main.c << 'EOF'
+#include <stdint.h>
+#include "hal.h"
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    hal_init(50000000u);
+
+    Serial_begin(115200);
+    Serial_println("User firmware started");
+
+    pinMode(PIN_D2, PIN_OUTPUT);
+    digitalWrite(PIN_D2, 0);
+
+    Wire_begin();
+    Wire_beginTransmission(0x68);
+    Wire_write(0x00);
+    int err = Wire_endTransmission();
+    if (err == 0) {
+        Wire_requestFrom(0x68, 1);
+        if (Wire_available()) {
+            uint8_t v = Wire_read();
+            Serial_print("I2C(0x68) -> 0x");
+            const char hex[17] = "0123456789ABCDEF";
+            char buf[3];
+            buf[0] = hex[(v >> 4) & 0xF];
+            buf[1] = hex[v & 0xF];
+            buf[2] = 0;
+            Serial_println(buf);
+        } else {
+            Serial_println("I2C: no data");
+        }
+    } else {
+        Serial_println("I2C: NACK");
+    }
+
+    SPI_begin();
+    SPI_setClockDiv(4);
+    SPI_setMode(0);
+    uint8_t spi_resp = SPI_transfer(0x9F);
+    Serial_print("SPI response: 0x");
+    const char hex[17] = "0123456789ABCDEF";
+    char sbuf[3];
+    sbuf[0] = hex[(spi_resp >> 4) & 0xF];
+    sbuf[1] = hex[spi_resp & 0xF];
+    sbuf[2] = 0;
+    Serial_println(sbuf);
+
+    while (1) {
+        digitalWrite(PIN_D2, 1);
+        delay_cycles(5000000u);
+        digitalWrite(PIN_D2, 0);
+        delay_cycles(5000000u);
+    }
+}
+EOF
+
+11.3 examples/Makefile
+----------------------
+
+    cat > examples/Makefile << 'EOF'
+RISCV_PREFIX = riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJCOPY = $(RISCV_PREFIX)objcopy
+
+CFLAGS  = -march=rv32imc -mabi=ilp32 -Os -ffreestanding -nostdlib -Wall -Wextra
+LDFLAGS = -T linker.ld -nostartfiles -nostdlib
+
+all: firmware.bin
+
+firmware.elf: main.c ../hal/hal.c ../hal/hal.h linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ main.c ../hal/hal.c
+
+firmware.bin: firmware.elf
+	$(OBJCOPY) -O binary $< $@
+
+clean:
+	rm -f firmware.elf firmware.bin
+EOF
+
+11.4 Build firmware
+-------------------
+
+    cd ~/hazard3_fw/examples
+    make
+
+You get `firmware.bin`.
+
+================================================================================
+12. END-TO-END FLOW (EPHEMERAL SoC)
+================================================================================
+
+12.1 Build boot ROM
+-------------------
+
+    cd ~/hazard3_fw/bootrom
+    make
+
+Use `bootrom.hex` to initialize `boot_rom.sv` in your SoC at 0x2000_0000.
+
+12.2 Integrate and compile SoC RTL in Quartus
+---------------------------------------------
+- Add Hazard3 RTL from `rtl/cores/hazard3/` to Quartus.
+- Add SDRAM controller RTL from `rtl/sdram_controller/` and your `sdram_ahb_wrapper.sv`.[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+- Add SoC RTL from `rtl/soc/*.sv` (`top_soc.sv`, `ahb_interconnect.sv`, peripherals, boot_rom.sv, jtag_uart_wrapper.sv).
+- Assign pins:
+  - clk_50 → DE0-Lite 50 MHz clock.
+  - SDRAM pins → DE0-Lite SDRAM header (per manual).
+  - UART0 TX/RX → Arduino D1/D0.
+  - I2C SDA/SCL → A4/A5.
+  - SPI signals → D10–D13.
+  - GPIO pins → remaining Arduino pins and/or LEDs.
+
+Compile to produce `hazard3_sc.sof`.
+
+12.3 Program DE0-Lite (SRAM only, ephemeral)
+--------------------------------------------
+In Quartus Programmer:
+- Hardware: USB-Blaster.
+- File: `hazard3_sc.sof`.
+- Check only “Program/Configure”.
+- Program.
+
+After power-cycle, this configuration disappears; you must reprogram to use it again.
+
+12.4 Bootloader operation
+-------------------------
+As soon as FPGA is configured:
+
+- Hazard3 core starts at 0x2000_0000 (Boot ROM).
+- Bootloader runs.
+- It prints messages to both:
+  - JTAG-UART (view via `nios2-terminal`),
+  - UART0 (view via 3.3 V USB-serial dongle on D0/D1).
+
+Messages:
+
+- "Hazard3 Bootloader (UART0 + JTAG-UART)"
+- "Waiting for H3BT header..."
+
+12.5 Load firmware over JTAG-UART or UART0
+------------------------------------------
+You can write a Python script that:
+
+- For UART0:
+  - Opens `/dev/ttyUSB0` at 115200.
+  - Sends "H3BT".
+  - Sends dest_addr `0x80000000` (LE).
+  - Sends size of `firmware.bin` (LE).
+  - Sends contents of `firmware.bin`.
+
+- For JTAG-UART:
+  - Uses `nios2-terminal` or `quartus_stp` piping to send the same sequence.
+
+The bootloader accepts the magic from whichever path speaks first.
+
+12.6 Run user firmware
+----------------------
+After load:
+- Bootloader copies firmware into SDRAM at 0x80000000.
+- Jumps to 0x80000000.
+
+User firmware:
+- Initializes HAL.
+- Prints messages over UART0.
+- Toggles GPIO (D2).
+- Attempts I2C read from 0x68.
+- Performs SPI transfer (0x9F).
+- Blinks D2 forever.
+
+12.7 Power-cycle to wipe everything
+-----------------------------------
+Because you only programmed SRAM:
+- Power-cycle DE0-Lite → FPGA is blank / factory image.
+- Your SoC and firmware are gone.
+- To run again:
+  - Re-program `hazard3_sc.sof`.
+  - Re-load `firmware.bin` via UART0 or JTAG-UART.
+
+================================================================================
+RESULT
+================================================================================
+
+By following these steps and implementing the glue RTL as described, you get:
+
+- A single-core Hazard3 SoC on DE0-Lite.
+- Fully open-source SDRAM controller (no proprietary IP).[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/oskarwires/sdram_controller?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054&citationId=1 "Github")
+- UART0 + JTAG-UART + SPI0 + I2C0 + GPIO.
+- Bootloader in ROM that loads firmware over either UART0 or JTAG-UART.
+- HAL and user firmware that exercise all peripherals.
+- Ephemeral behavior (no persistent flash programming).
+
+This single-core system is a direct functional subset of your planned quad-core,
+so you can later extend the interconnect and core instantiations without
+changing the firmware contracts.
