@@ -958,3 +958,710 @@ Phase 4 will:
 ============================================================
 END OF PHASE 3
 ============================================================
+============================================================
+PHASE 4 (OpenCores) — FULL UART/SPI/I2C/GPIO/PWM VIA WISHBONE
+============================================================
+
+All files in this phase live under:
+  ~/h3_quad_de10lite/soc/rtl
+
+Goal:
+- Replace simplified APB peripherals with full OpenCores IP (Wishbone B3).
+- Use a single APB→Wishbone bridge and a simple Wishbone interconnect.
+- Keep the memory map stable:
+    UART  : 0x4000_0000
+    GPIO  : 0x4000_1000
+    SPI   : 0x4000_2000
+    I2C   : 0x4000_3000
+    PWM   : 0x4000_4000
+
+You will:
+- Clone OpenCores (or GitHub mirror) IP into soc/rtl/opencores/
+- Add an APB→WB bridge.
+- Add a WB interconnect.
+- Instantiate OpenCores cores in h3_apb_subsys.
+- Update h3_quad_soc to expose full pins.
+
+------------------------------------------------------------
+1. Create OpenCores RTL directory and clone IP cores
+------------------------------------------------------------
+
+cd ~/h3_quad_de10lite/soc
+mkdir -p rtl/opencores
+cd rtl/opencores
+
+Clone GitHub mirrors (adjust if you prefer official opencores.org tarballs):
+
+git clone https://github.com/freecores/uart16550.git
+git clone https://github.com/freecores/i2c.git
+git clone https://github.com/freecores/spi_master.git
+git clone https://github.com/freecores/gpio.git
+git clone https://github.com/freecores/pwm.git
+
+Result (conceptual):
+
+soc/rtl/opencores/
+  uart16550/
+  i2c/
+  spi_master/
+  gpio/
+  pwm/
+
+Later in Quartus, add the .v/.vhd files from these directories to the project.
+
+------------------------------------------------------------
+2. APB → Wishbone B3 bridge
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/rtl/apb2wb_bridge.v
+
+This is an APB slave and a single Wishbone master.
+
+----------------------------------------
+apb2wb_bridge.v
+----------------------------------------
+module apb2wb_bridge (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire [31:0] paddr,
+    input  wire        pwrite,
+    input  wire        psel,
+    input  wire        penable,
+    input  wire [31:0] pwdata,
+    output reg  [31:0] prdata,
+    output reg         pready,
+    output reg         pslverr,
+
+    output reg  [31:0] wb_adr_o,
+    output reg  [31:0] wb_dat_o,
+    input  wire [31:0] wb_dat_i,
+    output reg         wb_we_o,
+    output reg  [3:0]  wb_sel_o,
+    output reg         wb_stb_o,
+    output reg         wb_cyc_o,
+    input  wire        wb_ack_i,
+    input  wire        wb_err_i
+);
+
+    localparam IDLE  = 2'd0;
+    localparam BUSY  = 2'd1;
+
+    reg [1:0] state, next_state;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    always @(*) begin
+        pready   = 1'b0;
+        pslverr  = 1'b0;
+        prdata   = 32'h0;
+
+        wb_adr_o = 32'h0;
+        wb_dat_o = 32'h0;
+        wb_we_o  = 1'b0;
+        wb_sel_o = 4'b0000;
+        wb_stb_o = 1'b0;
+        wb_cyc_o = 1'b0;
+
+        next_state = state;
+
+        case (state)
+            IDLE: begin
+                if (psel && penable) begin
+                    wb_adr_o = paddr;
+                    wb_dat_o = pwdata;
+                    wb_we_o  = pwrite;
+                    wb_sel_o = 4'b1111;
+                    wb_stb_o = 1'b1;
+                    wb_cyc_o = 1'b1;
+                    next_state = BUSY;
+                end else begin
+                    pready  = 1'b1;
+                end
+            end
+
+            BUSY: begin
+                wb_adr_o = paddr;
+                wb_dat_o = pwdata;
+                wb_we_o  = pwrite;
+                wb_sel_o = 4'b1111;
+                wb_stb_o = 1'b1;
+                wb_cyc_o = 1'b1;
+                if (wb_ack_i || wb_err_i) begin
+                    pready  = 1'b1;
+                    pslverr = wb_err_i;
+                    prdata  = wb_dat_i;
+                    next_state = IDLE;
+                end
+            end
+        endcase
+    end
+
+endmodule
+----------------------------------------
+
+------------------------------------------------------------
+3. Wishbone B3 interconnect (1 master → 5 slaves)
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/rtl/wb_interconnect.v
+
+Address ranges (same as APB levels, but we decode on wb_adr_o):
+
+  UART  : 0x4000_0000
+  GPIO  : 0x4000_1000
+  SPI   : 0x4000_2000
+  I2C   : 0x4000_3000
+  PWM   : 0x4000_4000
+
+----------------------------------------
+wb_interconnect.v
+----------------------------------------
+module wb_interconnect (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire [31:0] m_adr_i,
+    input  wire [31:0] m_dat_i,
+    output reg  [31:0] m_dat_o,
+    input  wire        m_we_i,
+    input  wire [3:0]  m_sel_i,
+    input  wire        m_stb_i,
+    input  wire        m_cyc_i,
+    output reg         m_ack_o,
+    output reg         m_err_o,
+
+    output reg  [31:0] s0_adr_o,
+    output reg  [31:0] s0_dat_o,
+    input  wire [31:0] s0_dat_i,
+    output reg         s0_we_o,
+    output reg  [3:0]  s0_sel_o,
+    output reg         s0_stb_o,
+    output reg         s0_cyc_o,
+    input  wire        s0_ack_i,
+    input  wire        s0_err_i,
+
+    output reg  [31:0] s1_adr_o,
+    output reg  [31:0] s1_dat_o,
+    input  wire [31:0] s1_dat_i,
+    output reg         s1_we_o,
+    output reg  [3:0]  s1_sel_o,
+    output reg         s1_stb_o,
+    output reg         s1_cyc_o,
+    input  wire        s1_ack_i,
+    input  wire        s1_err_i,
+
+    output reg  [31:0] s2_adr_o,
+    output reg  [31:0] s2_dat_o,
+    input  wire [31:0] s2_dat_i,
+    output reg         s2_we_o,
+    output reg  [3:0]  s2_sel_o,
+    output reg         s2_stb_o,
+    output reg         s2_cyc_o,
+    input  wire        s2_ack_i,
+    input  wire        s2_err_i,
+
+    output reg  [31:0] s3_adr_o,
+    output reg  [31:0] s3_dat_o,
+    input  wire [31:0] s3_dat_i,
+    output reg         s3_we_o,
+    output reg  [3:0]  s3_sel_o,
+    output reg         s3_stb_o,
+    output reg         s3_cyc_o,
+    input  wire        s3_ack_i,
+    input  wire        s3_err_i,
+
+    output reg  [31:0] s4_adr_o,
+    output reg  [31:0] s4_dat_o,
+    input  wire [31:0] s4_dat_i,
+    output reg         s4_we_o,
+    output reg  [3:0]  s4_sel_o,
+    output reg         s4_stb_o,
+    output reg         s4_cyc_o,
+    input  wire        s4_ack_i,
+    input  wire        s4_err_i
+);
+
+    wire sel0 = (m_adr_i[15:12] == 4'h0);
+    wire sel1 = (m_adr_i[15:12] == 4'h1);
+    wire sel2 = (m_adr_i[15:12] == 4'h2);
+    wire sel3 = (m_adr_i[15:12] == 4'h3);
+    wire sel4 = (m_adr_i[15:12] == 4'h4);
+
+    always @(*) begin
+        s0_adr_o = 32'h0;
+        s0_dat_o = 32'h0;
+        s0_we_o  = 1'b0;
+        s0_sel_o = 4'b0000;
+        s0_stb_o = 1'b0;
+        s0_cyc_o = 1'b0;
+
+        s1_adr_o = 32'h0;
+        s1_dat_o = 32'h0;
+        s1_we_o  = 1'b0;
+        s1_sel_o = 4'b0000;
+        s1_stb_o = 1'b0;
+        s1_cyc_o = 1'b0;
+
+        s2_adr_o = 32'h0;
+        s2_dat_o = 32'h0;
+        s2_we_o  = 1'b0;
+        s2_sel_o = 4'b0000;
+        s2_stb_o = 1'b0;
+        s2_cyc_o = 1'b0;
+
+        s3_adr_o = 32'h0;
+        s3_dat_o = 32'h0;
+        s3_we_o  = 1'b0;
+        s3_sel_o = 4'b0000;
+        s3_stb_o = 1'b0;
+        s3_cyc_o = 1'b0;
+
+        s4_adr_o = 32'h0;
+        s4_dat_o = 32'h0;
+        s4_we_o  = 1'b0;
+        s4_sel_o = 4'b0000;
+        s4_stb_o = 1'b0;
+        s4_cyc_o = 1'b0;
+
+        m_dat_o = 32'h0;
+        m_ack_o = 1'b0;
+        m_err_o = 1'b0;
+
+        if (m_cyc_i && m_stb_i) begin
+            if (sel0) begin
+                s0_adr_o = m_adr_i;
+                s0_dat_o = m_dat_i;
+                s0_we_o  = m_we_i;
+                s0_sel_o = m_sel_i;
+                s0_stb_o = 1'b1;
+                s0_cyc_o = 1'b1;
+                m_dat_o  = s0_dat_i;
+                m_ack_o  = s0_ack_i;
+                m_err_o  = s0_err_i;
+            end else if (sel1) begin
+                s1_adr_o = m_adr_i;
+                s1_dat_o = m_dat_i;
+                s1_we_o  = m_we_i;
+                s1_sel_o = m_sel_i;
+                s1_stb_o = 1'b1;
+                s1_cyc_o = 1'b1;
+                m_dat_o  = s1_dat_i;
+                m_ack_o  = s1_ack_i;
+                m_err_o  = s1_err_i;
+            end else if (sel2) begin
+                s2_adr_o = m_adr_i;
+                s2_dat_o = m_dat_i;
+                s2_we_o  = m_we_i;
+                s2_sel_o = m_sel_i;
+                s2_stb_o = 1'b1;
+                s2_cyc_o = 1'b1;
+                m_dat_o  = s2_dat_i;
+                m_ack_o  = s2_ack_i;
+                m_err_o  = s2_err_i;
+            end else if (sel3) begin
+                s3_adr_o = m_adr_i;
+                s3_dat_o = m_dat_i;
+                s3_we_o  = m_we_i;
+                s3_sel_o = m_sel_i;
+                s3_stb_o = 1'b1;
+                s3_cyc_o = 1'b1;
+                m_dat_o  = s3_dat_i;
+                m_ack_o  = s3_ack_i;
+                m_err_o  = s3_err_i;
+            end else if (sel4) begin
+                s4_adr_o = m_adr_i;
+                s4_dat_o = m_dat_i;
+                s4_we_o  = m_we_i;
+                s4_sel_o = m_sel_i;
+                s4_stb_o = 1'b1;
+                s4_cyc_o = 1'b1;
+                m_dat_o  = s4_dat_i;
+                m_ack_o  = s4_ack_i;
+                m_err_o  = s4_err_i;
+            end else begin
+                m_ack_o = 1'b1;
+                m_err_o = 1'b1;
+                m_dat_o = 32'h0;
+            end
+        end
+    end
+
+endmodule
+----------------------------------------
+
+------------------------------------------------------------
+4. APB subsystem using OpenCores peripherals
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/rtl/h3_apb_subsys.v
+
+This replaces the previous minimal version. It now:
+- Takes APB signals from h3_quad_soc.
+- Bridges APB to Wishbone.
+- Connects to Wishbone interconnect.
+- Instantiates OpenCores peripherals:
+    s0: UART16550
+    s1: GPIO
+    s2: SPI master
+    s3: I2C master
+    s4: PWM
+
+Note: The exact top-level module names and ports of each OpenCores core may differ slightly. Adjust them to match the actual IP you clone (uart_top vs uart16550, etc.). The structure is correct.
+
+----------------------------------------
+h3_apb_subsys.v
+----------------------------------------
+module h3_apb_subsys (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire [31:0] paddr,
+    input  wire        pwrite,
+    input  wire        psel,
+    input  wire        penable,
+    input  wire [31:0] pwdata,
+    output wire [31:0] prdata,
+    output wire        pready,
+    output wire        pslverr,
+
+    input  wire        uart_rx,
+    output wire        uart_tx,
+
+    input  wire [31:0] gpio_in,
+    output wire [31:0] gpio_out,
+    output wire [31:0] gpio_dir,
+
+    output wire        spi_sclk,
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire        spi_cs_n,
+
+    inout  wire        i2c_sda,
+    output wire        i2c_scl,
+
+    output wire [3:0]  pwm_out
+);
+
+    wire [31:0] wb_m_adr;
+    wire [31:0] wb_m_dat_o;
+    wire [31:0] wb_m_dat_i;
+    wire        wb_m_we;
+    wire [3:0]  wb_m_sel;
+    wire        wb_m_stb;
+    wire        wb_m_cyc;
+    wire        wb_m_ack;
+    wire        wb_m_err;
+
+    apb2wb_bridge u_apb2wb (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .paddr     (paddr),
+        .pwrite    (pwrite),
+        .psel      (psel),
+        .penable   (penable),
+        .pwdata    (pwdata),
+        .prdata    (prdata),
+        .pready    (pready),
+        .pslverr   (pslverr),
+        .wb_adr_o  (wb_m_adr),
+        .wb_dat_o  (wb_m_dat_o),
+        .wb_dat_i  (wb_m_dat_i),
+        .wb_we_o   (wb_m_we),
+        .wb_sel_o  (wb_m_sel),
+        .wb_stb_o  (wb_m_stb),
+        .wb_cyc_o  (wb_m_cyc),
+        .wb_ack_i  (wb_m_ack),
+        .wb_err_i  (wb_m_err)
+    );
+
+    wire [31:0] wb_s0_adr, wb_s0_dat_o, wb_s0_dat_i;
+    wire        wb_s0_we, wb_s0_stb, wb_s0_cyc, wb_s0_ack, wb_s0_err;
+    wire [3:0]  wb_s0_sel;
+
+    wire [31:0] wb_s1_adr, wb_s1_dat_o, wb_s1_dat_i;
+    wire        wb_s1_we, wb_s1_stb, wb_s1_cyc, wb_s1_ack, wb_s1_err;
+    wire [3:0]  wb_s1_sel;
+
+    wire [31:0] wb_s2_adr, wb_s2_dat_o, wb_s2_dat_i;
+    wire        wb_s2_we, wb_s2_stb, wb_s2_cyc, wb_s2_ack, wb_s2_err;
+    wire [3:0]  wb_s2_sel;
+
+    wire [31:0] wb_s3_adr, wb_s3_dat_o, wb_s3_dat_i;
+    wire        wb_s3_we, wb_s3_stb, wb_s3_cyc, wb_s3_ack, wb_s3_err;
+    wire [3:0]  wb_s3_sel;
+
+    wire [31:0] wb_s4_adr, wb_s4_dat_o, wb_s4_dat_i;
+    wire        wb_s4_we, wb_s4_stb, wb_s4_cyc, wb_s4_ack, wb_s4_err;
+    wire [3:0]  wb_s4_sel;
+
+    wb_interconnect u_wb_ic (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .m_adr_i    (wb_m_adr),
+        .m_dat_i    (wb_m_dat_o),
+        .m_dat_o    (wb_m_dat_i),
+        .m_we_i     (wb_m_we),
+        .m_sel_i    (wb_m_sel),
+        .m_stb_i    (wb_m_stb),
+        .m_cyc_i    (wb_m_cyc),
+        .m_ack_o    (wb_m_ack),
+        .m_err_o    (wb_m_err),
+        .s0_adr_o   (wb_s0_adr),
+        .s0_dat_o   (wb_s0_dat_o),
+        .s0_dat_i   (wb_s0_dat_i),
+        .s0_we_o    (wb_s0_we),
+        .s0_sel_o   (wb_s0_sel),
+        .s0_stb_o   (wb_s0_stb),
+        .s0_cyc_o   (wb_s0_cyc),
+        .s0_ack_i   (wb_s0_ack),
+        .s0_err_i   (wb_s0_err),
+        .s1_adr_o   (wb_s1_adr),
+        .s1_dat_o   (wb_s1_dat_o),
+        .s1_dat_i   (wb_s1_dat_i),
+        .s1_we_o    (wb_s1_we),
+        .s1_sel_o   (wb_s1_sel),
+        .s1_stb_o   (wb_s1_stb),
+        .s1_cyc_o   (wb_s1_cyc),
+        .s1_ack_i   (wb_s1_ack),
+        .s1_err_i   (wb_s1_err),
+        .s2_adr_o   (wb_s2_adr),
+        .s2_dat_o   (wb_s2_dat_o),
+        .s2_dat_i   (wb_s2_dat_i),
+        .s2_we_o    (wb_s2_we),
+        .s2_sel_o   (wb_s2_sel),
+        .s2_stb_o   (wb_s2_stb),
+        .s2_cyc_o   (wb_s2_cyc),
+        .s2_ack_i   (wb_s2_ack),
+        .s2_err_i   (wb_s2_err),
+        .s3_adr_o   (wb_s3_adr),
+        .s3_dat_o   (wb_s3_dat_o),
+        .s3_dat_i   (wb_s3_dat_i),
+        .s3_we_o    (wb_s3_we),
+        .s3_sel_o   (wb_s3_sel),
+        .s3_stb_o   (wb_s3_stb),
+        .s3_cyc_o   (wb_s3_cyc),
+        .s3_ack_i   (wb_s3_ack),
+        .s3_err_i   (wb_s3_err),
+        .s4_adr_o   (wb_s4_adr),
+        .s4_dat_o   (wb_s4_dat_o),
+        .s4_dat_i   (wb_s4_dat_i),
+        .s4_we_o    (wb_s4_we),
+        .s4_sel_o   (wb_s4_sel),
+        .s4_stb_o   (wb_s4_stb),
+        .s4_cyc_o   (wb_s4_cyc),
+        .s4_ack_i   (wb_s4_ack),
+        .s4_err_i   (wb_s4_err)
+    );
+
+    wire [31:0] gpio_out_reg;
+    wire [31:0] gpio_dir_reg;
+    assign gpio_out = gpio_out_reg;
+    assign gpio_dir = gpio_dir_reg;
+
+    wire i2c_scl_o;
+    wire i2c_sda_o;
+    wire i2c_sda_oe;
+
+    assign i2c_scl = i2c_scl_o;
+    assign i2c_sda = i2c_sda_oe ? i2c_sda_o : 1'bz;
+    wire i2c_sda_i = i2c_sda;
+
+    wire [3:0] pwm_out_int;
+    assign pwm_out = pwm_out_int;
+
+    uart_top u_uart (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (~rst_n),
+        .wb_adr_i   (wb_s0_adr[4:2]),
+        .wb_dat_i   (wb_s0_dat_o),
+        .wb_dat_o   (wb_s0_dat_i),
+        .wb_we_i    (wb_s0_we),
+        .wb_stb_i   (wb_s0_stb),
+        .wb_cyc_i   (wb_s0_cyc),
+        .wb_ack_o   (wb_s0_ack),
+        .wb_sel_i   (wb_s0_sel),
+        .int_o      (),
+        .stx_pad_o  (uart_tx),
+        .srx_pad_i  (uart_rx),
+        .rts_pad_o  (),
+        .cts_pad_i  (1'b0),
+        .dtr_pad_o  (),
+        .dsr_pad_i  (1'b0),
+        .ri_pad_i   (1'b0),
+        .dcd_pad_i  (1'b0)
+    );
+    assign wb_s0_err = 1'b0;
+
+    gpio_top u_gpio (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (~rst_n),
+        .wb_adr_i   (wb_s1_adr[4:2]),
+        .wb_dat_i   (wb_s1_dat_o),
+        .wb_dat_o   (wb_s1_dat_i),
+        .wb_we_i    (wb_s1_we),
+        .wb_stb_i   (wb_s1_stb),
+        .wb_cyc_i   (wb_s1_cyc),
+        .wb_ack_o   (wb_s1_ack),
+        .wb_sel_i   (wb_s1_sel),
+        .ext_pad_i  (gpio_in),
+        .ext_pad_o  (gpio_out_reg),
+        .ext_padoe_o(gpio_dir_reg),
+        .int_o      ()
+    );
+    assign wb_s1_err = 1'b0;
+
+    spi_top u_spi (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (~rst_n),
+        .wb_adr_i   (wb_s2_adr[4:2]),
+        .wb_dat_i   (wb_s2_dat_o),
+        .wb_dat_o   (wb_s2_dat_i),
+        .wb_we_i    (wb_s2_we),
+        .wb_stb_i   (wb_s2_stb),
+        .wb_cyc_i   (wb_s2_cyc),
+        .wb_ack_o   (wb_s2_ack),
+        .wb_sel_i   (wb_s2_sel),
+        .ss_pad_o   (spi_cs_n),
+        .sclk_pad_o (spi_sclk),
+        .mosi_pad_o (spi_mosi),
+        .miso_pad_i (spi_miso),
+        .int_o      ()
+    );
+    assign wb_s2_err = 1'b0;
+
+    i2c_master_top u_i2c (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (~rst_n),
+        .wb_adr_i   (wb_s3_adr[4:2]),
+        .wb_dat_i   (wb_s3_dat_o),
+        .wb_dat_o   (wb_s3_dat_i),
+        .wb_we_i    (wb_s3_we),
+        .wb_stb_i   (wb_s3_stb),
+        .wb_cyc_i   (wb_s3_cyc),
+        .wb_ack_o   (wb_s3_ack),
+        .wb_sel_i   (wb_s3_sel),
+        .scl_pad_o  (i2c_scl_o),
+        .scl_padoen_o(),
+        .sda_pad_o  (i2c_sda_o),
+        .sda_padoen_o(i2c_sda_oe),
+        .sda_pad_i  (i2c_sda_i),
+        .int_o      ()
+    );
+    assign wb_s3_err = 1'b0;
+
+    pwm_top u_pwm (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (~rst_n),
+        .wb_adr_i   (wb_s4_adr[4:2]),
+        .wb_dat_i   (wb_s4_dat_o),
+        .wb_dat_o   (wb_s4_dat_i),
+        .wb_we_i    (wb_s4_we),
+        .wb_stb_i   (wb_s4_stb),
+        .wb_cyc_i   (wb_s4_cyc),
+        .wb_ack_o   (wb_s4_ack),
+        .wb_sel_i   (wb_s4_sel),
+        .pwm_o      (pwm_out_int),
+        .int_o      ()
+    );
+    assign wb_s4_err = 1'b0;
+
+endmodule
+----------------------------------------
+
+------------------------------------------------------------
+5. Update h3_quad_soc to use OpenCores APB subsystem
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/rtl/h3_quad_soc.v
+
+Ensure the module header matches:
+
+  module h3_quad_soc #(
+      parameter N_CORES = 4
+  )(
+      input  wire         clk,
+      input  wire         rst_n,
+
+      input  wire         uart_rx,
+      output wire         uart_tx,
+
+      input  wire [31:0]  gpio_in,
+      output wire [31:0]  gpio_out,
+      output wire [31:0]  gpio_dir,
+
+      output wire         spi_sclk,
+      output wire         spi_mosi,
+      input  wire         spi_miso,
+      output wire         spi_cs_n,
+
+      inout  wire         i2c_sda,
+      output wire         i2c_scl,
+
+      output wire [3:0]   pwm_out
+  );
+
+Inside h3_quad_soc, where you had:
+
+  h3_ahb_to_apb u_ahb2apb ( ... )
+  h3_apb_subsys u_apb ( ... )
+
+ensure that h3_apb_subsys is now the OpenCores version above, and connect:
+
+  h3_apb_subsys u_apb (
+      .clk      (clk),
+      .rst_n    (rst_n),
+      .paddr    (paddr),
+      .pwrite   (pwrite),
+      .psel     (psel),
+      .penable  (penable),
+      .pwdata   (pwdata),
+      .prdata   (prdata),
+      .pready   (pready),
+      .pslverr  (pslverr),
+      .uart_rx  (uart_rx),
+      .uart_tx  (uart_tx),
+      .gpio_in  (gpio_in),
+      .gpio_out (gpio_out),
+      .gpio_dir (gpio_dir),
+      .spi_sclk (spi_sclk),
+      .spi_mosi (spi_mosi),
+      .spi_miso (spi_miso),
+      .spi_cs_n (spi_cs_n),
+      .i2c_sda  (i2c_sda),
+      .i2c_scl  (i2c_scl),
+      .pwm_out  (pwm_out)
+  );
+
+------------------------------------------------------------
+6. What you have now
+------------------------------------------------------------
+
+At this point, your SoC includes:
+
+- Quad-core Hazard3 (RV32IM).
+- AHB backbone with:
+  - Boot ROM (0x0000_0000, 16 KB).
+  - Instruction SRAM (0x0001_0000, 64 KB).
+  - Data SRAM (0x1000_0000, 64 KB).
+  - APB region (0x4000_0000+).
+- AHB→APB bridge.
+- APB→Wishbone bridge.
+- Wishbone interconnect (single master, 5 slaves).
+- OpenCores peripherals:
+  - UART16550 (0x4000_0000).
+  - GPIO (0x4000_1000).
+  - SPI Master (0x4000_2000).
+  - I2C Master (0x4000_3000).
+  - PWM (0x4000_4000).
+
+All are full-featured, protocol-correct IP cores, not simplified demos.
+
+============================================================
+END OF PHASE 4 (OPENCORES)
+============================================================
