@@ -1467,4 +1467,464 @@ WHAT PHASE 2D GIVES YOU
   - Ephemeral configuration.
   - Open, reproducible, non-destructive.
 
-########END P2D########
+########END P2D#######
+================================================================================
+PHASE 2E: PWM PERIPHERAL (WISHBONE) + HAL + EXAMPLE USE
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Complete the MCU feature set by adding **PWM** to your 4‑hart Hazard3 SoC:
+
+- Wishbone PWM peripheral with multiple channels.
+- Memory-mapped at a clean address.
+- Simple semantics: per-channel period + duty.
+- HAL support + example SDRAM firmware usage.
+
+Still:
+
+- Only `.sof` to FPGA SRAM, no flash.
+- Boot ROM + H3BT + SDRAM firmware unchanged in structure.
+- Fully open-source, reproducible.
+
+We’ll implement:
+
+1. `pwm_wb.sv` — Wishbone PWM with 4 channels.
+2. Address map + integration in `wb_interconnect` and `top_soc.sv`.
+3. HAL extensions in `h3_soc.h` / `h3_soc.c`.
+4. Example usage in `main.c`.
+
+================================================================================
+STEP 1 — PWM REGISTER MAP
+================================================================================
+
+Base address (new region): **0x1000_0700**
+
+We’ll define 4 PWM channels (0..3). Each channel has:
+
+- CTRL   (enable, invert, etc.)
+- PERIOD (ticks per cycle)
+- DUTY   (ticks high)
+
+Register layout (word-aligned, 32-bit):
+
+Base + 0x00: GLOBAL_CTRL (RW)
+- bit0: ENABLE (global run)
+- bit1: RESET (self-clearing reset of counters)
+
+Channel n (n = 0..3, stride = 0x10):
+
+Base + 0x10 + 0x10*n: CHn_CTRL (RW)
+- bit0: ENABLE (channel active)
+- bit1: INVERT (output inverted)
+
+Base + 0x14 + 0x10*n: CHn_PERIOD (RW)
+- 32-bit period in clock ticks (must be > 0)
+
+Base + 0x18 + 0x10*n: CHn_DUTY (RW)
+- 32-bit duty in clock ticks (<= PERIOD)
+
+Base + 0x1C + 0x10*n: reserved / unused
+
+Outputs:
+
+- `pwm_out[3:0]` → 4 PWM channels exposed to pins (e.g. Arduino pins).
+
+================================================================================
+STEP 2 — PWM WISHBONE SLAVE RTL
+================================================================================
+
+File: ~/fpga/h3_phase1_sc/rtl/soc/pwm_wb.sv
+
+module pwm_wb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // PWM outputs
+    output wire [3:0]  pwm_out
+);
+
+    assign wb_err_o = 1'b0;
+
+    // Global control
+    reg [31:0] global_ctrl;
+
+    // Per-channel registers
+    reg [31:0] ch_ctrl   [0:3];
+    reg [31:0] ch_period [0:3];
+    reg [31:0] ch_duty   [0:3];
+    reg [31:0] ch_count  [0:3];
+
+    integer i;
+
+    // Decode
+    wire [7:0] byte_off = wb_adr_i[7:0];   // within 0x1000_0700 region
+    wire [3:0] word_off = byte_off[5:2];   // 4-byte words
+
+    // Global control bits
+    wire global_enable = global_ctrl[0];
+    wire global_reset  = global_ctrl[1];
+
+    // PWM logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            global_ctrl <= 32'h0;
+            for (i = 0; i < 4; i = i + 1) begin
+                ch_ctrl[i]   <= 32'h0;
+                ch_period[i] <= 32'd1000;  // default period
+                ch_duty[i]   <= 32'd0;
+                ch_count[i]  <= 32'd0;
+            end
+        end else begin
+            // Global reset of counters if requested
+            if (global_reset) begin
+                for (i = 0; i < 4; i = i + 1)
+                    ch_count[i] <= 32'd0;
+                // self-clear RESET bit
+                global_ctrl[1] <= 1'b0;
+            end
+
+            // PWM counters
+            if (global_enable) begin
+                for (i = 0; i < 4; i = i + 1) begin
+                    if (ch_ctrl[i][0]) begin // channel enable
+                        if (ch_count[i] >= ch_period[i]) begin
+                            ch_count[i] <= 32'd0;
+                        end else begin
+                            ch_count[i] <= ch_count[i] + 32'd1;
+                        end
+                    end else begin
+                        ch_count[i] <= 32'd0;
+                    end
+                end
+            end else begin
+                for (i = 0; i < 4; i = i + 1)
+                    ch_count[i] <= 32'd0;
+            end
+        end
+    end
+
+    // PWM output generation
+    genvar ch;
+    generate
+        for (ch = 0; ch < 4; ch = ch + 1) begin : gen_pwm
+            wire active = (ch_ctrl[ch][0] && global_enable);
+            wire invert = ch_ctrl[ch][1];
+            wire high   = (ch_count[ch] < ch_duty[ch]);
+            assign pwm_out[ch] = active ? (invert ? ~high : high) : 1'b0;
+        end
+    endgenerate
+
+    // Wishbone access
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (word_off)
+                        4'h0: global_ctrl <= wb_dat_i;
+
+                        // CH0
+                        4'h4: ch_ctrl[0]   <= wb_dat_i;
+                        4'h5: ch_period[0] <= wb_dat_i;
+                        4'h6: ch_duty[0]   <= wb_dat_i;
+
+                        // CH1
+                        4'h8: ch_ctrl[1]   <= wb_dat_i;
+                        4'h9: ch_period[1] <= wb_dat_i;
+                        4'hA: ch_duty[1]   <= wb_dat_i;
+
+                        // CH2
+                        4'hC: ch_ctrl[2]   <= wb_dat_i;
+                        4'hD: ch_period[2] <= wb_dat_i;
+                        4'hE: ch_duty[2]   <= wb_dat_i;
+
+                        // CH3
+                        4'h10: ch_ctrl[3]   <= wb_dat_i;
+                        4'h11: ch_period[3] <= wb_dat_i;
+                        4'h12: ch_duty[3]   <= wb_dat_i;
+
+                        default: ;
+                    endcase
+                end else begin
+                    case (word_off)
+                        4'h0: wb_dat_o <= global_ctrl;
+
+                        // CH0
+                        4'h4:  wb_dat_o <= ch_ctrl[0];
+                        4'h5:  wb_dat_o <= ch_period[0];
+                        4'h6:  wb_dat_o <= ch_duty[0];
+
+                        // CH1
+                        4'h8:  wb_dat_o <= ch_ctrl[1];
+                        4'h9:  wb_dat_o <= ch_period[1];
+                        4'hA:  wb_dat_o <= ch_duty[1];
+
+                        // CH2
+                        4'hC:  wb_dat_o <= ch_ctrl[2];
+                        4'hD:  wb_dat_o <= ch_period[2];
+                        4'hE:  wb_dat_o <= ch_duty[2];
+
+                        // CH3
+                        4'h10: wb_dat_o <= ch_ctrl[3];
+                        4'h11: wb_dat_o <= ch_period[3];
+                        4'h12: wb_dat_o <= ch_duty[3];
+
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 3 — INTEGRATE PWM INTO WB + TOP_SOC
+================================================================================
+
+### 3.1 — WB interconnect decode
+
+Add a new slave slot (e.g. s8) for PWM at **0x1000_0700**.
+
+In wb_interconnect.sv:
+
+- Add s8_* ports like others.
+- Add decode:
+
+  sel_s8 = (m_adr_i[31:8] == 24'h100007);
+
+- Route s8_* in master-to-slave and slave-to-master muxes.
+
+(You’ve done this pattern already for s6/s7 in earlier phases.)
+
+### 3.2 — top_soc.sv wiring
+
+Add WB signals:
+
+wire [31:0] s8_adr_o, s8_dat_o, s8_dat_i;
+wire        s8_we_o, s8_cyc_o, s8_stb_o;
+wire [3:0]  s8_sel_o;
+wire        s8_ack_i, s8_err_i;
+
+Add PWM outputs:
+
+wire [3:0] pwm_ch;
+
+// Instantiate PWM
+pwm_wb u_pwm (
+    .clk       (clk),
+    .rst       (rst),
+    .wb_adr_i  (s8_adr_o),
+    .wb_dat_i  (s8_dat_o),
+    .wb_dat_o  (s8_dat_i),
+    .wb_we_i   (s8_we_o),
+    .wb_sel_i  (s8_sel_o),
+    .wb_cyc_i  (s8_cyc_o),
+    .wb_stb_i  (s8_stb_o),
+    .wb_ack_o  (s8_ack_i),
+    .wb_err_o  (s8_err_i),
+    .pwm_out   (pwm_ch)
+);
+
+Now map `pwm_ch[3:0]` to pins:
+
+- For example:
+
+  - pwm_ch[0] → Arduino D9
+  - pwm_ch[1] → Arduino D10
+  - pwm_ch[2] → Arduino D5
+  - pwm_ch[3] → Arduino D6
+
+You choose the mapping in the .qsf pin assignments.
+
+================================================================================
+STEP 4 — HAL EXTENSIONS FOR PWM
+================================================================================
+
+Update: ~/hazard3_fw/app/h3_soc.h
+
+Add after other peripheral sections:
+
+/* ============================================================================
+ * PWM (4-channel)
+ * Base: 0x1000_0700
+ * ============================================================================
+ */
+
+#define H3_PWM_BASE          0x10000700u
+
+#define H3_PWM_GLOBAL_CTRL   (*(volatile uint32_t *)(H3_PWM_BASE + 0x00))
+
+#define H3_PWM_CH_CTRL(n)    (*(volatile uint32_t *)(H3_PWM_BASE + 0x10 + 0x10u*(n)))
+#define H3_PWM_CH_PERIOD(n)  (*(volatile uint32_t *)(H3_PWM_BASE + 0x14 + 0x10u*(n)))
+#define H3_PWM_CH_DUTY(n)    (*(volatile uint32_t *)(H3_PWM_BASE + 0x18 + 0x10u*(n)))
+
+/* Global CTRL bits */
+#define H3_PWM_GLOBAL_ENABLE (1u << 0)
+#define H3_PWM_GLOBAL_RESET  (1u << 1)
+
+/* Channel CTRL bits */
+#define H3_PWM_CH_ENABLE     (1u << 0)
+#define H3_PWM_CH_INVERT     (1u << 1)
+
+/* HAL API for PWM */
+void     h3_pwm_global_enable(int enable);
+void     h3_pwm_global_reset(void);
+void     h3_pwm_config(uint32_t ch, uint32_t period, uint32_t duty, int invert);
+void     h3_pwm_enable(uint32_t ch, int enable);
+
+Now implement in ~/hazard3_fw/app/h3_soc.c:
+
+Add near the bottom:
+
+void h3_pwm_global_enable(int enable)
+{
+    if (enable)
+        H3_PWM_GLOBAL_CTRL |= H3_PWM_GLOBAL_ENABLE;
+    else
+        H3_PWM_GLOBAL_CTRL &= ~H3_PWM_GLOBAL_ENABLE;
+}
+
+void h3_pwm_global_reset(void)
+{
+    H3_PWM_GLOBAL_CTRL |= H3_PWM_GLOBAL_RESET;
+}
+
+void h3_pwm_config(uint32_t ch, uint32_t period, uint32_t duty, int invert)
+{
+    if (ch >= 4) return;
+    if (period == 0) period = 1;
+
+    H3_PWM_CH_PERIOD(ch) = period;
+    if (duty > period) duty = period;
+    H3_PWM_CH_DUTY(ch) = duty;
+
+    uint32_t ctrl = 0;
+    if (invert) ctrl |= H3_PWM_CH_INVERT;
+    H3_PWM_CH_CTRL(ch) = ctrl;
+}
+
+void h3_pwm_enable(uint32_t ch, int enable)
+{
+    if (ch >= 4) return;
+    uint32_t ctrl = H3_PWM_CH_CTRL(ch);
+    if (enable)
+        ctrl |= H3_PWM_CH_ENABLE;
+    else
+        ctrl &= ~H3_PWM_CH_ENABLE;
+    H3_PWM_CH_CTRL(ch) = ctrl;
+}
+
+================================================================================
+STEP 5 — EXAMPLE USAGE IN SDRAM FIRMWARE
+================================================================================
+
+In your multi-hart firmware (main.c from Phase 2D), you can now add PWM usage.
+
+For a quick test, let’s let **HART2** drive PWM instead of doing manual GPIO blink.
+
+Replace hart2_main() in main.c with:
+
+static void hart2_main(void)
+{
+    h3_con_puts("HART2: PWM blinker started\n");
+
+    /* Configure PWM channel 0:
+     *  - period = 50000 ticks (~1ms at 50 MHz → 1 kHz)
+     *  - start with 10% duty
+     */
+    uint32_t period = 50000u;
+    h3_pwm_config(0, period, period / 10u, 0);
+
+    /* Enable global + channel. */
+    h3_pwm_global_enable(1);
+    h3_pwm_enable(0, 1);
+
+    /* Slowly sweep duty cycle between 10% and 90%. */
+    uint32_t duty = period / 10u;
+    int step = (int)(period / 50u); // 2% steps
+
+    while (1) {
+        h3_pwm_config(0, period, duty, 0);
+
+        h3_con_puts("HART2: PWM duty = ");
+        // crude decimal print just for visibility
+        uint32_t pct = (duty * 100u) / period;
+        char buf[4];
+        buf[0] = '0' + (pct / 10) % 10;
+        buf[1] = '0' + (pct % 10);
+        buf[2] = '%';
+        buf[3] = '\0';
+        h3_con_puts(buf);
+        h3_con_puts("\n");
+
+        h3_delay_cycles(5000000u);
+
+        duty += step;
+        if (duty >= (period * 9u) / 10u || duty <= (period * 1u) / 10u)
+            step = -step;
+    }
+}
+
+Then rebuild:
+
+cd ~/hazard3_fw/app
+make
+
+Load via H3BT as usual.
+
+PWM channel 0 (pwm_ch[0]) should now show a varying duty cycle at ~1 kHz on the mapped pin (e.g. Arduino D9).
+
+================================================================================
+STEP 6 — QUARTUS: FILES, BUILD, PROGRAM
+================================================================================
+
+1. Add `pwm_wb.sv` to the Quartus project.
+2. Update `wb_interconnect.sv` with s8 decode @ 0x1000_0700.
+3. Update `top_soc.sv`:
+   - Add s8_* signals.
+   - Instantiate u_pwm.
+   - Expose `pwm_ch[3:0]` to top-level ports or connect them to existing GPIO pins.
+4. Assign PWM outputs to physical pins in .qsf (e.g. Arduino header).
+5. Recompile.
+6. Program `.sof` over JTAG (SRAM-only).
+7. Load firmware via H3BT and observe PWM behavior.
+
+================================================================================
+WHAT PHASE 2E GIVES YOU
+================================================================================
+
+You now have:
+
+- A **4-core Hazard3 MCU-class SoC** with:
+  - UART0 + JTAG-UART
+  - I2C
+  - SPI
+  - GPIO
+  - **PWM (4 channels)**
+  - Mailbox (hart start)
+  - CLINT-lite (software interrupts + timers)
+- A HAL that cleanly abstracts everything.
+- Multicore firmware that can assign real tasks to different harts, including PWM control.
+
+########END P2E########
