@@ -784,4 +784,5 @@ WHAT PHASE 1A HAS ACHIEVED (QUAD-CORE FUTURE IN MIND)
   - Phase 1C+: SDRAM, UART, I2C, SPI, GPIO, JTAG-UART, bootloader, HAL.
   - Phase 2: dual-core bring-up.
   - Phase 3: quad-core with core control and hart coordination.
-№############END PHASE1################
+№############END PHASE1_A################
+
