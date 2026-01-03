@@ -2144,3 +2144,940 @@ Next natural step is **Phase 1D**:
   firmware to prove SDRAM + UART together.
 
 ##############END Phase 1C################
+================================================================================
+PHASE 1D: REAL UART16550 INTEGRATION ON WISHBONE s1 @ 0x1000_0000
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1D
+----------------
+Take the SoC from Phase 1C (Hazard3 + AHB→WB + SDRAM) and:
+
+- Replace the UART stub on Wishbone s1 with a **real** OpenCores UART16550.
+- Map UART0 at 0x1000_0000 (word-addressed).
+- Expose UART RX/TX pins on DE0-Lite Arduino D0/D1 (or equivalent).
+- Add a tiny test firmware that:
+  - Boots from ROM.
+  - Writes to UART0 registers.
+  - Sends a “Hello from UART0” message over the external USB‑serial dongle.
+
+NO changes to your ephemeral rule:
+- Only `.sof` via JTAG to **SRAM**.
+- Never program flash (.pof).
+- On power-cycle, DE0‑Lite returns to factory demo.
+
+ASSUMPTIONS
+-----------
+- You already have:
+  - Phase 1A + 1B + 1C implemented and compiling:
+    - hazard3_tile.sv
+    - ahb_interconnect_4m.sv
+    - ahb_to_wb_bridge.sv
+    - wb_interconnect.sv
+    - boot_rom.sv
+    - sdram_wb_wrapper.sv
+    - top_soc.sv (with SDRAM pins)
+  - Boot ROM stub (bootrom.c) that loops forever.
+- You have (or can obtain) OpenCores UART16550 RTL with a Wishbone interface.
+
+DIRECTORY CONTEXT
+-----------------
+We add:
+
+- ~/fpga/h3_phase1_sc/rtl/cores/opencores_uart16550/
+    - uart_top.v (or similar; main 16550 + WB top)
+    - other UART core files
+- ~/fpga/h3_phase1_sc/rtl/soc/uart16550_wb_wrapper.sv   (NEW)
+- Update: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv         (connect UART to s1)
+- Update: ~/hazard3_fw/bootrom/bootrom.c                 (minimal UART test)
+
+We maintain:
+- Only `.sof` via JTAG.
+- Bootrom.hex as ROM content.
+
+================================================================================
+STEP 1 — PLACE THE OPENCORES UART16550 SOURCES
+================================================================================
+
+1. Create directory for UART core:
+
+   mkdir -p ~/fpga/h3_phase1_sc/rtl/cores/opencores_uart16550
+
+2. Download OpenCores UART16550 from opencores.org (or equivalent mirror):
+
+   - Place its Verilog files in:
+     ~/fpga/h3_phase1_sc/rtl/cores/opencores_uart16550/
+
+3. Identify the Wishbone wrapper/top for the UART core:
+   - Common names: uart_top.v, uart_wb.v, etc.
+   - It typically exposes:
+     - Wishbone:
+       - wb_clk_i, wb_rst_i
+       - wb_adr_i, wb_dat_i, wb_dat_o, wb_sel_i, wb_cyc_i, wb_stb_i, wb_we_i
+       - wb_ack_o
+     - UART pins:
+       - stx_o (TX)
+       - srx_i (RX)
+     - Optional modem control pins (we can tie unused to constants).
+
+You’ll adjust the wrapper below to the exact module/port names from the core you fetched.
+
+================================================================================
+STEP 2 — UART16550 WISHBONE WRAPPER (s1 SLAVE)
+================================================================================
+
+We wrap the OpenCores UART16550 into a module with the Wishbone interface that
+matches s1_* in wb_interconnect.
+
+Addressing model:
+- We’ll use the low address bits [7:2] as register index (word-addressed).
+- The core may expect byte addressing; we pass the full wb_adr_i and let it use what it needs.
+
+UART configuration:
+- 8N1, FIFOs enabled, 115200 baud from 50 MHz clock.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/uart16550_wb_wrapper.sv ----------------
+
+module uart16550_wb_wrapper
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave interface
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output wire [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output wire        wb_ack_o,
+    output wire        wb_err_o,
+
+    // UART pins
+    input  wire        uart_rx,
+    output wire        uart_tx
+);
+
+    // For this simple case, we don't use wb_err_o.
+    assign wb_err_o = 1'b0;
+
+    // OpenCores UART16550 usually has an 8-bit data bus.
+    // We map our 32-bit WB bus to 8 bits by using the low byte and ignoring others.
+    // For a more correct implementation, you’d consider wb_sel_i and partial writes.
+
+    wire        uart_ack;
+    wire [7:0]  uart_dat_o;
+
+    assign wb_ack_o   = uart_ack;
+    assign wb_dat_o   = {24'h0, uart_dat_o};
+
+    // Example instance; adapt module/port names to the actual OpenCores UART top.
+    uart_top u_uart (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (rst),
+
+        .wb_adr_i   (wb_adr_i[4:2]),   // word-aligned 3-bit register index (0..7)
+        .wb_dat_i   (wb_dat_i[7:0]),
+        .wb_dat_o   (uart_dat_o),
+        .wb_we_i    (wb_we_i),
+        .wb_sel_i   (wb_sel_i[0]),
+        .wb_cyc_i   (wb_cyc_i),
+        .wb_stb_i   (wb_stb_i),
+        .wb_ack_o   (uart_ack),
+
+        // Modem control (tie off if not used)
+        .stx_pad_o  (uart_tx),
+        .srx_pad_i  (uart_rx),
+        .rts_pad_o  (),
+        .cts_pad_i  (1'b0),
+        .dtr_pad_o  (),
+        .dsr_pad_i  (1'b0),
+        .ri_pad_i   (1'b0),
+        .dcd_pad_i  (1'b0),
+
+        // Interrupt (unused for now)
+        .int_o      ()
+    );
+
+endmodule
+
+NOTES:
+- You must check the actual OpenCores UART top port list and adjust:
+  - Module name (uart_top vs. something else).
+  - Address width (wb_adr_i bits).
+  - Data bus width (8 vs. 32 bits).
+  - Modem control pins.
+
+================================================================================
+STEP 3 — UPDATE top_soc.sv TO CONNECT UART0 ON s1 AND EXPOSE UART PINS
+================================================================================
+
+We now:
+
+- Add UART pins (uart0_rx, uart0_tx) to top_soc.
+- Replace the s1 stub (UART) with the real uart16550_wb_wrapper.
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv --------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq,
+
+    // UART0 pins (map to D0/D1 on DE0-Lite Arduino header)
+    input  wire        uart0_rx,
+    output wire        uart0_tx
+
+    // Later: add I2C/SPI/GPIO pins
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    // (UNCHANGED) AHB masters M0..M3, AHB slaves s0..s1, Hazard3 tile,
+    // AHB interconnect, Boot ROM, AHB→WB bridge, WB interconnect, SDRAM integration
+    // Keep everything from Phase 1C as-is, except the stub for s1 (UART).
+
+    // ... (same declarations as Phase 1C: m0..m3_*; s0..s1_*; etc.) ...
+
+    // HART0
+    hazard3_tile #(
+        .HART_ID(0)
+    ) u_hart0 ( /* same as Phase 1C */ );
+
+    // AHB interconnect
+    ahb_interconnect_4m u_ahb_ic ( /* same as Phase 1C */ );
+
+    // Boot ROM
+    boot_rom u_boot_rom ( /* same as Phase 1C (hooked to s0_*) */ );
+
+    // AHB→Wishbone bridge on s1
+    wire [31:0] wb_adr_m;
+    wire [31:0] wb_dat_o_m;
+    wire [31:0] wb_dat_i_m;
+    wire        wb_we_m;
+    wire [3:0]  wb_sel_m;
+    wire        wb_cyc_m;
+    wire        wb_stb_m;
+    wire        wb_ack_m;
+    wire        wb_err_m;
+
+    ahb_to_wb_bridge u_ahb2wb ( /* same as Phase 1C (hooked to s1_*) */ );
+
+    // Wishbone interconnect
+    wire [31:0] s0_dat_i, s1_dat_i, s2_dat_i, s3_dat_i, s4_dat_i, s5_dat_i;
+    wire        s0_ack_i, s1_ack_i, s2_ack_i, s3_ack_i, s4_ack_i, s5_ack_i;
+    wire        s0_err_i, s1_err_i, s2_err_i, s3_err_i, s4_err_i, s5_err_i;
+
+    wire [31:0] s0_adr_o, s1_adr_o, s2_adr_o, s3_adr_o, s4_adr_o, s5_adr_o;
+    wire [31:0] s0_dat_o, s1_dat_o, s2_dat_o, s3_dat_o, s4_dat_o, s5_dat_o;
+    wire        s0_we_o, s1_we_o, s2_we_o, s3_we_o, s4_we_o, s5_we_o;
+    wire [3:0]  s0_sel_o, s1_sel_o, s2_sel_o, s3_sel_o, s4_sel_o, s5_sel_o;
+    wire        s0_cyc_o, s1_cyc_o, s2_cyc_o, s3_cyc_o, s4_cyc_o, s5_cyc_o;
+    wire        s0_stb_o, s1_stb_o, s2_stb_o, s3_stb_o, s4_stb_o, s5_stb_o;
+
+    wb_interconnect u_wb_ic ( /* same as Phase 1C */ );
+
+    // SDRAM (s0)
+    sdram_wb_wrapper u_sdram_wb (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s0_adr_o),
+        .wb_dat_i   (s0_dat_o),
+        .wb_dat_o   (s0_dat_i),
+        .wb_we_i    (s0_we_o),
+        .wb_sel_i   (s0_sel_o),
+        .wb_cyc_i   (s0_cyc_o),
+        .wb_stb_i   (s0_stb_o),
+        .wb_ack_o   (s0_ack_i),
+        .wb_err_o   (s0_err_i),
+
+        .sdram_a    (sdram_a),
+        .sdram_ba   (sdram_ba),
+        .sdram_clk  (sdram_clk),
+        .sdram_cke  (sdram_cke),
+        .sdram_cs_n (sdram_cs_n),
+        .sdram_ras_n(sdram_ras_n),
+        .sdram_cas_n(sdram_cas_n),
+        .sdram_we_n (sdram_we_n),
+        .sdram_dqm  (sdram_dqm),
+        .sdram_dq   (sdram_dq)
+    );
+
+    // UART0 (s1): real OpenCores 16550
+    uart16550_wb_wrapper u_uart0 (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s1_adr_o),
+        .wb_dat_i   (s1_dat_o),
+        .wb_dat_o   (s1_dat_i),
+        .wb_we_i    (s1_we_o),
+        .wb_sel_i   (s1_sel_o),
+        .wb_cyc_i   (s1_cyc_o),
+        .wb_stb_i   (s1_stb_o),
+        .wb_ack_o   (s1_ack_i),
+        .wb_err_o   (s1_err_i),
+
+        .uart_rx    (uart0_rx),
+        .uart_tx    (uart0_tx)
+    );
+
+    // Still stub peripherals for now
+    assign s2_dat_i = 32'hI2C0_000;  assign s2_ack_i = s2_cyc_o & s2_stb_o; assign s2_err_i = 1'b0;
+    assign s3_dat_i = 32'hSPI0_000;  assign s3_ack_i = s3_cyc_o & s3_stb_o; assign s3_err_i = 1'b0;
+    assign s4_dat_i = 32'hGPIO_000;  assign s4_ack_i = s4_cyc_o & s4_stb_o; assign s4_err_i = 1'b0;
+    assign s5_dat_i = 32'hJTAG_000;  assign s5_ack_i = s5_cyc_o & s5_stb_o; assign s5_err_i = 1'b0;
+
+endmodule
+
+NOTE:
+- I’ve elided the repeated, unchanged declarations/instantiations from Phase 1C
+  with “(same as Phase 1C)” to keep this readable, but in your actual file you’ll
+  have the complete code.
+
+================================================================================
+STEP 4 — UPDATE BOOT ROM TO EXERCISE UART0
+================================================================================
+
+For a first UART test, we can:
+
+- Keep executing from ROM @ 0x2000_0000.
+- Directly program UART registers via its memory map at 0x1000_0000.
+- Print a short string once.
+
+We’ll assume a 16550-like register layout with byte addressing:
+
+Offset (byte)  Register
+0x00           RBR/THR (RX/TX)
+0x04           IER
+0x08           IIR/FCR
+0x0C           LCR
+0x10           MCR
+0x14           LSR
+0x18           MSR
+0x1C           SCR
+DLAB=1 remaps 0x00/0x04 to DLL/DLM
+
+We’ll use 32-bit accesses but only low byte matters (wrapper maps to 8-bit).
+
+----- UPDATED FILE: ~/hazard3_fw/bootrom/bootrom.c ----------------------------
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+
+#define UART_RBR     (*(volatile uint32_t *)(UART0_BASE + 0x00)) // RX (DLAB=0)
+#define UART_THR     (*(volatile uint32_t *)(UART0_BASE + 0x00)) // TX (DLAB=0)
+#define UART_IER     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_IIR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_FCR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_LCR     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_MCR     (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_LSR     (*(volatile uint32_t *)(UART0_BASE + 0x14))
+
+#define UART_LSR_DR   (1u << 0)
+#define UART_LSR_THRE (1u << 5)
+
+static void uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    // 16550: divisor = clk / (16 * baud)
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+
+    // Enable DLAB to access DLL/DLM
+    UART_LCR = 0x80u;
+    UART_THR = (divisor & 0xFFu);          // DLL
+    UART_IER = ((divisor >> 8) & 0xFFu);   // DLM
+
+    // 8N1, DLAB=0
+    UART_LCR = 0x03u;
+
+    // Enable FIFO, clear RX/TX
+    UART_FCR = 0x07u;
+
+    // Modem Control: set OUT2 (often needed to enable interrupts), but we won't use IRQs yet
+    UART_MCR = 0x08u;
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_LSR & UART_LSR_THRE)) {
+        // wait
+    }
+    UART_THR = (uint8_t)c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') {
+            uart_putc('\r');
+        }
+        uart_putc(*s++);
+    }
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+    uart_init(SYS_CLK_HZ, 115200u);
+
+    uart_puts("Hazard3 Phase 1D: UART16550 test\n");
+    uart_puts("If you see this over UART0, the bridge + WB + UART are alive.\n");
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+Rebuild bootrom.hex:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+Ensure bootrom.hex is visible to Quartus (e.g. copy to project dir).
+
+================================================================================
+STEP 5 — QUARTUS: FILES, PINS, BUILD, PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Add UART core RTL:
+   - Quartus → Add/Remove Files:
+     - ../rtl/cores/opencores_uart16550/*.v
+     - ../rtl/soc/uart16550_wb_wrapper.sv
+     - Updated ../rtl/soc/top_soc.sv
+
+2. UART0 pin assignment:
+   - Map uart0_tx and uart0_rx to DE0-Lite Arduino D1 and D0 respectively
+     (check board manual for exact pin names).
+   - Connect your 3.3 V USB‑serial dongle:
+     - Dongle TX → SoC RX (D0 / uart0_rx).
+     - Dongle RX → SoC TX (D1 / uart0_tx).
+     - GND → GND.
+
+3. Boot ROM:
+   - Ensure the new bootrom.hex (with UART test) is in the location referenced
+     by boot_rom.sv.
+
+4. Compile:
+   - Processing → Start Compilation.
+
+5. Program SRAM only:
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - File: h3_phase1_sc.sof.
+     - Check only “Program/Configure”.
+     - START.
+   - Do **not** create/use .pof or program any configuration device.
+
+6. Run-time test:
+   - Power on DE0-Lite → factory demo loads from flash by default.
+   - Program .sof over JTAG → Hazard3 SoC overlays into SRAM.
+   - Open a serial terminal on the host at 115200 8N1 on the USB‑serial port.
+   - Reset DE0-Lite (reset_n asserted then released).
+   - You should see:
+
+     Hazard3 Phase 1D: UART16550 test
+     If you see this over UART0, the bridge + WB + UART are alive.
+
+   - Power-cycle the board:
+     - Your SoC disappears.
+     - Factory demo reappears, as required.
+
+================================================================================
+WHAT PHASE 1D GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- Real, OpenCores UART16550 integrated into the same WB fabric as SDRAM.
+- Cleanly memory-mapped at 0x1000_0000 behind AHB→WB bridge.
+- Verified end-to-end path:
+  Hazard3 core → AHB → AHB→WB bridge → WB interconnect → UART16550 → pins.
+- Preserves:
+  - Quad-core-ready AHB fabric (M0..M3).
+  - Ephemeral configuration (SRAM-only .sof, factory demo on power-cycle).
+################END PHASE1D##############
+================================================================================
+PHASE 1E: REAL I2C MASTER INTEGRATION ON WISHBONE s2 @ 0x1000_0100
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1E
+----------------
+Extend the SoC from Phase 1D (Hazard3 + SDRAM + UART16550) by:
+
+- Replacing the I2C stub on Wishbone s2 with a **real OpenCores I2C master**.
+- Mapping I2C0 at 0x1000_0100 (byte/word accessed via WB).
+- Exposing SDA/SCL pins (open-drain) on Arduino A4/A5.
+- Adding a simple ROM-based test:
+  - Configure I2C for 100 kHz.
+  - Try a write/read to a known/slave address (e.g. 0x68 or dummy poll).
+  - Print status via UART0.
+
+Still:
+- Only `.sof` via JTAG to SRAM (no .pof, no flash programming).
+- Power-cycle → DE0-Lite factory demo restored automatically.
+
+ASSUMPTIONS
+-----------
+You already have from earlier phases:
+
+- AHB master (HART0 tile) and 4-master AHB fabric.
+- AHB→WB bridge feeding wb_interconnect.
+- SDRAM integrated as s0 (OpenCores SDRAM).
+- UART16550 integrated as s1 (OpenCores UART) @ 0x1000_0000.
+- Stub slaves for s2 (I2C), s3 (SPI), s4 (GPIO), s5 (JTAG-UART).
+- Boot ROM that prints over UART0.
+
+We now replace the I2C stub on s2 with a real OpenCores I2C master.
+
+================================================================================
+STEP 1 — PLACE THE OPENCORES I2C MASTER SOURCES
+================================================================================
+
+1. Create directory for I2C core:
+
+   mkdir -p ~/fpga/h3_phase1_sc/rtl/cores/opencores_i2c
+
+2. Download OpenCores I2C master from opencores.org and place all RTL files in:
+
+   ~/fpga/h3_phase1_sc/rtl/cores/opencores_i2c/
+
+3. Identify the Wishbone top-level, commonly named something like:
+
+   i2c_master_top.v
+
+   It typically has ports like:
+
+   - Wishbone:
+     - wb_clk_i, wb_rst_i
+     - wb_adr_i[2:0], wb_dat_i[7:0], wb_dat_o[7:0]
+     - wb_we_i, wb_stb_i, wb_cyc_i
+     - wb_ack_o
+   - I2C:
+     - scl_pad_i, scl_pad_o, scl_padoen_o
+     - sda_pad_i, sda_pad_o, sda_padoen_o
+
+We’ll wrap that into our WB interface and map to top_soc SDA/SCL pins as open-drain.
+
+================================================================================
+STEP 2 — I2C WISHBONE WRAPPER (s2 SLAVE)
+================================================================================
+
+We wrap i2c_master_top into a module with the s2_* Wishbone interface expected by
+wb_interconnect:
+
+- 32-bit WB data but core is 8-bit → we map low byte.
+- We use address bits [4:2] or [2:0] depending on the core.
+- Provide SDA/SCL as inout, using oe signals from core.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/i2c_wb_wrapper.sv ---------------------
+
+module i2c_wb_wrapper
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave interface
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output wire [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output wire        wb_ack_o,
+    output wire        wb_err_o,
+
+    // I2C pins (to board)
+    inout  wire        sda,
+    inout  wire        scl
+);
+
+    assign wb_err_o = 1'b0;
+
+    // Low byte used for I2C core
+    wire [7:0] i2c_dat_o;
+
+    assign wb_dat_o = {24'h0, i2c_dat_o};
+
+    // Address mapping:
+    // The classic OpenCores I2C uses 3-bit register index:
+    // 0: PRERlo, 1: PRERhi, 2: CTR, 3: TXR/RXR, 4: CR/SR, others reserved.
+    wire [2:0] reg_adr = wb_adr_i[4:2];
+
+    // I2C pads: open-drain behavior
+    wire scl_pad_i, scl_pad_o, scl_padoen_o;
+    wire sda_pad_i, sda_pad_o, sda_padoen_o;
+
+    assign scl_pad_i = scl;
+    assign sda_pad_i = sda;
+
+    assign scl = (scl_padoen_o == 1'b0) ? scl_pad_o : 1'bz;
+    assign sda = (sda_padoen_o == 1'b0) ? sda_pad_o : 1'bz;
+
+    i2c_master_top u_i2c (
+        .wb_clk_i   (clk),
+        .wb_rst_i   (rst),
+
+        .wb_adr_i   (reg_adr),
+        .wb_dat_i   (wb_dat_i[7:0]),
+        .wb_dat_o   (i2c_dat_o),
+        .wb_we_i    (wb_we_i),
+        .wb_stb_i   (wb_stb_i),
+        .wb_cyc_i   (wb_cyc_i),
+        .wb_ack_o   (wb_ack_o),
+
+        // Interrupt (unused for now)
+        .wb_inta_o  (),
+
+        // I2C signals
+        .scl_pad_i  (scl_pad_i),
+        .scl_pad_o  (scl_pad_o),
+        .scl_padoen_o (scl_padoen_o),
+        .sda_pad_i  (sda_pad_i),
+        .sda_pad_o  (sda_pad_o),
+        .sda_padoen_o (sda_padoen_o)
+    );
+
+endmodule
+
+NOTE:
+- Adjust module/port names if your I2C core differs.
+- The key is: we present a clean WB slave and drive sda/scl as open-drain IO.
+
+================================================================================
+STEP 3 — UPDATE top_soc.sv TO INSTANTIATE I2C (s2) + EXPOSE SDA/SCL PINS
+================================================================================
+
+We add:
+
+- I2C pins to top_soc (i2c_sda, i2c_scl).
+- Replace the s2 stub with i2c_wb_wrapper instance.
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv --------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq,
+
+    // UART0 pins
+    input  wire        uart0_rx,
+    output wire        uart0_tx,
+
+    // I2C0 pins (map to Arduino A4/A5)
+    inout  wire        i2c_sda,
+    inout  wire        i2c_scl
+
+    // Later: SPI, GPIO, JTAG-UART
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    // All AHB/wb signals same as Phase 1D; only difference is s2 hookup.
+
+    // ... Hazard3 tile, AHB interconnect, Boot ROM, AHB→WB bridge, WB interconnect
+    //     and SDRAM (u_sdram_wb) same as Phase 1D ...
+
+    // UART0 on s1 (unchanged)
+    uart16550_wb_wrapper u_uart0 (
+        .clk        (clk),
+        .rst        (rst),
+        .wb_adr_i   (s1_adr_o),
+        .wb_dat_i   (s1_dat_o),
+        .wb_dat_o   (s1_dat_i),
+        .wb_we_i    (s1_we_o),
+        .wb_sel_i   (s1_sel_o),
+        .wb_cyc_i   (s1_cyc_o),
+        .wb_stb_i   (s1_stb_o),
+        .wb_ack_o   (s1_ack_i),
+        .wb_err_o   (s1_err_i),
+
+        .uart_rx    (uart0_rx),
+        .uart_tx    (uart0_tx)
+    );
+
+    // I2C0 on s2: real OpenCores I2C master
+    i2c_wb_wrapper u_i2c0 (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s2_adr_o),
+        .wb_dat_i   (s2_dat_o),
+        .wb_dat_o   (s2_dat_i),
+        .wb_we_i    (s2_we_o),
+        .wb_sel_i   (s2_sel_o),
+        .wb_cyc_i   (s2_cyc_o),
+        .wb_stb_i   (s2_stb_o),
+        .wb_ack_o   (s2_ack_i),
+        .wb_err_o   (s2_err_i),
+
+        .sda        (i2c_sda),
+        .scl        (i2c_scl)
+    );
+
+    // Keep stubs for others for now
+    assign s3_dat_i = 32'hSPI0_000;  assign s3_ack_i = s3_cyc_o & s3_stb_o; assign s3_err_i = 1'b0;
+    assign s4_dat_i = 32'hGPIO_000;  assign s4_ack_i = s4_cyc_o & s4_stb_o; assign s4_err_i = 1'b0;
+    assign s5_dat_i = 32'hJTAG_000;  assign s5_ack_i = s5_cyc_o & s5_stb_o; assign s5_err_i = 1'b0;
+
+endmodule
+
+(In your actual file, ensure all the AHB/WB signal declarations and other instantiations
+from Phase 1C/1D remain intact; only the s2 stub is replaced.)
+
+================================================================================
+STEP 4 — BOOT ROM I2C TEST (ROM-BASED, PRINTS STATUS OVER UART)
+================================================================================
+
+We’ll extend bootrom.c to:
+
+- Initialize UART (as in 1D).
+- Initialize I2C core:
+  - Set prescaler for ~100 kHz from 50 MHz.
+  - Enable core.
+- Attempt a simple transaction:
+  - Write to a target address (e.g. 0x68) with a dummy register index.
+  - Check for ACK/NACK.
+- Print result on UART.
+
+I2C Register Map (OpenCores standard):
+
+Base: 0x1000_0100
+
+Offset  Register
+0x00    PRERlo
+0x04    PRERhi
+0x08    CTR
+0x0C    TXR/RXR
+0x10    CR/SR
+
+Bits:
+- CTR:
+  - EN (bit 7) = 1 to enable core
+- CR:
+  - STA (bit 7) = START
+  - STO (bit 6) = STOP
+  - RD  (bit 5) = read
+  - WR  (bit 4) = write
+  - ACK (bit 3) = ACK bit for reads
+- SR:
+  - RxACK (bit 7) = 0 if ACK received, 1 if NACK
+  - TIP  (bit 1) = transfer in progress
+
+----- UPDATED FILE: ~/hazard3_fw/bootrom/bootrom.c ----------------------------
+
+#include <stdint.h>
+
+#define UART0_BASE   0x10000000u
+#define UART_RBR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_THR     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_IER     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_FCR     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_LCR     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_MCR     (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_LSR     (*(volatile uint32_t *)(UART0_BASE + 0x14))
+
+#define UART_LSR_DR   (1u << 0)
+#define UART_LSR_THRE (1u << 5)
+
+#define I2C0_BASE    0x10000100u
+#define I2C_PRER_LO  (*(volatile uint32_t *)(I2C0_BASE + 0x00))
+#define I2C_PRER_HI  (*(volatile uint32_t *)(I2C0_BASE + 0x04))
+#define I2C_CTR      (*(volatile uint32_t *)(I2C0_BASE + 0x08))
+#define I2C_TXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_RXR      (*(volatile uint32_t *)(I2C0_BASE + 0x0C))
+#define I2C_CR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+#define I2C_SR       (*(volatile uint32_t *)(I2C0_BASE + 0x10))
+
+#define I2C_CTR_EN   (1u << 7)
+#define I2C_CR_STA   (1u << 7)
+#define I2C_CR_STO   (1u << 6)
+#define I2C_CR_RD    (1u << 5)
+#define I2C_CR_WR    (1u << 4)
+#define I2C_CR_ACK   (1u << 3)
+
+#define I2C_SR_RXACK (1u << 7)
+#define I2C_SR_TIP   (1u << 1)
+
+static void uart_init(uint32_t sys_clk_hz, uint32_t baud)
+{
+    uint32_t divisor = sys_clk_hz / (16u * baud);
+
+    UART_LCR = 0x80u;
+    UART_THR = (divisor & 0xFFu);
+    UART_IER = ((divisor >> 8) & 0xFFu);
+    UART_LCR = 0x03u;
+    UART_FCR = 0x07u;
+    UART_MCR = 0x08u;
+}
+
+static void uart_putc(char c)
+{
+    while (!(UART_LSR & UART_LSR_THRE)) { }
+    UART_THR = (uint8_t)c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+static void i2c_init(uint32_t sys_clk_hz, uint32_t bus_khz)
+{
+    uint32_t freq = bus_khz * 1000u;
+    uint32_t presc = (sys_clk_hz / (5u * freq)) - 1u; // from OC I2C docs
+
+    I2C_PRER_LO = (presc & 0xFFu);
+    I2C_PRER_HI = ((presc >> 8) & 0xFFu);
+    I2C_CTR     = I2C_CTR_EN;
+}
+
+static int i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t data)
+{
+    // Send START + address (write)
+    I2C_TXR = (uint32_t)((addr7 << 1) | 0u);
+    I2C_CR  = I2C_CR_STA | I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -1;
+
+    // Send register index
+    I2C_TXR = reg;
+    I2C_CR  = I2C_CR_WR;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -2;
+
+    // Send data + STOP
+    I2C_TXR = data;
+    I2C_CR  = I2C_CR_WR | I2C_CR_STO;
+    while (I2C_SR & I2C_SR_TIP) { }
+    if (I2C_SR & I2C_SR_RXACK) return -3;
+
+    return 0;
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    uart_init(SYS_CLK_HZ, 115200u);
+    uart_puts("Hazard3 Phase 1E: I2C master test\n");
+
+    // Initialize I2C at 100 kHz
+    i2c_init(SYS_CLK_HZ, 100u);
+    uart_puts("I2C initialized at ~100 kHz\n");
+
+    // Example: try writing to an I2C device at address 0x68, register 0x00, value 0x55
+    // If no device is present, we will see NACK and print error.
+    int rc = i2c_write_byte(0x68, 0x00, 0x55);
+
+    if (rc == 0) {
+        uart_puts("I2C write to 0x68 succeeded (ACK)\n");
+    } else {
+        uart_puts("I2C write to 0x68 failed with code: ");
+        char c = '0' + (char)(-rc);
+        uart_putc(c);
+        uart_putc('\n');
+    }
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+Rebuild bootrom:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+Copy/update bootrom.hex in the Quartus project directory or ensure path in boot_rom.sv is correct.
+
+================================================================================
+STEP 5 — QUARTUS: ADD FILES, SET PINS, COMPILE, PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Add I2C core RTL and wrapper:
+   - Quartus → Add/Remove Files:
+     - ../rtl/cores/opencores_i2c/*.v
+     - ../rtl/soc/i2c_wb_wrapper.sv
+     - Updated ../rtl/soc/top_soc.sv
+
+2. Assign I2C pins:
+   - Map i2c_sda and i2c_scl to the Arduino A4/A5 pins on DE0-Lite according
+     to the board manual (they are usually dedicated I2C pins).
+   - Ensure external pull-up resistors or on-board pull-ups are present (SDA/SCL
+     are open-drain).
+
+3. Boot ROM:
+   - Ensure updated bootrom.hex is accessible for boot_rom.sv.
+
+4. Compile:
+   - Processing → Start Compilation.
+
+5. Program SRAM only:
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - File: h3_phase1_sc.sof.
+     - Mode: JTAG, “Program/Configure” checked.
+     - START.
+   - Do NOT create or program .pof. Do NOT program configuration flash.
+
+6. Run test:
+   - Connect UART0 to external USB-serial, open terminal at 115200 8N1.
+   - Power on DE0-Lite → factory demo.
+   - Program .sof over JTAG → Hazard3 SoC overlays in SRAM.
+   - Reset board.
+   - Observe UART output:
+     - “Hazard3 Phase 1E: I2C master test”
+     - “I2C initialized at ~100 kHz”
+     - Either “I2C write to 0x68 succeeded (ACK)” or an error code.
+   - Power-cycle:
+     - Hazard3 SoC disappears.
+     - Factory demo returns (ephemeral configuration rule satisfied).
+
+================================================================================
+WHAT PHASE 1E GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- Real OpenCores I2C master integrated as a proper WB slave on s2.
+- Clean memory-mapped I2C interface at 0x1000_0100 behind the same AHB→WB bridge
+  used by SDRAM and UART.
+- Verified system path:
+  Hazard3 core → AHB fabric → AHB→WB → WB interconnect → I2C master → SDA/SCL.
+- The bus + address map remain stable for future:
+  - Adding SPI (1F), GPIO (1G), JTAG-UART (1H).
+  - Building bootloader (1I) and HAL (1J).
+  - Scaling to multiple Hazard3 tiles sharing this same memory/peripheral fabric.
+#########END PHASE1F############
