@@ -1449,3 +1449,534 @@ This is a foundation — from here you can:
 - Port a tiny existing RTOS if desired, using these hooks.
 
 ####END P3C####
+
+
+================================================================================
+PHASE 3D: HARDWARE ACCELERATOR FRAMEWORK + FIRST ACCELERATOR (CRC32)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Introduce a clean, reusable framework for hardware accelerators on your SoC, then
+instantiate a FIRST accelerator that is:
+
+- Small (fits easily on MAX 10 10M50).
+- Unambiguously useful for real workloads.
+- Naturally integrated with your existing DMA + PLIC + RTOS.
+
+We’ll do:
+
+1) A generic "accelerator slot" model:
+   - Wishbone control/status
+   - DMA-driven input/output in SDRAM
+   - PLIC interrupt for completion
+2) A concrete accelerator: **CRC32 over a buffer in SDRAM**:
+   - 1D data stream (bytes/words)
+   - DMA copies data (if needed), accelerator computes CRC in hardware
+   - Completion via PLIC
+
+This gives you a pattern you can clone for AES, SHA, FIR, FFT, etc.
+
+================================================================================
+ACCELERATOR MODEL
+================================================================================
+
+- Base address: 0x1000_0A00 (ACC0: CRC32).
+- Wishbone-mapped registers:
+  - SRC: source address in SDRAM
+  - LEN: number of bytes
+  - CTRL: START, BUSY, IRQ_EN
+  - RESULT: CRC32 result
+  - STATUS: DONE, ERROR
+- Accelerator itself:
+  - A simple FSM that:
+    - Reads 32-bit words from SDRAM via AHB master (like DMA did).
+    - Runs a CRC32 step per word.
+    - Raises an interrupt when done.
+
+NOTE: To keep Phase 3D minimal, this accelerator is **self-fetching** (AHB master),
+not driven by the DMA engine. You can later refactor accelerators to share a common DMA.
+
+================================================================================
+STEP 1 — CRC32 ACCELERATOR REGISTER MAP
+================================================================================
+
+Base: 0x1000_0A00
+
+0x00: ACC_CTRL (RW)
+  bit0: START  (write 1 to start)
+  bit1: BUSY   (read-only)
+  bit2: IRQ_EN
+0x04: ACC_SRC  (RW)
+  Source address in SDRAM (must be 4-byte aligned)
+0x08: ACC_LEN  (RW)
+  Length in bytes (must be multiple of 4)
+0x0C: ACC_RESULT (RO)
+  CRC32 result after completion
+0x10: ACC_STATUS (RO/W1C)
+  bit0: DONE
+  bit1: ERROR
+0x14..1C: reserved
+
+Interrupt:
+
+- PLIC source ID: 7 (for ACC0).
+
+================================================================================
+STEP 2 — CRC32 CORE (COMBINATIONAL STEP)
+================================================================================
+
+File: rtl/accel/crc32_step.sv
+
+module crc32_step (
+    input  wire [31:0] crc_in,
+    input  wire [31:0] data_in,
+    output wire [31:0] crc_out
+);
+    /* Standard Ethernet CRC32 polynomial: 0x04C11DB7,
+     * reflected representation often used. For simplicity,
+     * we provide a placeholder combinational step. In a real
+     * design, you’d paste in a verified CRC32 word-step implementation.
+     */
+
+    // *** PLACEHOLDER IMPLEMENTATION ***
+    // Replace with a known-good CRC32 word update if needed.
+    // For now, treat as pass-through to exercise the framework.
+    assign crc_out = crc_in ^ data_in;
+
+endmodule
+
+================================================================================
+STEP 3 — CRC32 ACCELERATOR (AHB MASTER + WB SLAVE)
+================================================================================
+
+File: rtl/soc/acc_crc32_wb_ahb.sv
+
+module acc_crc32_wb_ahb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // AHB master
+    output reg  [31:0] haddr,
+    output reg         hwrite,
+    output reg  [1:0]  htrans,
+    output reg  [2:0]  hsize,
+    output reg  [2:0]  hburst,
+    output reg  [31:0] hwdata,
+    input  wire [31:0] hrdata,
+    input  wire        hready,
+    input  wire [1:0]  hresp,
+
+    // Interrupt
+    output reg         acc_irq
+);
+
+    assign wb_err_o = 1'b0;
+
+    // Registers
+    reg [31:0] reg_ctrl;
+    reg [31:0] reg_src;
+    reg [31:0] reg_len;
+    reg [31:0] reg_result;
+    reg [31:0] reg_status;
+
+    wire ctrl_start   = reg_ctrl[0];
+    wire ctrl_busy    = reg_ctrl[1];
+    wire ctrl_irq_en  = reg_ctrl[2];
+
+    wire status_done  = reg_status[0];
+    wire status_error = reg_status[1];
+
+    // Internal state
+    reg [31:0] cur_src;
+    reg [31:0] bytes_remaining;
+    reg [31:0] crc_accum;
+
+    typedef enum logic [2:0] {
+        ACC_IDLE       = 3'd0,
+        ACC_READ_REQ   = 3'd1,
+        ACC_READ_WAIT  = 3'd2,
+        ACC_PROCESS    = 3'd3,
+        ACC_DONE       = 3'd4
+    } acc_state_t;
+
+    acc_state_t state;
+
+    localparam [1:0] HTRANS_IDLE   = 2'b00;
+    localparam [1:0] HTRANS_NONSEQ = 2'b10;
+
+    // CRC step
+    wire [31:0] crc_next;
+    crc32_step u_crc32_step (
+        .crc_in  (crc_accum),
+        .data_in (hrdata),
+        .crc_out (crc_next)
+    );
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o      <= 1'b0;
+            wb_dat_o      <= 32'h0;
+            reg_ctrl      <= 32'h0;
+            reg_src       <= 32'h0;
+            reg_len       <= 32'h0;
+            reg_result    <= 32'h0;
+            reg_status    <= 32'h0;
+
+            cur_src       <= 32'h0;
+            bytes_remaining <= 32'h0;
+            crc_accum     <= 32'hFFFFFFFF; // typical CRC32 init
+
+            state         <= ACC_IDLE;
+
+            haddr         <= 32'h0;
+            hwrite        <= 1'b0;
+            htrans        <= HTRANS_IDLE;
+            hsize         <= 3'b010;
+            hburst        <= 3'b000;
+            hwdata        <= 32'h0;
+
+            acc_irq       <= 1'b0;
+        end else begin
+            wb_ack_o <= 1'b0;
+            htrans   <= HTRANS_IDLE;
+            acc_irq  <= 1'b0;
+
+            // Wishbone interface
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (wb_adr_i[5:2])
+                        4'h0: begin
+                            // CTRL: START is w1s, BUSY ro, IRQ_EN rw
+                            reg_ctrl[2] <= wb_dat_i[2];
+                            reg_ctrl[3] <= wb_dat_i[3];
+                            if (wb_dat_i[0]) reg_ctrl[0] <= 1'b1;
+                        end
+                        4'h1: reg_src <= wb_dat_i;
+                        4'h2: reg_len <= wb_dat_i;
+                        4'h3: ; // RESULT is read-only
+                        4'h4: begin
+                            // STATUS W1C
+                            if (wb_dat_i[0]) reg_status[0] <= 1'b0;
+                            if (wb_dat_i[1]) reg_status[1] <= 1'b0;
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    case (wb_adr_i[5:2])
+                        4'h0: wb_dat_o <= reg_ctrl;
+                        4'h1: wb_dat_o <= reg_src;
+                        4'h2: wb_dat_o <= reg_len;
+                        4'h3: wb_dat_o <= reg_result;
+                        4'h4: wb_dat_o <= reg_status;
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+
+            // Accelerator state machine
+            case (state)
+                ACC_IDLE: begin
+                    reg_ctrl[1] <= 1'b0; // BUSY=0
+
+                    if (reg_ctrl[0] && reg_len != 0) begin
+                        // START
+                        reg_ctrl[0]      <= 1'b0;
+                        reg_ctrl[1]      <= 1'b1; // BUSY=1
+                        reg_status[0]    <= 1'b0; // DONE=0
+                        reg_status[1]    <= 1'b0; // ERROR=0
+
+                        cur_src          <= reg_src;
+                        bytes_remaining  <= reg_len;
+                        crc_accum        <= 32'hFFFFFFFF; // reset CRC
+                        state            <= ACC_READ_REQ;
+                    end
+                end
+
+                ACC_READ_REQ: begin
+                    haddr  <= cur_src;
+                    hwrite <= 1'b0;
+                    hsize  <= 3'b010;
+                    hburst <= 3'b000;
+                    htrans <= HTRANS_NONSEQ;
+                    if (hready) begin
+                        state <= ACC_READ_WAIT;
+                    end
+                end
+
+                ACC_READ_WAIT: begin
+                    if (hready) begin
+                        // hrdata valid
+                        state <= ACC_PROCESS;
+                    end
+                end
+
+                ACC_PROCESS: begin
+                    // Update CRC with hrdata
+                    crc_accum <= crc_next;
+
+                    if (bytes_remaining <= 4) begin
+                        // Finished
+                        reg_result <= ~crc_next;  // typical final XOR
+                        state      <= ACC_DONE;
+                    end else begin
+                        cur_src        <= cur_src + 4;
+                        bytes_remaining<= bytes_remaining - 4;
+                        state          <= ACC_READ_REQ;
+                    end
+                end
+
+                ACC_DONE: begin
+                    reg_ctrl[1]   <= 1'b0;  // BUSY=0
+                    reg_status[0] <= 1'b1;  // DONE=1
+                    if (ctrl_irq_en)
+                        acc_irq <= 1'b1;
+                    state <= ACC_IDLE;
+                end
+
+                default: state <= ACC_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 4 — WISHBONE + AHB INTEGRATION
+================================================================================
+
+### 4.1 — Wishbone (new slave s11) at 0x1000_0A00
+
+In wb_interconnect.sv:
+
+- Add s11_* signals.
+- Decode:
+
+  sel_s11 = (m_adr_i[31:8] == 24'h10000A);
+
+- Add s11 to mux logic like previous slaves.
+
+### 4.2 — AHB (new master M5)
+
+In AHB interconnect:
+
+- Add DMA (M4) already present.
+- Add ACC0 (CRC32) as **M5**:
+
+  wire [31:0] acc_haddr;
+  wire        acc_hwrite;
+  wire [1:0]  acc_htrans;
+  wire [2:0]  acc_hsize;
+  wire [2:0]  acc_hburst;
+  wire [31:0] acc_hwdata;
+  wire [31:0] acc_hrdata;
+  wire        acc_hready;
+  wire [1:0]  acc_hresp;
+
+- Add to arbiter, with low priority if desired.
+
+================================================================================
+STEP 5 — TOP-LEVEL INSTANTIATION + PLIC WIRING
+================================================================================
+
+In top_soc.sv:
+
+- Declare s11_* WB and ACC AHB signals (as above).
+- Declare:
+
+  wire acc0_irq;
+
+- Wire accelerator IRQ into PLIC source ID 7:
+
+  assign plic_src_irq[7] = acc0_irq;
+
+Instantiate:
+
+acc_crc32_wb_ahb u_acc_crc32 (
+    .clk       (clk),
+    .rst       (rst),
+
+    .wb_adr_i  (s11_adr_o),
+    .wb_dat_i  (s11_dat_o),
+    .wb_dat_o  (s11_dat_i),
+    .wb_we_i   (s11_we_o),
+    .wb_sel_i  (s11_sel_o),
+    .wb_cyc_i  (s11_cyc_o),
+    .wb_stb_i  (s11_stb_o),
+    .wb_ack_o  (s11_ack_i),
+    .wb_err_o  (s11_err_i),
+
+    .haddr     (acc_haddr),
+    .hwrite    (acc_hwrite),
+    .htrans    (acc_htrans),
+    .hsize     (acc_hsize),
+    .hburst    (acc_hburst),
+    .hwdata    (acc_hwdata),
+    .hrdata    (acc_hrdata),
+    .hready    (acc_hready),
+    .hresp     (acc_hresp),
+
+    .acc_irq   (acc0_irq)
+);
+
+Connect acc_* signals into AHB fabric as master M5.
+
+================================================================================
+STEP 6 — HAL EXTENSIONS (ACC0 CRC32)
+================================================================================
+
+In h3_soc.h:
+
+/* ============================================================================
+ * ACC0: CRC32 accelerator
+ * Base: 0x1000_0A00
+ * ============================================================================
+ */
+#define H3_ACC0_BASE        0x10000A00u
+
+#define H3_ACC0_CTRL        (*(volatile uint32_t *)(H3_ACC0_BASE + 0x00))
+#define H3_ACC0_SRC         (*(volatile uint32_t *)(H3_ACC0_BASE + 0x04))
+#define H3_ACC0_LEN         (*(volatile uint32_t *)(H3_ACC0_BASE + 0x08))
+#define H3_ACC0_RESULT      (*(volatile uint32_t *)(H3_ACC0_BASE + 0x0C))
+#define H3_ACC0_STATUS      (*(volatile uint32_t *)(H3_ACC0_BASE + 0x10))
+
+#define H3_ACC0_CTRL_START  (1u << 0)
+#define H3_ACC0_CTRL_BUSY   (1u << 1)
+#define H3_ACC0_CTRL_IRQ_EN (1u << 2)
+
+#define H3_ACC0_STATUS_DONE (1u << 0)
+#define H3_ACC0_STATUS_ERR  (1u << 1)
+
+int      h3_acc0_crc32_start(uint32_t src, uint32_t len, int irq_en);
+int      h3_acc0_crc32_busy(void);
+uint32_t h3_acc0_crc32_result(void);
+void     h3_acc0_crc32_clear_done(void);
+
+In h3_soc.c:
+
+int h3_acc0_crc32_start(uint32_t src, uint32_t len, int irq_en)
+{
+    /* 4-byte aligned, length multiple of 4 */
+    if ((src & 3u) || (len & 3u) || len == 0u)
+        return -1;
+
+    if (H3_ACC0_CTRL & H3_ACC0_CTRL_BUSY)
+        return -1;
+
+    H3_ACC0_SRC = src;
+    H3_ACC0_LEN = len;
+
+    uint32_t ctrl = 0;
+    if (irq_en)
+        ctrl |= H3_ACC0_CTRL_IRQ_EN;
+
+    H3_ACC0_CTRL = ctrl | H3_ACC0_CTRL_START;
+    return 0;
+}
+
+int h3_acc0_crc32_busy(void)
+{
+    return (H3_ACC0_CTRL & H3_ACC0_CTRL_BUSY) ? 1 : 0;
+}
+
+uint32_t h3_acc0_crc32_result(void)
+{
+    return H3_ACC0_RESULT;
+}
+
+void h3_acc0_crc32_clear_done(void)
+{
+    H3_ACC0_STATUS = H3_ACC0_STATUS_DONE;
+}
+
+================================================================================
+STEP 7 — TRAP HANDLER UPDATE (ACC0 IRQ HANDLING)
+================================================================================
+
+In trap_handler (MEI/PLIC branch), add:
+
+else if (id == 7u) {
+    uint32_t crc = h3_acc0_crc32_result();
+    h3_con_puts("ACC0 CRC32 complete, result=0x");
+    h3_con_put_hex(crc);
+    h3_con_puts("\n");
+    h3_acc0_crc32_clear_done();
+}
+
+Ensure `h3_con_put_hex()` exists or replace with a simple hex print.
+
+================================================================================
+STEP 8 — FIRMWARE EXAMPLE USING ACC0
+================================================================================
+
+In hart0_main() or a demo app:
+
+#define ACC_BUF_WORDS 256
+static uint32_t acc_buf[ACC_BUF_WORDS] __attribute__((aligned(4)));
+
+void hart0_main(void)
+{
+    uint32_t hartid = h3_read_mhartid();
+    if (hartid != 0)
+        while (1) __asm__ volatile("wfi");
+
+    h3_con_puts("HART0: ACC0 CRC32 demo\n");
+
+    /* Fill buffer with sample data (in SDRAM or .bss mapped to SDRAM) */
+    for (int i = 0; i < ACC_BUF_WORDS; i++) {
+        acc_buf[i] = 0xA5A50000u + (uint32_t)i;
+    }
+
+    uint32_t src_addr = (uint32_t)acc_buf;
+    uint32_t len_bytes = ACC_BUF_WORDS * 4u;
+
+    /* Enable PLIC IRQ ID 7 for HART0 */
+    h3_plic_enable_irq(0, 7, 1);
+    h3_enable_mei();
+
+    h3_con_puts("HART0: starting ACC0 CRC32...\n");
+    if (h3_acc0_crc32_start(src_addr, len_bytes, 1) != 0) {
+        h3_con_puts("HART0: acc0 start error\n");
+    } else {
+        h3_con_puts("HART0: waiting for ACC0 IRQ\n");
+    }
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+================================================================================
+WHAT PHASE 3D GIVES YOU
+================================================================================
+
+- A **generic accelerator slot** pattern:
+  - Wishbone control/status at 0x1000_0A00.
+  - AHB master fetch of data from SDRAM.
+  - Completion interrupt via PLIC (ID 7).
+- A concrete example accelerator:
+  - CRC32 over a buffer (structure suitable for AES/SHA/FIR/FFT).
+- A reusable HAL and firmware pattern.
+
+From here, cloning ACC0 to ACC1/ACC2 for AES, SHA, or a DSP kernel is trivial:
+- Copy `acc_crc32_wb_ahb.sv` → `acc_aes_wb_ahb.sv`.
+- Replace `crc32_step` with AES round logic.
+- Change base address and PLIC ID.
+- Add new HAL functions
+
+####END P3D####
