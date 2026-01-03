@@ -912,3 +912,540 @@ You now have:
 This sets the stage for Phase 3C (RTOS/SMP scheduler).
 
 ####END P3B####
+================================================================================
+PHASE 3C: MINIMAL SMP-AWARE RUNTIME + SCHEDULER SKELETON
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Build a small, explicit "RTOS-ish" layer on top of your current SoC:
+
+- 4 harts (0..3), each running tasks.
+- Cooperative tasks (explicit yield) + optional preemptive tick using MTIME/MTIMECMP.
+- One simple scheduler:
+  - Fixed number of tasks at compile time.
+  - Per-hart run queue index.
+  - Each task has its own stack + state.
+- Clean separation from bare-metal HAL (reuse existing CLINT + PLIC + trap handler model).
+
+MAX 10 10M50 impact: none. This is all firmware and uses your existing CLINT (MSIP/MTIME).
+
+================================================================================
+MODEL OVERVIEW
+================================================================================
+
+We define:
+
+- TASK_MAX: e.g., 8 tasks total.
+- HART_MAX: 4 harts.
+- Each task:
+  - stack pointer
+  - entry function
+  - state: UNUSED, READY, RUNNING
+  - assigned hart
+- Each hart:
+  - current task ID
+  - simple round-robin among READY tasks assigned to it.
+
+We implement:
+
+- Cooperative yield via ECALL.
+- Optional preemptive tick:
+  - MTIMER interrupt on each hart periodically.
+  - Timer ISR calls scheduler to pick next READY task.
+
+================================================================================
+STEP 1 — CORE TYPES AND CONSTANTS
+================================================================================
+
+File: hazard3_fw/app/h3_rtos.h
+
+#ifndef H3_RTOS_H
+#define H3_RTOS_H
+
+#include <stdint.h>
+
+#define H3_HART_MAX      4
+#define H3_TASK_MAX      8
+
+typedef enum {
+    H3_TASK_UNUSED = 0,
+    H3_TASK_READY  = 1,
+    H3_TASK_RUNNING= 2,
+} h3_task_state_t;
+
+typedef struct {
+    uint32_t       *stack_top;    /* current SP */
+    void           (*entry)(void);
+    h3_task_state_t state;
+    uint32_t        hartid;       /* assigned hart */
+} h3_task_t;
+
+void h3_rtos_init(void);
+int  h3_task_create(void (*entry)(void), uint32_t *stack_top, uint32_t hartid);
+void h3_task_start(void);         /* called once per hart after init */
+void h3_task_yield(void);         /* cooperative yield (ECALL) */
+
+/* Optional preemption control */
+void h3_rtos_enable_tick(uint32_t ticks_per_sec);
+void h3_rtos_disable_tick(void);
+
+#endif
+
+================================================================================
+STEP 2 — RTOS IMPLEMENTATION SKELETON
+================================================================================
+
+File: hazard3_fw/app/h3_rtos.c
+
+#include "h3_rtos.h"
+#include "h3_soc.h"   /* for CLINT + CSR helpers */
+#include <stddef.h>
+
+static h3_task_t g_tasks[H3_TASK_MAX];
+static uint32_t  g_current_task[H3_HART_MAX]; /* per-hart current task index */
+
+static uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+static void h3_write_mepc(uint32_t v)
+{
+    __asm__ volatile ("csrw mepc, %0" :: "r"(v));
+}
+
+static uint32_t h3_read_mepc(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mepc" : "=r"(v));
+    return v;
+}
+
+static void h3_enable_mti(void)
+{
+    uint32_t mstatus, mie;
+    __asm__ volatile ("csrr %0, mstatus" : "=r"(mstatus));
+    __asm__ volatile ("csrr %0, mie"     : "=r"(mie));
+
+    mstatus |= (1u << 3);   /* MIE */
+    mie     |= (1u << 7);   /* MTIE */
+
+    __asm__ volatile ("csrw mstatus, %0" :: "r"(mstatus));
+    __asm__ volatile ("csrw mie, %0"     :: "r"(mie));
+}
+
+static void h3_disable_mti(void)
+{
+    uint32_t mie;
+    __asm__ volatile ("csrr %0, mie"     : "=r"(mie));
+    mie &= ~(1u << 7);  /* clear MTIE */
+    __asm__ volatile ("csrw mie, %0"     :: "r"(mie));
+}
+
+void h3_rtos_init(void)
+{
+    for (int i = 0; i < H3_TASK_MAX; i++) {
+        g_tasks[i].stack_top = NULL;
+        g_tasks[i].entry     = NULL;
+        g_tasks[i].state     = H3_TASK_UNUSED;
+        g_tasks[i].hartid    = 0;
+    }
+
+    for (int h = 0; h < H3_HART_MAX; h++) {
+        g_current_task[h] = 0xFFFFFFFFu; /* no task yet */
+    }
+}
+
+/* Allocate a task slot and initialize its stack/entry/hart binding */
+int h3_task_create(void (*entry)(void), uint32_t *stack_top, uint32_t hartid)
+{
+    if (entry == NULL || stack_top == NULL) return -1;
+    if (hartid >= H3_HART_MAX) return -1;
+
+    for (int i = 0; i < H3_TASK_MAX; i++) {
+        if (g_tasks[i].state == H3_TASK_UNUSED) {
+            g_tasks[i].stack_top = stack_top;
+            g_tasks[i].entry     = entry;
+            g_tasks[i].state     = H3_TASK_READY;
+            g_tasks[i].hartid    = hartid;
+            return i;
+        }
+    }
+    return -1; /* no free slot */
+}
+
+/* Simple round-robin: find next READY task for this hart */
+static int h3_next_task_for_hart(uint32_t hartid, int current)
+{
+    int start = (current < 0) ? 0 : (current + 1);
+    for (int i = 0; i < H3_TASK_MAX; i++) {
+        int idx = (start + i) % H3_TASK_MAX;
+        if (g_tasks[idx].state == H3_TASK_READY && g_tasks[idx].hartid == hartid) {
+            return idx;
+        }
+    }
+    return -1;
+}
+
+/* Assembly context switch:
+ * Save current registers to old_sp, restore from new_sp.
+ * This is a minimal skeleton: you will extend to save all callee-saved regs.
+ */
+extern void h3_context_switch(uint32_t **old_sp, uint32_t *new_sp);
+
+/* Called from each hart's main to start scheduling.
+ * It never returns: it jumps into the first task for this hart.
+ */
+void h3_task_start(void)
+{
+    uint32_t hartid = h3_read_mhartid();
+
+    int next = h3_next_task_for_hart(hartid, -1);
+    if (next < 0) {
+        /* No tasks: spin */
+        while (1) {
+            __asm__ volatile("wfi");
+        }
+    }
+
+    g_current_task[hartid] = (uint32_t)next;
+    g_tasks[next].state = H3_TASK_RUNNING;
+
+    uint32_t *task_sp = g_tasks[next].stack_top;
+
+    /* Set MEPC to task entry and perform context switch into that stack.
+     * h3_context_switch will set SP and return into the task.
+     */
+    h3_write_mepc((uint32_t)(g_tasks[next].entry));
+
+    uint32_t *dummy_sp = NULL;
+    h3_context_switch(&dummy_sp, task_sp);
+
+    while (1) { /* should never get here */ }
+}
+
+/* Cooperative yield: called by task code.
+ * We trigger an ECALL so that the trap handler can call the scheduler.
+ */
+void h3_task_yield(void)
+{
+    __asm__ volatile("ecall");
+}
+
+/* Timer tick control:
+ * ticks_per_sec: how many RTOS ticks per second (e.g., 1000 for 1ms).
+ * We assume you know your CLINT MTIME frequency (h3_clint_timer_freq()).
+ */
+void h3_rtos_enable_tick(uint32_t ticks_per_sec)
+{
+    uint64_t freq = h3_clint_timer_freq(); /* you provide this helper in h3_soc */
+    uint64_t delta = freq / ticks_per_sec;
+
+    uint32_t hartid = h3_read_mhartid();
+    uint64_t now = h3_clint_mtime_read();
+    h3_clint_mtimecmp_write(hartid, now + delta);
+
+    h3_enable_mti();
+}
+
+void h3_rtos_disable_tick(void)
+{
+    h3_disable_mti();
+}
+
+================================================================================
+STEP 3 — CONTEXT SWITCH STUB (ASSEMBLY)
+================================================================================
+
+File: hazard3_fw/app/h3_context_switch.S
+
+/* Very minimal context switch stub:
+ * void h3_context_switch(uint32_t **old_sp, uint32_t *new_sp);
+ *
+ * - Saves current SP into *old_sp.
+ * - Loads new_sp into SP.
+ * - Returns to caller (which expects MEPC already set).
+ *
+ * For real RTOS, extend to save/restore s0..s11, ra, etc.
+ */
+
+    .section .text
+    .globl h3_context_switch
+h3_context_switch:
+    /* a0 = &old_sp, a1 = new_sp */
+
+    /* store current SP into *old_sp */
+    addi    sp, sp, 0
+    sw      sp, 0(a0)
+
+    /* load new SP */
+    mv      sp, a1
+
+    ret
+
+================================================================================
+STEP 4 — TRAP HANDLER UPDATE (ECALL + MTIMER)
+================================================================================
+
+Modify your existing trap handler (from previous phases) to:
+
+- Handle ECALL from M-mode (cooperative yield).
+- Handle MTIMER (MTI) interrupt for preemptive tick.
+
+File: hazard3_fw/app/trap.c (or equivalent)
+
+static inline uint32_t h3_read_mcause(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mcause" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+void h3_rtos_schedule_from_isr(void);  /* forward decl */
+
+void trap_handler(void)
+{
+    uint32_t mcause = h3_read_mcause();
+    uint32_t hartid = h3_read_mhartid();
+
+    uint32_t is_interrupt = mcause >> 31;
+    uint32_t cause        = mcause & 0x7FFFFFFFu;
+
+    if (is_interrupt) {
+        if (cause == 7u) {
+            /* Machine timer interrupt (MTI) */
+            h3_rtos_schedule_from_isr();
+        } else if (cause == 11u) {
+            /* Machine external interrupt (MEI, PLIC) */
+            uint32_t id = h3_plic_claim(hartid);
+            if (id == 1u) {
+                /* UART0 or others, as before */
+                char c;
+                if (h3_uart_getc_nonblock(&c)) {
+                    h3_con_putc(c);
+                }
+            } else if (id == 6u) {
+                h3_con_puts("HART0: DMA complete IRQ\n");
+                h3_dma_clear_done();
+            }
+            if (id != 0u)
+                h3_plic_complete(hartid, id);
+        } else {
+            /* other interrupt types: optional */
+        }
+    } else {
+        /* Exception */
+        if (cause == 11u) {
+            /* ECALL from M-mode: cooperative yield */
+            h3_rtos_schedule_from_isr();
+        } else {
+            /* other exceptions: optional debug */
+        }
+    }
+}
+
+================================================================================
+STEP 5 — SCHEDULER ENTRY FROM ISR
+================================================================================
+
+We need a function called from trap handler to pick the next task for this hart
+and do a context switch.
+
+Add to h3_rtos.c:
+
+extern void h3_context_switch(uint32_t **old_sp, uint32_t *new_sp);
+
+void h3_rtos_schedule_from_isr(void)
+{
+    uint32_t hartid = h3_read_mhartid();
+
+    int cur = (g_current_task[hartid] == 0xFFFFFFFFu)
+            ? -1
+            : (int)g_current_task[hartid];
+
+    int next = h3_next_task_for_hart(hartid, cur);
+    if (next < 0) {
+        /* No READY task; stay in current (if any) */
+        return;
+    }
+
+    if (cur == next) {
+        /* Same task continues */
+        return;
+    }
+
+    /* Mark task states */
+    if (cur >= 0 && g_tasks[cur].state == H3_TASK_RUNNING)
+        g_tasks[cur].state = H3_TASK_READY;
+
+    g_tasks[next].state = H3_TASK_RUNNING;
+    g_current_task[hartid] = (uint32_t)next;
+
+    /* Set MEPC to next task entry if it has never run before */
+    if (g_tasks[next].stack_top != NULL && g_tasks[next].entry != NULL) {
+        /* In this minimal model, we assume MEPC points to entry each time.
+         * A more advanced model would preserve PC in the task context.
+         */
+        h3_write_mepc((uint32_t)(g_tasks[next].entry));
+    }
+
+    uint32_t *old_sp = g_tasks[cur >= 0 ? cur : next].stack_top;
+    uint32_t *new_sp = g_tasks[next].stack_top;
+
+    /* Save current SP into old task, load new SP from next task */
+    h3_context_switch(&g_tasks[cur >= 0 ? cur : next].stack_top, new_sp);
+}
+
+================================================================================
+STEP 6 — CLINT TIMER HELPERS (IN HAL)
+================================================================================
+
+In h3_soc.h, declare (if not already):
+
+uint64_t h3_clint_mtime_read(void);
+void     h3_clint_mtimecmp_write(uint32_t hartid, uint64_t value);
+uint64_t h3_clint_timer_freq(void);
+
+In h3_soc.c, implement according to your CLINT base and timer clock.
+For example:
+
+#define H3_CLINT_BASE      0x02000000u
+#define H3_CLINT_MTIME     (*(volatile uint64_t *)(H3_CLINT_BASE + 0xBFF8))
+#define H3_CLINT_MTIMECMP(h) (*(volatile uint64_t *)(H3_CLINT_BASE + 0x4000 + 8*(h)))
+
+uint64_t h3_clint_mtime_read(void)
+{
+    return H3_CLINT_MTIME;
+}
+
+void h3_clint_mtimecmp_write(uint32_t hartid, uint64_t value)
+{
+    H3_CLINT_MTIMECMP(hartid) = value;
+}
+
+uint64_t h3_clint_timer_freq(void)
+{
+    /* Return MTIME frequency in Hz, matching your CLINT implementation */
+    return 50000000ull; /* example: 50 MHz */
+}
+
+Modify h3_rtos_enable_tick() in h3_rtos.c to re-arm the timer each tick:
+
+void h3_rtos_enable_tick(uint32_t ticks_per_sec)
+{
+    uint64_t freq = h3_clint_timer_freq();
+    uint64_t delta = freq / ticks_per_sec;
+
+    uint32_t hartid = h3_read_mhartid();
+    uint64_t now = h3_clint_mtime_read();
+    h3_clint_mtimecmp_write(hartid, now + delta);
+
+    h3_enable_mti();
+}
+
+/* Called from MTI path in trap_handler to re-arm timer */
+void h3_rtos_rearm_tick(uint32_t ticks_per_sec)
+{
+    uint64_t freq = h3_clint_timer_freq();
+    uint64_t delta = freq / ticks_per_sec;
+
+    uint32_t hartid = h3_read_mhartid();
+    uint64_t now = h3_clint_mtime_read();
+    h3_clint_mtimecmp_write(hartid, now + delta);
+}
+
+And in trap_handler(), within MTI branch:
+
+else if (cause == 7u) {
+    h3_rtos_rearm_tick(1000); /* example: 1 kHz tick */
+    h3_rtos_schedule_from_isr();
+}
+
+================================================================================
+STEP 7 — EXAMPLE: TWO TASKS ON HART0 (COOPERATIVE + TICK)
+================================================================================
+
+In a demo app file:
+
+#include "h3_rtos.h"
+#include "h3_soc.h"
+
+#define STACK_SIZE_WORDS 256
+static uint32_t task0_stack[STACK_SIZE_WORDS];
+static uint32_t task1_stack[STACK_SIZE_WORDS];
+
+void task0_entry(void)
+{
+    while (1) {
+        h3_con_puts("TASK0 running on HART0\n");
+        for (volatile int i = 0; i < 100000; i++);
+        h3_task_yield();
+    }
+}
+
+void task1_entry(void)
+{
+    while (1) {
+        h3_con_puts("TASK1 running on HART0\n");
+        for (volatile int i = 0; i < 100000; i++);
+        h3_task_yield();
+    }
+}
+
+void hart0_main(void)
+{
+    h3_con_puts("HART0: RTOS init\n");
+
+    h3_rtos_init();
+
+    /* Create two tasks pinned to HART0 */
+    h3_task_create(task0_entry, &task0_stack[STACK_SIZE_WORDS-1], 0);
+    h3_task_create(task1_entry, &task1_stack[STACK_SIZE_WORDS-1], 0);
+
+    /* Enable tick preemption at 1kHz (optional) */
+    h3_rtos_enable_tick(1000);
+
+    /* Start scheduling on this hart */
+    h3_task_start();
+}
+
+void hart1_main(void)
+{
+    /* You can create HART1-specific tasks here, then call h3_task_start() */
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+================================================================================
+RESULT OF PHASE 3C
+================================================================================
+
+You now have:
+
+- A minimal SMP-aware runtime:
+  - Harts can run multiple tasks via cooperative yield and/or timer tick.
+- A simple, explicit scheduling path:
+  - ECALL -> trap_handler -> h3_rtos_schedule_from_isr() -> context switch.
+  - MTI -> trap_handler -> re-arm timer -> schedule next task.
+- All running entirely in firmware, using:
+  - CLINT MTIME/MTIMECMP
+  - Existing PLIC, DMA, UART, etc.
+
+This is a foundation — from here you can:
+- Add proper context save/restore (all registers).
+- Add priorities, time slicing, and per-task PC.
+- Port a tiny existing RTOS if desired, using these hooks.
+
+####END P3C####
