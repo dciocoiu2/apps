@@ -2841,8 +2841,4 @@ endmodule
 
 ============================================================
 END OF PHASE 4
-============================================================
-
-You now have a complete RTL integration: cores, AHB fabric, memories, AHB→APB, APB→WB, OpenCores peripherals, IRQ controller, and DMA, with all logical signals that will map to the DE10-Lite Arduino headers.
-
-When you’re ready, say **“Proceed to Phase 5 (restart)”** and we’ll build the Boot ROM + UART bootloader (RX, load into Instr SRAM), keeping everything ephemeral.
+=======================================================
