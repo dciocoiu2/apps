@@ -1,0 +1,400 @@
+================================================================================
+PHASE 2A: ADD HART1–HART3 (MULTI-CORE HAZARD3 TILES ON AHB M1–M3)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 2A
+----------------
+Turn your single-core Hazard3 SoC into a **4-hart SoC** by:
+
+- Instantiating **HART1, HART2, HART3** as additional Hazard3 tiles.
+- Connecting them as AHB masters M1, M2, M3 in the existing AHB fabric.
+- Defining a simple **boot discipline**:
+  - HART0 (M0) is the primary boot hart.
+  - HART1–3 enter a “parked” wait loop until firmware explicitly releases them.
+- Keeping all existing peripherals, bootloader, HAL, and SDRAM unchanged.
+
+Still:
+
+- FPGA is configured via `.sof` into **SRAM only**.
+- No flash programming; power-cycle → factory demo.
+- All changes are in RTL and firmware only.
+
+HIGH-LEVEL DESIGN
+-----------------
+- Each hart:
+  - Has its own Hazard3 tile instance with unique HART_ID (0,1,2,3).
+  - Shares the same Boot ROM and SDRAM/peripheral address map.
+- Boot behavior:
+  - Hardware: all harts reset together.
+  - Software: HART0 follows full bootloader flow, HART1–3 park in a loop.
+  - Later phases (2B/2C) will add CLINT-like start/wakeup, but 2A just gets
+    all four cores instantiated and behaving safely.
+
+================================================================================
+STEP 1 — MULTI-HART ENTRY CONVENTION IN BOOT ROM
+================================================================================
+
+We’ll define how each hart behaves at reset. Hazard3 provides a hart ID (via CSR
+or parameter). For now, we assume:
+
+- Bootloader code can read mhartid via CSR and branch.
+- HART0 runs the full bootloader logic.
+- HART1–3 just park in WFI until future phases use them.
+
+You can adapt your bootrom.c (Phase 1I) with a tiny shim:
+
+----- PATCH CONCEPT FOR ~/hazard3_fw/bootrom/bootrom.c ------------------------
+
+/* Add CSR read helper (inline asm) */
+static inline uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+    uint32_t hartid = h3_read_mhartid();
+
+    /* Only HART0 runs the bootloader for now. */
+    if (hartid != 0) {
+        while (1) {
+            __asm__ volatile ("wfi");
+        }
+    }
+
+    uart_init(SYS_CLK_HZ, 115200u);
+    select_console();
+    con_puts("\nHazard3 Phase 1I Bootloader (H3BT) - HART0\n");
+    ...
+    bootloader_loop();
+}
+
+Rebuild `bootrom.hex` after this change, same as Phase 1I.
+
+Note:
+- HART1–3 are electrically alive but permanently parked in WFI until we add
+  an inter-hart wake mechanism in Phase 2B/2C.
+- This avoids spurious bus traffic from secondary harts.
+
+================================================================================
+STEP 2 — TOP-LEVEL RTL: ADD HART1–HART3 AND CONNECT TO AHB FABRIC
+================================================================================
+
+We now modify `top_soc.sv` to:
+
+- Instantiate 3 more Hazard3 tiles.
+- Connect them as AHB masters M1, M2, M3 on `ahb_interconnect_4m`.
+- Provide them with the same clock/reset as HART0.
+- Keep all downstream fabric/peripherals unchanged.
+
+Assuming your `hazard3_tile` module has the same AHB-Lite master interface as in
+Phase 1A and a parameter `HART_ID`, we do:
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv --------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq,
+
+    // UART0 pins
+    input  wire        uart0_rx,
+    output wire        uart0_tx,
+
+    // I2C0 pins
+    inout  wire        i2c_sda,
+    inout  wire        i2c_scl,
+
+    // SPI0 pins
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire        spi_sck,
+    output wire        spi_ss0,
+
+    // GPIO pins
+    inout  wire [19:0] gpio_pins
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    //==========================================================================
+    // AHB master interfaces for 4 harts (M0..M3)
+    //==========================================================================
+
+    // HART0 (M0)
+    wire [31:0] m0_haddr;
+    wire [2:0]  m0_hsize;
+    wire [1:0]  m0_hburst;
+    wire [1:0]  m0_htrans;
+    wire        m0_hwrite;
+    wire [31:0] m0_hwdata;
+    wire [31:0] m0_hrdata;
+    wire        m0_hready;
+    wire        m0_hresp;
+
+    // HART1 (M1)
+    wire [31:0] m1_haddr;
+    wire [2:0]  m1_hsize;
+    wire [1:0]  m1_hburst;
+    wire [1:0]  m1_htrans;
+    wire        m1_hwrite;
+    wire [31:0] m1_hwdata;
+    wire [31:0] m1_hrdata;
+    wire        m1_hready;
+    wire        m1_hresp;
+
+    // HART2 (M2)
+    wire [31:0] m2_haddr;
+    wire [2:0]  m2_hsize;
+    wire [1:0]  m2_hburst;
+    wire [1:0]  m2_htrans;
+    wire        m2_hwrite;
+    wire [31:0] m2_hwdata;
+    wire [31:0] m2_hrdata;
+    wire        m2_hready;
+    wire        m2_hresp;
+
+    // HART3 (M3)
+    wire [31:0] m3_haddr;
+    wire [2:0]  m3_hsize;
+    wire [1:0]  m3_hburst;
+    wire [1:0]  m3_htrans;
+    wire        m3_hwrite;
+    wire [31:0] m3_hwdata;
+    wire [31:0] m3_hrdata;
+    wire        m3_hready;
+    wire        m3_hresp;
+
+    //==========================================================================
+    // AHB slaves: s0 = Boot ROM, s1 = AHB→WB bridge (SDRAM + peripherals)
+    //==========================================================================
+
+    wire [31:0] s0_haddr, s1_haddr;
+    wire [2:0]  s0_hsize, s1_hsize;
+    wire [1:0]  s0_hburst, s1_hburst;
+    wire [1:0]  s0_htrans, s1_htrans;
+    wire        s0_hwrite, s1_hwrite;
+    wire [31:0] s0_hwdata, s1_hwdata;
+    wire [31:0] s0_hrdata, s1_hrdata;
+    wire        s0_hready, s1_hready;
+    wire        s0_hresp,  s1_hresp;
+
+    //==========================================================================
+    // HAZARD3 TILE INSTANCES (4 HARTS)
+    //==========================================================================
+
+    // HART0
+    hazard3_tile #(
+        .HART_ID(0)
+    ) u_hart0 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m0_haddr),
+        .HSIZE  (m0_hsize),
+        .HBURST (m0_hburst),
+        .HTRANS (m0_htrans),
+        .HWRITE (m0_hwrite),
+        .HWDATA (m0_hwdata),
+        .HRDATA (m0_hrdata),
+        .HREADY (m0_hready),
+        .HRESP  (m0_hresp)
+    );
+
+    // HART1
+    hazard3_tile #(
+        .HART_ID(1)
+    ) u_hart1 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m1_haddr),
+        .HSIZE  (m1_hsize),
+        .HBURST (m1_hburst),
+        .HTRANS (m1_htrans),
+        .HWRITE (m1_hwrite),
+        .HWDATA (m1_hwdata),
+        .HRDATA (m1_hrdata),
+        .HREADY (m1_hready),
+        .HRESP  (m1_hresp)
+    );
+
+    // HART2
+    hazard3_tile #(
+        .HART_ID(2)
+    ) u_hart2 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m2_haddr),
+        .HSIZE  (m2_hsize),
+        .HBURST (m2_hburst),
+        .HTRANS (m2_htrans),
+        .HWRITE (m2_hwrite),
+        .HWDATA (m2_hwdata),
+        .HRDATA (m2_hrdata),
+        .HREADY (m2_hready),
+        .HRESP  (m2_hresp)
+    );
+
+    // HART3
+    hazard3_tile #(
+        .HART_ID(3)
+    ) u_hart3 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m3_haddr),
+        .HSIZE  (m3_hsize),
+        .HBURST (m3_hburst),
+        .HTRANS (m3_htrans),
+        .HWRITE (m3_hwrite),
+        .HWDATA (m3_hwdata),
+        .HRDATA (m3_hrdata),
+        .HREADY (m3_hready),
+        .HRESP  (m3_hresp)
+    );
+
+    //==========================================================================
+    // AHB INTERCONNECT (4 MASTERS → 2 SLAVES)
+    //==========================================================================
+
+    ahb_interconnect_4m u_ahb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        // Masters
+        .m0_haddr   (m0_haddr), .m0_hsize(m0_hsize), .m0_hburst(m0_hburst),
+        .m0_htrans  (m0_htrans), .m0_hwrite(m0_hwrite), .m0_hwdata(m0_hwdata),
+        .m0_hrdata  (m0_hrdata), .m0_hready(m0_hready), .m0_hresp(m0_hresp),
+
+        .m1_haddr   (m1_haddr), .m1_hsize(m1_hsize), .m1_hburst(m1_hburst),
+        .m1_htrans  (m1_htrans), .m1_hwrite(m1_hwrite), .m1_hwdata(m1_hwdata),
+        .m1_hrdata  (m1_hrdata), .m1_hready(m1_hready), .m1_hresp(m1_hresp),
+
+        .m2_haddr   (m2_haddr), .m2_hsize(m2_hsize), .m2_hburst(m2_hburst),
+        .m2_htrans  (m2_htrans), .m2_hwrite(m2_hwrite), .m2_hwdata(m2_hwdata),
+        .m2_hrdata  (m2_hrdata), .m2_hready(m2_hready), .m2_hresp(m2_hresp),
+
+        .m3_haddr   (m3_haddr), .m3_hsize(m3_hsize), .m3_hburst(m3_hburst),
+        .m3_htrans  (m3_htrans), .m3_hwrite(m3_hwrite), .m3_hwdata(m3_hwdata),
+        .m3_hrdata  (m3_hrdata), .m3_hready(m3_hready), .m3_hresp(m3_hresp),
+
+        // Slaves
+        .s0_haddr   (s0_haddr), .s0_hsize(s0_hsize), .s0_hburst(s0_hburst),
+        .s0_htrans  (s0_htrans), .s0_hwrite(s0_hwrite), .s0_hwdata(s0_hwdata),
+        .s0_hrdata  (s0_hrdata), .s0_hready(s0_hready), .s0_hresp(s0_hresp),
+
+        .s1_haddr   (s1_haddr), .s1_hsize(s1_hsize), .s1_hburst(s1_hburst),
+        .s1_htrans  (s1_htrans), .s1_hwrite(s1_hwrite), .s1_hwdata(s1_hwdata),
+        .s1_hrdata  (s1_hrdata), .s1_hready(s1_hready), .s1_hresp(s1_hresp)
+    );
+
+    //==========================================================================
+    // Boot ROM, AHB→WB bridge, WB interconnect, SDRAM, UART0, I2C, SPI, GPIO,
+    // JTAG-UART are exactly as in Phase 1H/1K.
+    //==========================================================================
+    //
+    //  boot_rom u_boot_rom (attached to s0_*)
+    //  ahb_to_wb_bridge u_ahb2wb (attached to s1_*)
+    //  wb_interconnect u_wb_ic
+    //  sdram_wb_wrapper u_sdram_wb (s0 of WB)
+    //  uart16550_wb_wrapper u_uart0 (s1)
+    //  i2c_wb_wrapper u_i2c0 (s2)
+    //  spi_wb_wrapper u_spi0 (s3)
+    //  gpio_wb u_gpio (s4)
+    //  jtag_uart_0 + jtag_uart_wb_wrapper u_jtag (s5)
+    //
+    // Keep all that code identical to the end of Phase 1H/1K.
+
+endmodule
+
+Notes:
+
+- The only structural change is: M1, M2, M3 are now driven by real harts
+  instead of being tied off.
+- The rest of the SoC (ROM, SDRAM, peripherals, bootloader, HAL) remains intact.
+
+================================================================================
+STEP 3 — QUARTUS: RECOMPILE AND PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Ensure RTL tree updated:
+   - Only `top_soc.sv` changed.
+   - All other files from Phase 1K remain.
+
+2. Rebuild:
+   - Open Quartus project `h3_phase1_sc`.
+   - Processing → Start Compilation.
+
+3. Program (SRAM only):
+   - Quartus Programmer:
+     - Hardware: USB-Blaster.
+     - Mode: JTAG.
+     - File: `h3_phase1_sc.sof`.
+     - Check ONLY “Program/Configure”.
+     - START.
+   - No `.pof`, no flash writes.
+   - Power-cycle → factory demo (unchanged).
+
+================================================================================
+STEP 4 — RUNTIME BEHAVIOR AFTER PHASE 2A
+================================================================================
+
+At reset:
+
+- All 4 harts start at `_start` in Boot ROM.
+- Each hart reads `mhartid`.
+- HART0:
+  - Runs the H3BT bootloader (Phase 1I).
+  - Loads SDRAM firmware via UART0 / JTAG-UART.
+  - Jumps to 0x80000000.
+- HART1–3:
+  - Immediately park in a WFI loop inside bootrom.
+
+When firmware at 0x80000000 runs (Phase 1K):
+
+- It currently assumes single-hart; only HART0 will execute it.
+- HART1–3 remain parked in ROM WFI.
+- In later phases (2B/2C), the firmware will:
+  - Write to a CLINT-like block or shared memory to wake HART1–3.
+  - Provide distinct roles to each hart.
+
+For now, Phase 2A is about **clean multi-hart instantiation with safe behavior**.
+
+================================================================================
+WHAT PHASE 2A GIVES YOU
+================================================================================
+
+- A **quad-core Hazard3 SoC** at the hardware level:
+  - 4 independent harts sharing:
+    - ROM
+    - SDRAM
+    - UART/I2C/SPI/GPIO/JTAG-UART
+- A consistent boot story:
+  - HART0 is the designated boot/control hart.
+  - HART1–3 are passive until explicitly activated later.
+- No change to your ephemeral rule:
+  - `.sof` → SRAM.
+  - No flash touch.
+  - Power-cycle → factory demo.
+
+########END P2A########
