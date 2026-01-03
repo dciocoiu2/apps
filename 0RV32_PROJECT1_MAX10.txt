@@ -1564,4 +1564,583 @@ WHAT PHASE 1B ACHIEVES TOWARD QUAD-CORE GOAL
   - Add bootloader, HAL, and firmware on top (1I–1K).
   - Then scale to 2 and 4 cores by hooking up more hazard3_tile instances to M1..M3.
 
-################END PHASE1B##############
+################END PHASE1B#############
+================================================================================
+PHASE 1C: SDRAM INTEGRATION (OPENCORES CONTROLLER) INTO AHB→WB FABRIC
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
+
+GOAL OF PHASE 1C
+----------------
+Replace the SDRAM stub (Wishbone s0) from Phase 1B with a **real** OpenCores-style
+SDRAM controller, giving you:
+
+- External SDRAM @ 0x8000_0000 on DE0-Lite.
+- SDRAM accessed via:
+  Hazard3 → AHB interconnect → AHB→WB bridge → WB SDRAM controller.
+- Still: only `.sof` programmed via JTAG into **SRAM**, never flash.
+  On power-cycle, the DE0-Lite returns to its factory demo.
+
+ASSUMPTIONS
+-----------
+- You have the DE0-Lite’s SDRAM chip (IS42S16400 or equivalent 16-bit SDRAM) wired
+  to the FPGA using the Terasic reference design.
+- You can download an OpenCores SDRAM controller that:
+  - Speaks **Wishbone** on the system side.
+  - Drives standard SDRAM signals (addr, bank, dq, dqm, ras/cas/we, cke, clk).
+- We’ll:
+  - Add a WB wrapper/top for the SDRAM controller.
+  - Connect it to s0_* ports of wb_interconnect.
+  - Expose SDRAM pins from top_soc.
+  - Keep all other slaves (UART/I2C/SPI/GPIO/JTAG-UART) as stubs for now.
+
+DIRECTORY CONTEXT
+-----------------
+We add:
+
+- ~/fpga/h3_phase1_sc/rtl/cores/opencores_sdram/
+    - sdram_ctrl.v            (from OpenCores)
+    - (other files as needed by that core)
+- ~/fpga/h3_phase1_sc/rtl/soc/sdram_wb_wrapper.sv   (NEW)
+- Update: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv    (add SDRAM instance + pins)
+
+You still have:
+
+- hazard3_tile.sv
+- ahb_interconnect_4m.sv
+- ahb_to_wb_bridge.sv
+- wb_interconnect.sv
+- boot_rom.sv
+- bootrom.hex (Phase 1A ROM)
+
+================================================================================
+STEP 1 — PLACE THE OPENCORES SDRAM CONTROLLER RTL
+================================================================================
+
+1. Create directory for the SDRAM core:
+
+   mkdir -p ~/fpga/h3_phase1_sc/rtl/cores/opencores_sdram
+
+2. Download the OpenCores SDRAM controller sources from opencores.org into that
+   directory. The main top-level usually has a name like:
+
+   - sdram_ctrl.v   or
+   - sdr_ctrl.v
+
+   It typically exposes:
+
+   - Wishbone system interface:
+     - wb_clk_i, wb_rst_i
+     - wb_adr_i, wb_dat_i, wb_dat_o, wb_sel_i, wb_cyc_i, wb_stb_i, wb_we_i
+     - wb_ack_o, wb_err_o
+   - SDRAM signals:
+     - sdram_clk, sdram_cke, sdram_cs_n, sdram_ras_n, sdram_cas_n, sdram_we_n
+     - sdram_ba, sdram_a
+     - sdram_dqm, sdram_dq
+
+   The exact names may differ slightly; adjust the wrapper accordingly.
+
+================================================================================
+STEP 2 — WISHBONE SDRAM WRAPPER (ADAPT TO OUR FABRIC)
+================================================================================
+
+We wrap the raw SDRAM controller into a module with **exactly** the Wishbone ports
+expected by wb_interconnect for s0.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/sdram_wb_wrapper.sv -------------------
+
+module sdram_wb_wrapper
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave interface (from wb_interconnect)
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output wire [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output wire        wb_ack_o,
+    output wire        wb_err_o,
+
+    // SDRAM physical interface (to DE0-Lite board pins)
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq
+);
+
+    // The OpenCores controller often expects:
+    // - byte address or word address; we pass wb_adr_i directly / or truncated.
+    // - 32-bit data; matches our fabric.
+    // - synchronous reset and clock.
+
+    // Adjust these instance/port names to your specific OpenCores SDRAM core.
+    // Example instance (placeholder names):
+
+    wire [31:0] sdram_dat_o;
+    wire        sdram_ack_o;
+    wire        sdram_err_o;
+
+    assign wb_dat_o = sdram_dat_o;
+    assign wb_ack_o = sdram_ack_o;
+    assign wb_err_o = sdram_err_o;
+
+    sdram_ctrl u_sdram (
+        // System
+        .wb_clk_i   (clk),
+        .wb_rst_i   (rst),
+
+        .wb_adr_i   (wb_adr_i),
+        .wb_dat_i   (wb_dat_i),
+        .wb_dat_o   (sdram_dat_o),
+        .wb_sel_i   (wb_sel_i),
+        .wb_cyc_i   (wb_cyc_i),
+        .wb_stb_i   (wb_stb_i),
+        .wb_we_i    (wb_we_i),
+        .wb_ack_o   (sdram_ack_o),
+        .wb_err_o   (sdram_err_o),
+
+        // SDRAM
+        .sdram_clk  (sdram_clk),
+        .sdram_cke  (sdram_cke),
+        .sdram_cs_n (sdram_cs_n),
+        .sdram_ras_n(sdram_ras_n),
+        .sdram_cas_n(sdram_cas_n),
+        .sdram_we_n (sdram_we_n),
+        .sdram_ba   (sdram_ba),
+        .sdram_a    (sdram_a),
+        .sdram_dqm  (sdram_dqm),
+        .sdram_dq   (sdram_dq)
+    );
+
+endmodule
+
+NOTES:
+- The exact module name and ports of the OpenCores SDRAM core might differ:
+  - You might need to map address width, data width, CAS latency, etc.
+  - You may need to parameterize the controller (e.g. bank bits, row/col bits).
+- This wrapper’s job is only to match **Wishbone** and expose SDRAM pins.
+
+================================================================================
+STEP 3 — UPDATE wb_interconnect TO BE USED WITH REAL SDRAM (LOGIC ALREADY OK)
+================================================================================
+
+Our Phase 1B wb_interconnect is already structurally correct for s0 as SDRAM.  
+We just need to:
+
+- Connect s0_* ports to sdram_wb_wrapper instead of the s0 stub.
+
+No change required inside wb_interconnect.sv itself.
+
+================================================================================
+STEP 4 — UPDATE top_soc.sv TO INSTANTIATE SDRAM WRAPPER + EXPOSE PINS
+================================================================================
+
+We now modify top_soc.sv:
+
+- Add SDRAM pins to the module ports.
+- Replace SDRAM stub assignments for s0_… with the real wrapper instance.
+- Keep stubs for s1–s5 (UART/I2C/SPI/GPIO/JTAG-UART) for now.
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv -------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n,
+
+    // SDRAM pins (to DE0-Lite external SDRAM)
+    output wire [12:0] sdram_a,
+    output wire [1:0]  sdram_ba,
+    output wire        sdram_clk,
+    output wire        sdram_cke,
+    output wire        sdram_cs_n,
+    output wire        sdram_ras_n,
+    output wire        sdram_cas_n,
+    output wire        sdram_we_n,
+    output wire [1:0]  sdram_dqm,
+    inout  wire [15:0] sdram_dq
+
+    // Later phases: add UART/I2C/SPI/GPIO pins here
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    //======================
+    // AHB masters as in Phase 1B (HART0 + reserved M1..M3)
+    //======================
+    wire [31:0] m0_haddr;
+    wire [2:0]  m0_hsize;
+    wire [1:0]  m0_hburst;
+    wire [1:0]  m0_htrans;
+    wire        m0_hwrite;
+    wire [31:0] m0_hwdata;
+    wire [31:0] m0_hrdata;
+    wire        m0_hready;
+    wire        m0_hresp;
+
+    wire [31:0] m1_haddr = 32'h0;
+    wire [2:0]  m1_hsize = 3'b010;
+    wire [1:0]  m1_hburst = 2'b00;
+    wire [1:0]  m1_htrans = 2'b00;
+    wire        m1_hwrite = 1'b0;
+    wire [31:0] m1_hwdata = 32'h0;
+    wire [31:0] m1_hrdata;
+    wire        m1_hready;
+    wire        m1_hresp;
+
+    wire [31:0] m2_haddr = 32'h0;
+    wire [2:0]  m2_hsize = 3'b010;
+    wire [1:0]  m2_hburst = 2'b00;
+    wire [1:0]  m2_htrans = 2'b00;
+    wire        m2_hwrite = 1'b0;
+    wire [31:0] m2_hwdata = 32'h0;
+    wire [31:0] m2_hrdata;
+    wire        m2_hready;
+    wire        m2_hresp;
+
+    wire [31:0] m3_haddr = 32'h0;
+    wire [2:0]  m3_hsize = 3'b010;
+    wire [1:0]  m3_hburst = 2'b00;
+    wire [1:0]  m3_htrans = 2'b00;
+    wire        m3_hwrite = 1'b0;
+    wire [31:0] m3_hwdata = 32'h0;
+    wire [31:0] m3_hrdata;
+    wire        m3_hready;
+    wire        m3_hresp;
+
+    // AHB slaves: s0 = ROM, s1 = AHB→WB
+    wire [31:0] s0_haddr, s1_haddr;
+    wire [2:0]  s0_hsize, s1_hsize;
+    wire [1:0]  s0_hburst, s1_hburst;
+    wire [1:0]  s0_htrans, s1_htrans;
+    wire        s0_hwrite, s1_hwrite;
+    wire [31:0] s0_hwdata, s1_hwdata;
+    wire [31:0] s0_hrdata, s1_hrdata;
+    wire        s0_hready, s1_hready;
+    wire        s0_hresp,  s1_hresp;
+
+    // HART0
+    hazard3_tile #(
+        .HART_ID(0)
+    ) u_hart0 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m0_haddr),
+        .HSIZE  (m0_hsize),
+        .HBURST (m0_hburst),
+        .HTRANS (m0_htrans),
+        .HWRITE (m0_hwrite),
+        .HWDATA (m0_hwdata),
+        .HRDATA (m0_hrdata),
+        .HREADY (m0_hready),
+        .HRESP  (m0_hresp)
+    );
+
+    // AHB interconnect
+    ahb_interconnect_4m u_ahb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        .m0_haddr   (m0_haddr),
+        .m0_hsize   (m0_hsize),
+        .m0_hburst  (m0_hburst),
+        .m0_htrans  (m0_htrans),
+        .m0_hwrite  (m0_hwrite),
+        .m0_hwdata  (m0_hwdata),
+        .m0_hrdata  (m0_hrdata),
+        .m0_hready  (m0_hready),
+        .m0_hresp   (m0_hresp),
+
+        .m1_haddr   (m1_haddr),
+        .m1_hsize   (m1_hsize),
+        .m1_hburst  (m1_hburst),
+        .m1_htrans  (m1_htrans),
+        .m1_hwrite  (m1_hwrite),
+        .m1_hwdata  (m1_hwdata),
+        .m1_hrdata  (m1_hrdata),
+        .m1_hready  (m1_hready),
+        .m1_hresp   (m1_hresp),
+
+        .m2_haddr   (m2_haddr),
+        .m2_hsize   (m2_hsize),
+        .m2_hburst  (m2_hburst),
+        .m2_htrans  (m2_htrans),
+        .m2_hwrite  (m2_hwrite),
+        .m2_hwdata  (m2_hwdata),
+        .m2_hrdata  (m2_hrdata),
+        .m2_hready  (m2_hready),
+        .m2_hresp   (m2_hresp),
+
+        .m3_haddr   (m3_haddr),
+        .m3_hsize   (m3_hsize),
+        .m3_hburst  (m3_hburst),
+        .m3_htrans  (m3_htrans),
+        .m3_hwrite  (m3_hwrite),
+        .m3_hwdata  (m3_hwdata),
+        .m3_hrdata  (m3_hrdata),
+        .m3_hready  (m3_hready),
+        .m3_hresp   (m3_hresp),
+
+        .s0_haddr   (s0_haddr),
+        .s0_hsize   (s0_hsize),
+        .s0_hburst  (s0_hburst),
+        .s0_htrans  (s0_htrans),
+        .s0_hwrite  (s0_hwrite),
+        .s0_hwdata  (s0_hwdata),
+        .s0_hrdata  (s0_hrdata),
+        .s0_hready  (s0_hready),
+        .s0_hresp   (s0_hresp),
+
+        .s1_haddr   (s1_haddr),
+        .s1_hsize   (s1_hsize),
+        .s1_hburst  (s1_hburst),
+        .s1_htrans  (s1_htrans),
+        .s1_hwrite  (s1_hwrite),
+        .s1_hwdata  (s1_hwdata),
+        .s1_hrdata  (s1_hrdata),
+        .s1_hready  (s1_hready),
+        .s1_hresp   (s1_hresp)
+    );
+
+    // Boot ROM @ 0x2000_0000
+    boot_rom u_boot_rom (
+        .clk    (clk),
+        .rst    (rst),
+        .HADDR  (s0_haddr),
+        .HSIZE  (s0_hsize),
+        .HBURST (s0_hburst),
+        .HTRANS (s0_htrans),
+        .HWRITE (s0_hwrite),
+        .HWDATA (s0_hwdata),
+        .HRDATA (s0_hrdata),
+        .HREADY (s0_hready),
+        .HRESP  (s0_hresp)
+    );
+
+    // AHB→Wishbone bridge on slave 1 (peripheral/SRAM region)
+    wire [31:0] wb_adr_m;
+    wire [31:0] wb_dat_o_m;
+    wire [31:0] wb_dat_i_m;
+    wire        wb_we_m;
+    wire [3:0]  wb_sel_m;
+    wire        wb_cyc_m;
+    wire        wb_stb_m;
+    wire        wb_ack_m;
+    wire        wb_err_m;
+
+    ahb_to_wb_bridge u_ahb2wb (
+        .clk        (clk),
+        .rst        (rst),
+
+        .HADDR      (s1_haddr),
+        .HSIZE      (s1_hsize),
+        .HBURST     (s1_hburst),
+        .HTRANS     (s1_htrans),
+        .HWRITE     (s1_hwrite),
+        .HWDATA     (s1_hwdata),
+        .HRDATA     (s1_hrdata),
+        .HREADY     (s1_hready),
+        .HRESP      (s1_hresp),
+
+        .wb_adr_o   (wb_adr_m),
+        .wb_dat_o   (wb_dat_o_m),
+        .wb_dat_i   (wb_dat_i_m),
+        .wb_we_o    (wb_we_m),
+        .wb_sel_o   (wb_sel_m),
+        .wb_cyc_o   (wb_cyc_m),
+        .wb_stb_o   (wb_stb_m),
+        .wb_ack_i   (wb_ack_m),
+        .wb_err_i   (wb_err_m)
+    );
+
+    // Wishbone interconnect
+    wire [31:0] s0_dat_i, s1_dat_i, s2_dat_i, s3_dat_i, s4_dat_i, s5_dat_i;
+    wire        s0_ack_i, s1_ack_i, s2_ack_i, s3_ack_i, s4_ack_i, s5_ack_i;
+    wire        s0_err_i, s1_err_i, s2_err_i, s3_err_i, s4_err_i, s5_err_i;
+
+    wire [31:0] s0_adr_o, s1_adr_o, s2_adr_o, s3_adr_o, s4_adr_o, s5_adr_o;
+    wire [31:0] s0_dat_o, s1_dat_o, s2_dat_o, s3_dat_o, s4_dat_o, s5_dat_o;
+    wire        s0_we_o,  s1_we_o,  s2_we_o,  s3_we_o,  s4_we_o,  s5_we_o;
+    wire [3:0]  s0_sel_o, s1_sel_o, s2_sel_o, s3_sel_o, s4_sel_o, s5_sel_o;
+    wire        s0_cyc_o, s1_cyc_o, s2_cyc_o, s3_cyc_o, s4_cyc_o, s5_cyc_o;
+    wire        s0_stb_o, s1_stb_o, s2_stb_o, s3_stb_o, s4_stb_o, s5_stb_o;
+
+    wb_interconnect u_wb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        .m_adr_i    (wb_adr_m),
+        .m_dat_i    (wb_dat_o_m),
+        .m_dat_o    (wb_dat_i_m),
+        .m_we_i     (wb_we_m),
+        .m_sel_i    (wb_sel_m),
+        .m_cyc_i    (wb_cyc_m),
+        .m_stb_i    (wb_stb_m),
+        .m_ack_o    (wb_ack_m),
+        .m_err_o    (wb_err_m),
+
+        .s0_adr_o   (s0_adr_o),
+        .s0_dat_o   (s0_dat_o),
+        .s0_dat_i   (s0_dat_i),
+        .s0_we_o    (s0_we_o),
+        .s0_sel_o   (s0_sel_o),
+        .s0_cyc_o   (s0_cyc_o),
+        .s0_stb_o   (s0_stb_o),
+        .s0_ack_i   (s0_ack_i),
+        .s0_err_i   (s0_err_i),
+
+        .s1_adr_o   (s1_adr_o),
+        .s1_dat_o   (s1_dat_o),
+        .s1_dat_i   (s1_dat_i),
+        .s1_we_o    (s1_we_o),
+        .s1_sel_o   (s1_sel_o),
+        .s1_cyc_o   (s1_cyc_o),
+        .s1_stb_o   (s1_stb_o),
+        .s1_ack_i   (s1_ack_i),
+        .s1_err_i   (s1_err_i),
+
+        .s2_adr_o   (s2_adr_o),
+        .s2_dat_o   (s2_dat_o),
+        .s2_dat_i   (s2_dat_i),
+        .s2_we_o    (s2_we_o),
+        .s2_sel_o   (s2_sel_o),
+        .s2_cyc_o   (s2_cyc_o),
+        .s2_stb_o   (s2_stb_o),
+        .s2_ack_i   (s2_ack_i),
+        .s2_err_i   (s2_err_i),
+
+        .s3_adr_o   (s3_adr_o),
+        .s3_dat_o   (s3_dat_o),
+        .s3_dat_i   (s3_dat_i),
+        .s3_we_o    (s3_we_o),
+        .s3_sel_o   (s3_sel_o),
+        .s3_cyc_o   (s3_cyc_o),
+        .s3_stb_o   (s3_stb_o),
+        .s3_ack_i   (s3_ack_i),
+        .s3_err_i   (s3_err_i),
+
+        .s4_adr_o   (s4_adr_o),
+        .s4_dat_o   (s4_dat_o),
+        .s4_dat_i   (s4_dat_i),
+        .s4_we_o    (s4_we_o),
+        .s4_sel_o   (s4_sel_o),
+        .s4_cyc_o   (s4_cyc_o),
+        .s4_stb_o   (s4_stb_o),
+        .s4_ack_i   (s4_ack_i),
+        .s4_err_i   (s4_err_i),
+
+        .s5_adr_o   (s5_adr_o),
+        .s5_dat_o   (s5_dat_o),
+        .s5_dat_i   (s5_dat_i),
+        .s5_we_o    (s5_we_o),
+        .s5_sel_o   (s5_sel_o),
+        .s5_cyc_o   (s5_cyc_o),
+        .s5_stb_o   (s5_stb_o),
+        .s5_ack_i   (s5_ack_i),
+        .s5_err_i   (s5_err_i)
+    );
+
+    // SDRAM slave (s0): connect to real SDRAM controller
+    sdram_wb_wrapper u_sdram_wb (
+        .clk        (clk),
+        .rst        (rst),
+
+        .wb_adr_i   (s0_adr_o),
+        .wb_dat_i   (s0_dat_o),
+        .wb_dat_o   (s0_dat_i),
+        .wb_we_i    (s0_we_o),
+        .wb_sel_i   (s0_sel_o),
+        .wb_cyc_i   (s0_cyc_o),
+        .wb_stb_i   (s0_stb_o),
+        .wb_ack_o   (s0_ack_i),
+        .wb_err_o   (s0_err_i),
+
+        .sdram_a    (sdram_a),
+        .sdram_ba   (sdram_ba),
+        .sdram_clk  (sdram_clk),
+        .sdram_cke  (sdram_cke),
+        .sdram_cs_n (sdram_cs_n),
+        .sdram_ras_n(sdram_ras_n),
+        .sdram_cas_n(sdram_cas_n),
+        .sdram_we_n (sdram_we_n),
+        .sdram_dqm  (sdram_dqm),
+        .sdram_dq   (sdram_dq)
+    );
+
+    // Stub peripherals for now
+    assign s1_dat_i = 32'hUART_0000; assign s1_ack_i = s1_cyc_o & s1_stb_o; assign s1_err_i = 1'b0;
+    assign s2_dat_i = 32'hI2C0_000;  assign s2_ack_i = s2_cyc_o & s2_stb_o; assign s2_err_i = 1'b0;
+    assign s3_dat_i = 32'hSPI0_000;  assign s3_ack_i = s3_cyc_o & s3_stb_o; assign s3_err_i = 1'b0;
+    assign s4_dat_i = 32'hGPIO_000;  assign s4_ack_i = s4_cyc_o & s4_stb_o; assign s4_err_i = 1'b0;
+    assign s5_dat_i = 32'hJTAG_000;  assign s5_ack_i = s5_cyc_o & s5_stb_o; assign s5_err_i = 1'b0;
+
+endmodule
+
+================================================================================
+STEP 5 — QUARTUS: PINS, BUILD, PROGRAM (SRAM-ONLY)
+================================================================================
+
+1. Add SDRAM controller RTL to project:
+   - In Quartus → Add/Remove Files:
+     - ../rtl/cores/opencores_sdram/*.v
+     - ../rtl/soc/sdram_wb_wrapper.sv
+     - Updated ../rtl/soc/top_soc.sv
+
+2. Pin assignments for SDRAM:
+   - Map sdram_* ports in top_soc to the correct DE0-Lite SDRAM pins according
+     to the board’s user manual (Terasic pin-out table).
+   - Typically:
+     - sdram_clk → dedicated SDRAM clock pin.
+     - sdram_a[12:0], sdram_ba[1:0], sdram_dq[15:0], sdram_dqm[1:0],
+       sdram_cs_n, sdram_ras_n, sdram_cas_n, sdram_we_n, sdram_cke → as per ref.
+
+3. Boot ROM:
+   - Ensure bootrom.hex is in the Quartus project directory, or path in boot_rom.sv
+     is adjusted.
+
+4. Compile:
+   - Processing → Start Compilation.
+
+5. Program SRAM (never flash):
+   - Open Quartus Programmer.
+   - Mode: JTAG.
+   - File: h3_phase1_sc.sof.
+   - Check only “Program/Configure”.
+   - Click Start.
+
+6. Behavior:
+   - Hazard3 boots from ROM at 0x2000_0000 and runs the Phase 1A stub (infinite WFI).
+   - Any subsequent C firmware we create can now place .text/.data in SDRAM at
+     0x8000_0000, and the bus path is fully real:
+       Core → AHB → Bridge → WB → SDRAM controller → SDRAM pins.
+   - On power-cycle, board reverts to factory demo image from flash.
+
+================================================================================
+WHAT PHASE 1C GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A scalable memory architecture:
+  - SDRAM as a first-class WB slave under a single AHB→WB gateway.
+  - Address map: 0x8000_0000.. for code/data.
+- Fully compatible with adding:
+  - More Hazard3 tiles (M1..M3).
+  - Peripherals behind the same WB fabric (UART/I2C/SPI/GPIO/JTAG-UART).
+  - Bootloader that uploads firmware into SDRAM and jumps to 0x8000_0000.
+
+Next natural step is **Phase 1D**:
+- Integrate a real OpenCores UART16550 on s1 (0x1000_0000) with a minimal test
+  firmware to prove SDRAM + UART together.
+
+##############END Phase 1C################
