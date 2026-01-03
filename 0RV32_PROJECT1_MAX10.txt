@@ -786,3 +786,782 @@ WHAT PHASE 1A HAS ACHIEVED (QUAD-CORE FUTURE IN MIND)
   - Phase 3: quad-core with core control and hart coordination.
 №############END PHASE1_A################
 
+================================================================================
+PHASE 1B: AHB→WISHBONE BRIDGE + WISHBONE FABRIC SHELL (QUAD-CORE-READY)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH PROGRAMMING)
+================================================================================
+
+GOAL OF PHASE 1B
+----------------
+Extend the Phase 1A SoC skeleton to introduce the full bus hierarchy:
+
+- KEEP:
+  - Hazard3 tile (HART0) as AHB master M0.
+  - 4-master-capable AHB interconnect (M0..M3, S0=Boot ROM).
+  - Boot ROM @ 0x2000_0000, with bootrom.hex.
+  - top_soc.sv structure and DE0-Lite top-level.
+
+- ADD in Phase 1B:
+  - AHB→Wishbone bridge (burst-aware, but we can treat it as single-beat for now).
+  - Wishbone fabric with address decode for:
+    - SDRAM @ 0x8000_0000 (future Phase 1C).
+    - UART0 @ 0x1000_0000 (future 1D).
+    - I2C0 @ 0x1000_0100 (future 1E).
+    - SPI0 @ 0x1000_0200 (future 1F).
+    - GPIO @ 0x1000_0300 (future 1G).
+    - JTAG-UART @ 0x1000_0500 (future 1H).
+  - Stub Wishbone slaves for now (return fixed data, OKAY).
+
+NOTES:
+- STILL: We only ever program .sof via JTAG → SRAM. No .pof, no flash. On power-cycle
+  the DE0-Lite returns to its factory image.
+- This phase is about bus structure, NOT functionality. All peripherals are stubs.
+
+Directory context:
+
+- ~/fpga/h3_phase1_sc/rtl/soc/
+    - hazard3_tile.sv              (from 1A)
+    - ahb_interconnect_4m.sv       (from 1A)
+    - boot_rom.sv                  (from 1A)
+    - top_soc.sv                   (UPDATED in 1B)
+    - ahb_to_wb_bridge.sv          (NEW)
+    - wb_interconnect.sv           (NEW)
+
+================================================================================
+STEP 1 — AHB→WISHBONE BRIDGE (SINGLE-BEAT, BURST-CAPABLE STRUCTURE)
+================================================================================
+
+We design a simple AHB-Lite slave → Wishbone master bridge:
+
+- AHB slave interface:
+  - Responds to reads/writes in the 0x1000_0000–0x8FFF_FFFF region.
+- Wishbone master interface:
+  - Issues a single Wishbone cycle per AHB transfer (Phase 1B).
+- Later we can extend it to actually use HBURST for bursts, but the interface will
+  already be correct.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/ahb_to_wb_bridge.sv -------------------
+
+module ahb_to_wb_bridge
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // AHB-Lite slave interface
+    input  wire [31:0] HADDR,
+    input  wire [2:0]  HSIZE,
+    input  wire [1:0]  HBURST,
+    input  wire [1:0]  HTRANS,
+    input  wire        HWRITE,
+    input  wire [31:0] HWDATA,
+    output reg  [31:0] HRDATA,
+    output reg         HREADY,
+    output reg         HRESP,
+
+    // Wishbone master interface
+    output reg  [31:0] wb_adr_o,
+    output reg  [31:0] wb_dat_o,
+    input  wire [31:0] wb_dat_i,
+    output reg         wb_we_o,
+    output reg  [3:0]  wb_sel_o,
+    output reg         wb_cyc_o,
+    output reg         wb_stb_o,
+    input  wire        wb_ack_i,
+    input  wire        wb_err_i
+);
+
+    // Simple FSM: IDLE → WB_CYCLE → DONE
+    localparam ST_IDLE  = 2'd0;
+    localparam ST_WB    = 2'd1;
+    localparam ST_RESP  = 2'd2;
+
+    reg [1:0] state, next_state;
+
+    // Latched AHB request info
+    reg [31:0] lat_addr;
+    reg [31:0] lat_wdata;
+    reg        lat_write;
+    reg [3:0]  lat_sel;
+
+    wire ahb_valid = HTRANS[1]; // NONSEQ or SEQ
+
+    // Derive byte enables from HSIZE and address (simplified: assume 32-bit)
+    // For now we just treat all accesses as 32-bit word.
+    wire [3:0] ahb_sel = 4'b1111;
+
+    // FSM
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= ST_IDLE;
+        end else begin
+            state <= next_state;
+        end
+    end
+
+    always @(*) begin
+        next_state = state;
+        case (state)
+            ST_IDLE: begin
+                if (ahb_valid) begin
+                    next_state = ST_WB;
+                end
+            end
+            ST_WB: begin
+                if (wb_ack_i || wb_err_i) begin
+                    next_state = ST_RESP;
+                end
+            end
+            ST_RESP: begin
+                next_state = ST_IDLE;
+            end
+        endcase
+    end
+
+    // Latch AHB request on first valid transfer
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            lat_addr  <= 32'h0;
+            lat_wdata <= 32'h0;
+            lat_write <= 1'b0;
+            lat_sel   <= 4'b0000;
+        end else begin
+            if (state == ST_IDLE && ahb_valid) begin
+                lat_addr  <= HADDR;
+                lat_wdata <= HWDATA;
+                lat_write <= HWRITE;
+                lat_sel   <= ahb_sel;
+            end
+        end
+    end
+
+    // Drive Wishbone signals
+    always @(*) begin
+        wb_adr_o = 32'h0;
+        wb_dat_o = 32'h0;
+        wb_we_o  = 1'b0;
+        wb_sel_o = 4'b0000;
+        wb_cyc_o = 1'b0;
+        wb_stb_o = 1'b0;
+
+        case (state)
+            ST_WB: begin
+                wb_adr_o = lat_addr;
+                wb_dat_o = lat_wdata;
+                wb_we_o  = lat_write;
+                wb_sel_o = lat_sel;
+                wb_cyc_o = 1'b1;
+                wb_stb_o = 1'b1;
+            end
+            default: begin
+                // IDLE / RESP → no WB cycle
+            end
+        endcase
+    end
+
+    // AHB response
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            HRDATA <= 32'h0;
+            HREADY <= 1'b1;
+            HRESP  <= 1'b0;
+        end else begin
+            case (state)
+                ST_IDLE: begin
+                    HREADY <= 1'b1; // ready for new transfer
+                    HRESP  <= 1'b0;
+                end
+                ST_WB: begin
+                    HREADY <= 1'b0; // wait for WB
+                    HRESP  <= 1'b0;
+                end
+                ST_RESP: begin
+                    HREADY <= 1'b1;
+                    HRESP  <= wb_err_i ? 1'b1 : 1'b0;
+                    HRDATA <= wb_dat_i;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 2 — WISHBONE INTERCONNECT SHELL (6 SLAVES, ALL STUBS FOR NOW)
+================================================================================
+
+We now define a single-master, multi-slave Wishbone interconnect:
+
+- Single master: output of ahb_to_wb_bridge.
+- Slaves:
+  - s0: SDRAM     @ 0x8000_0000–0x8FFF_FFFF (Phase 1C).
+  - s1: UART0     @ 0x1000_0000–0x1000_00FF.
+  - s2: I2C0      @ 0x1000_0100–0x1000_01FF.
+  - s3: SPI0      @ 0x1000_0200–0x1000_02FF.
+  - s4: GPIO      @ 0x1000_0300–0x1000_03FF.
+  - s5: JTAG-UART @ 0x1000_0500–0x1000_05FF.
+
+In Phase 1B:
+- Each slave is a stub: always ACK, returns fixed data, no error.
+- In later phases we replace those stubs with real IP instances.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/wb_interconnect.sv --------------------
+
+module wb_interconnect
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Master interface
+    input  wire [31:0] m_adr_i,
+    input  wire [31:0] m_dat_i,
+    output reg  [31:0] m_dat_o,
+    input  wire        m_we_i,
+    input  wire [3:0]  m_sel_i,
+    input  wire        m_cyc_i,
+    input  wire        m_stb_i,
+    output reg         m_ack_o,
+    output reg         m_err_o,
+
+    // Slave 0: SDRAM
+    output reg  [31:0] s0_adr_o,
+    output reg  [31:0] s0_dat_o,
+    input  wire [31:0] s0_dat_i,
+    output reg         s0_we_o,
+    output reg  [3:0]  s0_sel_o,
+    output reg         s0_cyc_o,
+    output reg         s0_stb_o,
+    input  wire        s0_ack_i,
+    input  wire        s0_err_i,
+
+    // Slave 1: UART0
+    output reg  [31:0] s1_adr_o,
+    output reg  [31:0] s1_dat_o,
+    input  wire [31:0] s1_dat_i,
+    output reg         s1_we_o,
+    output reg  [3:0]  s1_sel_o,
+    output reg         s1_cyc_o,
+    output reg         s1_stb_o,
+    input  wire        s1_ack_i,
+    input  wire        s1_err_i,
+
+    // Slave 2: I2C0
+    output reg  [31:0] s2_adr_o,
+    output reg  [31:0] s2_dat_o,
+    input  wire [31:0] s2_dat_i,
+    output reg         s2_we_o,
+    output reg  [3:0]  s2_sel_o,
+    output reg         s2_cyc_o,
+    output reg         s2_stb_o,
+    input  wire        s2_ack_i,
+    input  wire        s2_err_i,
+
+    // Slave 3: SPI0
+    output reg  [31:0] s3_adr_o,
+    output reg  [31:0] s3_dat_o,
+    input  wire [31:0] s3_dat_i,
+    output reg         s3_we_o,
+    output reg  [3:0]  s3_sel_o,
+    output reg         s3_cyc_o,
+    output reg         s3_stb_o,
+    input  wire        s3_ack_i,
+    input  wire        s3_err_i,
+
+    // Slave 4: GPIO
+    output reg  [31:0] s4_adr_o,
+    output reg  [31:0] s4_dat_o,
+    input  wire [31:0] s4_dat_i,
+    output reg         s4_we_o,
+    output reg  [3:0]  s4_sel_o,
+    output reg         s4_cyc_o,
+    output reg         s4_stb_o,
+    input  wire        s4_ack_i,
+    input  wire        s4_err_i,
+
+    // Slave 5: JTAG-UART
+    output reg  [31:0] s5_adr_o,
+    output reg  [31:0] s5_dat_o,
+    input  wire [31:0] s5_dat_i,
+    output reg         s5_we_o,
+    output reg  [3:0]  s5_sel_o,
+    output reg         s5_cyc_o,
+    output reg         s5_stb_o,
+    input  wire        s5_ack_i,
+    input  wire        s5_err_i
+);
+
+    // Address decode
+    // s0: SDRAM region >= 0x8000_0000
+    wire sel_s0 = (m_adr_i[31:28] == 4'h8);
+
+    // s1..s5: peripheral regions
+    wire sel_s1 = (m_adr_i[31:8] == 24'h100000); // 0x1000_0000 - 0x1000_00FF
+    wire sel_s2 = (m_adr_i[31:8] == 24'h100001); // 0x1000_0100 - 0x1000_01FF
+    wire sel_s3 = (m_adr_i[31:8] == 24'h100002); // 0x1000_0200 - 0x1000_02FF
+    wire sel_s4 = (m_adr_i[31:8] == 24'h100003); // 0x1000_0300 - 0x1000_03FF
+    wire sel_s5 = (m_adr_i[31:8] == 24'h100005); // 0x1000_0500 - 0x1000_05FF
+
+    // default: no slave → error
+    wire no_slave = !(sel_s0 | sel_s1 | sel_s2 | sel_s3 | sel_s4 | sel_s5);
+
+    // Drive slaves based on select
+    always @(*) begin
+        // default all slaves inactive
+        s0_adr_o = 32'h0; s0_dat_o = 32'h0; s0_we_o = 1'b0; s0_sel_o = 4'b0000; s0_cyc_o = 1'b0; s0_stb_o = 1'b0;
+        s1_adr_o = 32'h0; s1_dat_o = 32'h0; s1_we_o = 1'b0; s1_sel_o = 4'b0000; s1_cyc_o = 1'b0; s1_stb_o = 1'b0;
+        s2_adr_o = 32'h0; s2_dat_o = 32'h0; s2_we_o = 1'b0; s2_sel_o = 4'b0000; s2_cyc_o = 1'b0; s2_stb_o = 1'b0;
+        s3_adr_o = 32'h0; s3_dat_o = 32'h0; s3_we_o = 1'b0; s3_sel_o = 4'b0000; s3_cyc_o = 1'b0; s3_stb_o = 1'b0;
+        s4_adr_o = 32'h0; s4_dat_o = 32'h0; s4_we_o = 1'b0; s4_sel_o = 4'b0000; s4_cyc_o = 1'b0; s4_stb_o = 1'b0;
+        s5_adr_o = 32'h0; s5_dat_o = 32'h0; s5_we_o = 1'b0; s5_sel_o = 4'b0000; s5_cyc_o = 1'b0; s5_stb_o = 1'b0;
+
+        if (m_cyc_i && m_stb_i) begin
+            if (sel_s0) begin
+                s0_adr_o = m_adr_i;
+                s0_dat_o = m_dat_i;
+                s0_we_o  = m_we_i;
+                s0_sel_o = m_sel_i;
+                s0_cyc_o = 1'b1;
+                s0_stb_o = 1'b1;
+            end else if (sel_s1) begin
+                s1_adr_o = m_adr_i;
+                s1_dat_o = m_dat_i;
+                s1_we_o  = m_we_i;
+                s1_sel_o = m_sel_i;
+                s1_cyc_o = 1'b1;
+                s1_stb_o = 1'b1;
+            end else if (sel_s2) begin
+                s2_adr_o = m_adr_i;
+                s2_dat_o = m_dat_i;
+                s2_we_o  = m_we_i;
+                s2_sel_o = m_sel_i;
+                s2_cyc_o = 1'b1;
+                s2_stb_o = 1'b1;
+            end else if (sel_s3) begin
+                s3_adr_o = m_adr_i;
+                s3_dat_o = m_dat_i;
+                s3_we_o  = m_we_i;
+                s3_sel_o = m_sel_i;
+                s3_cyc_o = 1'b1;
+                s3_stb_o = 1'b1;
+            end else if (sel_s4) begin
+                s4_adr_o = m_adr_i;
+                s4_dat_o = m_dat_i;
+                s4_we_o  = m_we_i;
+                s4_sel_o = m_sel_i;
+                s4_cyc_o = 1'b1;
+                s4_stb_o = 1'b1;
+            end else if (sel_s5) begin
+                s5_adr_o = m_adr_i;
+                s5_dat_o = m_dat_i;
+                s5_we_o  = m_we_i;
+                s5_sel_o = m_sel_i;
+                s5_cyc_o = 1'b1;
+                s5_stb_o = 1'b1;
+            end
+        end
+    end
+
+    // Return data/ack/err to master
+    always @(*) begin
+        m_dat_o = 32'h0;
+        m_ack_o = 1'b0;
+        m_err_o = 1'b0;
+
+        if (m_cyc_i && m_stb_i) begin
+            if (sel_s0) begin
+                m_dat_o = s0_dat_i;
+                m_ack_o = s0_ack_i;
+                m_err_o = s0_err_i;
+            end else if (sel_s1) begin
+                m_dat_o = s1_dat_i;
+                m_ack_o = s1_ack_i;
+                m_err_o = s1_err_i;
+            end else if (sel_s2) begin
+                m_dat_o = s2_dat_i;
+                m_ack_o = s2_ack_i;
+                m_err_o = s2_err_i;
+            end else if (sel_s3) begin
+                m_dat_o = s3_dat_i;
+                m_ack_o = s3_ack_i;
+                m_err_o = s3_err_i;
+            end else if (sel_s4) begin
+                m_dat_o = s4_dat_i;
+                m_ack_o = s4_ack_i;
+                m_err_o = s4_err_i;
+            end else if (sel_s5) begin
+                m_dat_o = s5_dat_i;
+                m_ack_o = s5_ack_i;
+                m_err_o = s5_err_i;
+            end else if (no_slave) begin
+                m_dat_o = 32'hBAD0_0000;
+                m_ack_o = 1'b1;
+                m_err_o = 1'b1;
+            end
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 3 — TOP-LEVEL UPDATE: CONNECT AHB→WB BRIDGE + WB INTERCONNECT + STUB SLAVES
+================================================================================
+
+Now we update top_soc.sv to:
+
+- Hook up AHB slave 1 (previous dummy) to ahb_to_wb_bridge.
+- Hook the bridge’s Wishbone master to wb_interconnect.
+- Instantiate stub Wishbone slaves for SDRAM, UART, I2C, SPI, GPIO, JTAG-UART.
+
+NOTE:
+- You REPLACE the old dummy S1 logic in top_soc.sv with the new bridge+WB fabric.
+- The rest (HART0 tile, AHB interconnect, Boot ROM) remains as in Phase 1A.
+
+----- UPDATED FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv -------------------
+
+module top_soc
+(
+    input  wire clk_50,
+    input  wire reset_n
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    //======================
+    // AHB master signals from HART0 tile (M0)
+    //======================
+    wire [31:0] m0_haddr;
+    wire [2:0]  m0_hsize;
+    wire [1:0]  m0_hburst;
+    wire [1:0]  m0_htrans;
+    wire        m0_hwrite;
+    wire [31:0] m0_hwdata;
+    wire [31:0] m0_hrdata;
+    wire        m0_hready;
+    wire        m0_hresp;
+
+    // M1..M3 unused
+    wire [31:0] m1_haddr = 32'h0;
+    wire [2:0]  m1_hsize = 3'b010;
+    wire [1:0]  m1_hburst = 2'b00;
+    wire [1:0]  m1_htrans = 2'b00;
+    wire        m1_hwrite = 1'b0;
+    wire [31:0] m1_hwdata = 32'h0;
+    wire [31:0] m1_hrdata;
+    wire        m1_hready;
+    wire        m1_hresp;
+
+    wire [31:0] m2_haddr = 32'h0;
+    wire [2:0]  m2_hsize = 3'b010;
+    wire [1:0]  m2_hburst = 2'b00;
+    wire [1:0]  m2_htrans = 2'b00;
+    wire        m2_hwrite = 1'b0;
+    wire [31:0] m2_hwdata = 32'h0;
+    wire [31:0] m2_hrdata;
+    wire        m2_hready;
+    wire        m2_hresp;
+
+    wire [31:0] m3_haddr = 32'h0;
+    wire [2:0]  m3_hsize = 3'b010;
+    wire [1:0]  m3_hburst = 2'b00;
+    wire [1:0]  m3_htrans = 2'b00;
+    wire        m3_hwrite = 1'b0;
+    wire [31:0] m3_hwdata = 32'h0;
+    wire [31:0] m3_hrdata;
+    wire        m3_hready;
+    wire        m3_hresp;
+
+    // Slave 0: Boot ROM
+    wire [31:0] s0_haddr, s1_haddr;
+    wire [2:0]  s0_hsize, s1_hsize;
+    wire [1:0]  s0_hburst, s1_hburst;
+    wire [1:0]  s0_htrans, s1_htrans;
+    wire        s0_hwrite, s1_hwrite;
+    wire [31:0] s0_hwdata, s1_hwdata;
+    wire [31:0] s0_hrdata, s1_hrdata;
+    wire        s0_hready, s1_hready;
+    wire        s0_hresp,  s1_hresp;
+
+    // HART0 tile
+    hazard3_tile #(
+        .HART_ID(0)
+    ) u_hart0 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m0_haddr),
+        .HSIZE  (m0_hsize),
+        .HBURST (m0_hburst),
+        .HTRANS (m0_htrans),
+        .HWRITE (m0_hwrite),
+        .HWDATA (m0_hwdata),
+        .HRDATA (m0_hrdata),
+        .HREADY (m0_hready),
+        .HRESP  (m0_hresp)
+    );
+
+    // AHB interconnect
+    ahb_interconnect_4m u_ahb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        .m0_haddr   (m0_haddr),
+        .m0_hsize   (m0_hsize),
+        .m0_hburst  (m0_hburst),
+        .m0_htrans  (m0_htrans),
+        .m0_hwrite  (m0_hwrite),
+        .m0_hwdata  (m0_hwdata),
+        .m0_hrdata  (m0_hrdata),
+        .m0_hready  (m0_hready),
+        .m0_hresp   (m0_hresp),
+
+        .m1_haddr   (m1_haddr),
+        .m1_hsize   (m1_hsize),
+        .m1_hburst  (m1_hburst),
+        .m1_htrans  (m1_htrans),
+        .m1_hwrite  (m1_hwrite),
+        .m1_hwdata  (m1_hwdata),
+        .m1_hrdata  (m1_hrdata),
+        .m1_hready  (m1_hready),
+        .m1_hresp   (m1_hresp),
+
+        .m2_haddr   (m2_haddr),
+        .m2_hsize   (m2_hsize),
+        .m2_hburst  (m2_hburst),
+        .m2_htrans  (m2_htrans),
+        .m2_hwrite  (m2_hwrite),
+        .m2_hwdata  (m2_hwdata),
+        .m2_hrdata  (m2_hrdata),
+        .m2_hready  (m2_hready),
+        .m2_hresp   (m2_hresp),
+
+        .m3_haddr   (m3_haddr),
+        .m3_hsize   (m3_hsize),
+        .m3_hburst  (m3_hburst),
+        .m3_htrans  (m3_htrans),
+        .m3_hwrite  (m3_hwrite),
+        .m3_hwdata  (m3_hwdata),
+        .m3_hrdata  (m3_hrdata),
+        .m3_hready  (m3_hready),
+        .m3_hresp   (m3_hresp),
+
+        .s0_haddr   (s0_haddr),
+        .s0_hsize   (s0_hsize),
+        .s0_hburst  (s0_hburst),
+        .s0_htrans  (s0_htrans),
+        .s0_hwrite  (s0_hwrite),
+        .s0_hwdata  (s0_hwdata),
+        .s0_hrdata  (s0_hrdata),
+        .s0_hready  (s0_hready),
+        .s0_hresp   (s0_hresp),
+
+        .s1_haddr   (s1_haddr),
+        .s1_hsize   (s1_hsize),
+        .s1_hburst  (s1_hburst),
+        .s1_htrans  (s1_htrans),
+        .s1_hwrite  (s1_hwrite),
+        .s1_hwdata  (s1_hwdata),
+        .s1_hrdata  (s1_hrdata),
+        .s1_hready  (s1_hready),
+        .s1_hresp   (s1_hresp)
+    );
+
+    // Boot ROM
+    boot_rom u_boot_rom (
+        .clk    (clk),
+        .rst    (rst),
+        .HADDR  (s0_haddr),
+        .HSIZE  (s0_hsize),
+        .HBURST (s0_hburst),
+        .HTRANS (s0_htrans),
+        .HWRITE (s0_hwrite),
+        .HWDATA (s0_hwdata),
+        .HRDATA (s0_hrdata),
+        .HREADY (s0_hready),
+        .HRESP  (s0_hresp)
+    );
+
+    // AHB→Wishbone bridge on slave 1
+    wire [31:0] wb_adr_m;
+    wire [31:0] wb_dat_o_m;
+    wire [31:0] wb_dat_i_m;
+    wire        wb_we_m;
+    wire [3:0]  wb_sel_m;
+    wire        wb_cyc_m;
+    wire        wb_stb_m;
+    wire        wb_ack_m;
+    wire        wb_err_m;
+
+    ahb_to_wb_bridge u_ahb2wb (
+        .clk        (clk),
+        .rst        (rst),
+
+        .HADDR      (s1_haddr),
+        .HSIZE      (s1_hsize),
+        .HBURST     (s1_hburst),
+        .HTRANS     (s1_htrans),
+        .HWRITE     (s1_hwrite),
+        .HWDATA     (s1_hwdata),
+        .HRDATA     (s1_hrdata),
+        .HREADY     (s1_hready),
+        .HRESP      (s1_hresp),
+
+        .wb_adr_o   (wb_adr_m),
+        .wb_dat_o   (wb_dat_o_m),
+        .wb_dat_i   (wb_dat_i_m),
+        .wb_we_o    (wb_we_m),
+        .wb_sel_o   (wb_sel_m),
+        .wb_cyc_o   (wb_cyc_m),
+        .wb_stb_o   (wb_stb_m),
+        .wb_ack_i   (wb_ack_m),
+        .wb_err_i   (wb_err_m)
+    );
+
+    // Wishbone interconnect and stub slaves
+    wire [31:0] s0_dat_i, s1_dat_i, s2_dat_i, s3_dat_i, s4_dat_i, s5_dat_i;
+    wire        s0_ack_i, s1_ack_i, s2_ack_i, s3_ack_i, s4_ack_i, s5_ack_i;
+    wire        s0_err_i, s1_err_i, s2_err_i, s3_err_i, s4_err_i, s5_err_i;
+
+    wire [31:0] s0_adr_o, s1_adr_o, s2_adr_o, s3_adr_o, s4_adr_o, s5_adr_o;
+    wire [31:0] s0_dat_o, s1_dat_o, s2_dat_o, s3_dat_o, s4_dat_o, s5_dat_o;
+    wire        s0_we_o, s1_we_o, s2_we_o, s3_we_o, s4_we_o, s5_we_o;
+    wire [3:0]  s0_sel_o, s1_sel_o, s2_sel_o, s3_sel_o, s4_sel_o, s5_sel_o;
+    wire        s0_cyc_o, s1_cyc_o, s2_cyc_o, s3_cyc_o, s4_cyc_o, s5_cyc_o;
+    wire        s0_stb_o, s1_stb_o, s2_stb_o, s3_stb_o, s4_stb_o, s5_stb_o;
+
+    wb_interconnect u_wb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        .m_adr_i    (wb_adr_m),
+        .m_dat_i    (wb_dat_o_m),
+        .m_dat_o    (wb_dat_i_m),
+        .m_we_i     (wb_we_m),
+        .m_sel_i    (wb_sel_m),
+        .m_cyc_i    (wb_cyc_m),
+        .m_stb_i    (wb_stb_m),
+        .m_ack_o    (wb_ack_m),
+        .m_err_o    (wb_err_m),
+
+        .s0_adr_o   (s0_adr_o),
+        .s0_dat_o   (s0_dat_o),
+        .s0_dat_i   (s0_dat_i),
+        .s0_we_o    (s0_we_o),
+        .s0_sel_o   (s0_sel_o),
+        .s0_cyc_o   (s0_cyc_o),
+        .s0_stb_o   (s0_stb_o),
+        .s0_ack_i   (s0_ack_i),
+        .s0_err_i   (s0_err_i),
+
+        .s1_adr_o   (s1_adr_o),
+        .s1_dat_o   (s1_dat_o),
+        .s1_dat_i   (s1_dat_i),
+        .s1_we_o    (s1_we_o),
+        .s1_sel_o   (s1_sel_o),
+        .s1_cyc_o   (s1_cyc_o),
+        .s1_stb_o   (s1_stb_o),
+        .s1_ack_i   (s1_ack_i),
+        .s1_err_i   (s1_err_i),
+
+        .s2_adr_o   (s2_adr_o),
+        .s2_dat_o   (s2_dat_o),
+        .s2_dat_i   (s2_dat_i),
+        .s2_we_o    (s2_we_o),
+        .s2_sel_o   (s2_sel_o),
+        .s2_cyc_o   (s2_cyc_o),
+        .s2_stb_o   (s2_stb_o),
+        .s2_ack_i   (s2_ack_i),
+        .s2_err_i   (s2_err_i),
+
+        .s3_adr_o   (s3_adr_o),
+        .s3_dat_o   (s3_dat_o),
+        .s3_dat_i   (s3_dat_i),
+        .s3_we_o    (s3_we_o),
+        .s3_sel_o   (s3_sel_o),
+        .s3_cyc_o   (s3_cyc_o),
+        .s3_stb_o   (s3_stb_o),
+        .s3_ack_i   (s3_ack_i),
+        .s3_err_i   (s3_err_i),
+
+        .s4_adr_o   (s4_adr_o),
+        .s4_dat_o   (s4_dat_o),
+        .s4_dat_i   (s4_dat_i),
+        .s4_we_o    (s4_we_o),
+        .s4_sel_o   (s4_sel_o),
+        .s4_cyc_o   (s4_cyc_o),
+        .s4_stb_o   (s4_stb_o),
+        .s4_ack_i   (s4_ack_i),
+        .s4_err_i   (s4_err_i),
+
+        .s5_adr_o   (s5_adr_o),
+        .s5_dat_o   (s5_dat_o),
+        .s5_dat_i   (s5_dat_i),
+        .s5_we_o    (s5_we_o),
+        .s5_sel_o   (s5_sel_o),
+        .s5_cyc_o   (s5_cyc_o),
+        .s5_stb_o   (s5_stb_o),
+        .s5_ack_i   (s5_ack_i),
+        .s5_err_i   (s5_err_i)
+    );
+
+    // Stub slaves for now: always ACK, no error, return distinct constants
+    assign s0_dat_i = 32'hSDRA_0000; assign s0_ack_i = s0_cyc_o & s0_stb_o; assign s0_err_i = 1'b0;
+    assign s1_dat_i = 32'hUART_0000; assign s1_ack_i = s1_cyc_o & s1_stb_o; assign s1_err_i = 1'b0;
+    assign s2_dat_i = 32'hI2C0_000;  assign s2_ack_i = s2_cyc_o & s2_stb_o; assign s2_err_i = 1'b0;
+    assign s3_dat_i = 32'hSPI0_000;  assign s3_ack_i = s3_cyc_o & s3_stb_o; assign s3_err_i = 1'b0;
+    assign s4_dat_i = 32'hGPIO_000;  assign s4_ack_i = s4_cyc_o & s4_stb_o; assign s4_err_i = 1'b0;
+    assign s5_dat_i = 32'hJTAG_000;  assign s5_ack_i = s5_cyc_o & s5_stb_o; assign s5_err_i = 1'b0;
+
+endmodule
+
+================================================================================
+STEP 4 — QUARTUS BUILD & PROGRAMMING (STILL SRAM-ONLY, NO FLASH)
+================================================================================
+
+1. Ensure files are in place:
+   - ~/fpga/h3_phase1_sc/rtl/soc/hazard3_tile.sv
+   - ~/fpga/h3_phase1_sc/rtl/soc/ahb_interconnect_4m.sv
+   - ~/fpga/h3_phase1_sc/rtl/soc/boot_rom.sv
+   - ~/fpga/h3_phase1_sc/rtl/soc/ahb_to_wb_bridge.sv
+   - ~/fpga/h3_phase1_sc/rtl/soc/wb_interconnect.sv
+   - ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv
+   - Hazard3 core RTL under rtl/cores/hazard3/...
+
+2. Boot ROM hex:
+   - cd ~/hazard3_fw/bootrom
+   - make
+   - Copy bootrom.hex into ~/fpga/h3_phase1_sc/quartus (or adjust path in boot_rom.sv).
+
+3. In Quartus:
+   - Open h3_phase1_sc project (from Phase 1A).
+   - Add the new RTL files (ahb_to_wb_bridge, wb_interconnect, updated top_soc.sv).
+   - Re-run Analysis & Synthesis and full Compilation.
+
+4. Program DE0-Lite (SRAM-only):
+   - Open Quartus Programmer.
+   - Mode: JTAG.
+   - File: h3_phase1_sc.sof (output_files/).
+   - Check ONLY “Program/Configure”.
+   - DO NOT create or program .pof. DO NOT set any configuration device.
+   - Click Start.
+
+5. After programming:
+   - HART0 still boots from ROM and loops in _start().
+   - Any AHB access in 0x1000_0000–0x8FFF_FFFF goes through the AHB→WB bridge
+     and WB interconnect to stub slaves, returning known constants.
+
+================================================================================
+WHAT PHASE 1B ACHIEVES TOWARD QUAD-CORE GOAL
+================================================================================
+
+- You now have a **quad-core-ready bus architecture**:
+  - 4-master AHB interconnect (M0 live, M1–M3 reserved).
+  - AHB→WB bridge as a unified gateway to all off-core memory & peripherals.
+  - Wishbone fabric with stable, final address map for SDRAM and peripherals.
+
+- The next phases can now cleanly:
+  - Replace SDRAM stub (s0) with OpenCores SDRAM controller (Phase 1C).
+  - Replace UART/I2C/SPI/GPIO/JTAG-UART stubs (s1–s5) with real IP (Phases 1D–1H).
+  - Add bootloader, HAL, and firmware on top (1I–1K).
+  - Then scale to 2 and 4 cores by hooking up more hazard3_tile instances to M1..M3.
+
+################END PHASE1B##############
