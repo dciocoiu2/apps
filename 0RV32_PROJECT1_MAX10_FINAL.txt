@@ -4211,5 +4211,305 @@ Everything is **ephemeral**:
 ============================================================
 END OF PHASE 7
 ============================================================
+============================================================
+PHASE 8 — QUARTUS PROJECT, FPGA BUILD, AND ARDUINO-HEADER PIN BINDING
+============================================================
+
+Goal:
+- Create a full Quartus project for the DE10-Lite that:
+  - Targets MAX 10 10M50DAF484C7G.
+  - Uses `h3_quad_mcu_top` as the top-level entity.
+  - Includes all SoC RTL from previous phases.
+  - Maps all SoC I/O signals to the **Arduino headers** on the DE10-Lite.
+  - Produces a **.sof** for SRAM-only configuration via JTAG (no flash programming).
+- Outcome:
+  - You can load the SoC into FPGA SRAM.
+  - Bootloader runs on reset.
+  - You can then load `app.bin` over UART.
+
+NOTE:
+- Exact FPGA pin names for the Arduino header signals must come from the official DE10-Lite User Manual.
+- This phase tells you **exactly** how to wire the signals and what to search for; you only need to plug in the concrete pin names from the manual.
+
+------------------------------------------------------------
+1. Create the Quartus project
+------------------------------------------------------------
+
+From your Linux environment:
+
+1) Create a Quartus project directory:
+
+  cd ~/h3_quad_de10lite/soc
+  mkdir -p quartus
+  cd quartus
+
+2) Start Quartus (GUI) or use command line. We’ll assume GUI steps (they’re reproducible).
+
+3) In Quartus:
+   - File → New Project Wizard.
+   - “Next” through intro.
+   - Directory:  ~/h3_quad_de10lite/soc/quartus
+   - Project name: h3_quad_mcu
+   - Top-level entity: h3_quad_mcu_top
+   - Next.
+
+4) Add files to project:
+   - Add all RTL files from:
+     - ../rtl/ (all .v for SoC, including `h3_quad_mcu_top.v`, `h3_ahb_*`, `h3_apb_*`, `h3_wb_*`, `h3_irq_ctrl.v`, `h3_dma_engine.v`, etc.)
+     - ../rtl/opencores/** (UART, GPIO, SPI, I2C, PWM core files)
+     - hazard3 core files under ../rtl/hazard3/**
+
+5) Device selection:
+   - Family: MAX 10.
+   - Specific device: 10M50DAF484C7G (DE10-Lite FPGA).
+   - Finish the wizard.
+
+6) Save the project (h3_quad_mcu.qpf / h3_quad_mcu.qsf).
+
+------------------------------------------------------------
+2. Set the top entity and basic options
+------------------------------------------------------------
+
+In Quartus:
+
+1) Ensure top-level entity:
+   - Assignments → Settings → General.
+   - Top-level entity: h3_quad_mcu_top.
+
+2) EDA and simulation:
+   - (Optional for now) Set VHDL/Verilog HDL input as needed; we’re only using Verilog RTL.
+
+3) Unused pins:
+   - Assignments → Device → Device and Pin Options… → Unused Pins:
+   - Set to: As input tri-stated with weak pull-up (or similar safe default).
+
+4) Timing:
+   - For now, assume a single 50 MHz clock from the DE10-Lite board.
+   - We will constrain this in the .sdc (optional here, but ideal for timing closure).
+
+------------------------------------------------------------
+3. Connect the board 50 MHz clock and reset
+------------------------------------------------------------
+
+Your top-level `h3_quad_mcu_top` ports:
+
+  input  wire clk;
+  input  wire rst_n;
+
+We will:
+- Map `clk` to the DE10-Lite’s 50 MHz clock pin.
+- Map `rst_n` to a push-button or a stable reset source (you can use KEY0 or an external reset line later).
+
+Use the DE10-Lite User Manual to find:
+- The FPGA pin for 50 MHz clock (commonly a dedicated CLK input).
+- An appropriate input pin for reset.
+
+In Quartus:
+- Assignments → Pin Planner.
+- For `clk`:
+  - Set Location to the 50 MHz clock pin name from the manual.
+  - Set I/O Standard to 3.3-V LVTTL.
+- For `rst_n`:
+  - Assign to a button or other signal.
+  - I/O Standard also 3.3-V LVTTL.
+  - Remember: active-low; if tied to a button, plan for the electrical polarity (debounce optional).
+
+------------------------------------------------------------
+4. Arduino header mapping: SoC signals → Arduino pins → FPGA pins
+------------------------------------------------------------
+
+Your top-level ports for I/O:
+
+- GPIO:
+  - input  wire [15:0] gpio_in;
+  - output wire [15:0] gpio_out;
+  - output wire [15:0] gpio_dir;
+
+- UART:
+  - input  wire uart_rx;
+  - output wire uart_tx;
+
+- SPI:
+  - output wire       spi_sclk;
+  - output wire       spi_mosi;
+  - input  wire       spi_miso;
+  - output wire [3:0] spi_cs_n;
+
+- I2C:
+  - inout  wire i2c_sda;
+  - output wire i2c_scl;
+
+- PWM:
+  - output wire [3:0] pwm_out;
+  - input  wire [3:0] fault_in;
+
+We will conceptually map them to Arduino header labels:
+
+1) Pick Arduino pins:
+
+Example logical mapping (you will map to the exact DE10-Lite Arduino header positions):
+
+- UART:
+  - D0 → uart_rx
+  - D1 → uart_tx
+
+- SPI:
+  - D10 → spi_cs_n[0]
+  - D11 → spi_mosi
+  - D12 → spi_miso
+  - D13 → spi_sclk
+
+- I2C:
+  - SDA → i2c_sda
+  - SCL → i2c_scl
+
+- PWM:
+  - D3  → pwm_out[0]
+  - D5  → pwm_out[1]
+  - D6  → pwm_out[2]
+  - D9  → pwm_out[3]
+
+- Remaining GPIO:
+  - D2, D4, D7, D8, D14, D15 → selected bits of gpio_in/out/dir[15:0]
+
+2) Bind to FPGA pins:
+
+Using the DE10-Lite manual, for each Arduino header pin (e.g. D0, D1, D2, …, SDA, SCL), find:
+- The FPGA pin name (e.g. PIN_AF14, etc.).
+- I/O Standard: usually 3.3-V LVTTL.
+
+Then in Quartus Pin Planner:
+- For each top-level port bit, assign:
+  - `gpio_out[x]`, `gpio_in[x]`, and `gpio_dir[x]` all share the **same FPGA pin** via tri-state logic in the top wrapper you will add (see below).
+  - `uart_rx` / `uart_tx` to their pins.
+  - `spi_*` to their pins.
+  - `i2c_*` to their pins.
+  - `pwm_out[x]` and `fault_in[x]` to their pins.
+
+IMPORTANT:
+- `gpio_in`, `gpio_out`, `gpio_dir` are logical; to connect them to actual pins, it is best to create a small **I/O wrapper** around `h3_quad_mcu_top` that instantiates I/O buffers per bit:
+  - If `gpio_dir[i]` is 1: drive pin output from `gpio_out[i]`.
+  - Else: read pin input to `gpio_in[i]`.
+
+You can do this in Quartus by:
+- Creating a new top-level wrapper, e.g. `h3_quad_mcu_fpga_top.v`, that:
+  - Instantiates `h3_quad_mcu_top`.
+  - Connects physical `inout` pins to `gpio_in/out/dir`.
+- Then set `h3_quad_mcu_fpga_top` as the top entity.
+- This keeps `h3_quad_mcu_top` board-agnostic and clean.
+
+For brevity, the logic for tri-stated GPIO pins in the wrapper follows the classic pattern:
+
+  assign gpio_pin[i] = gpio_dir[i] ? gpio_out[i] : 1'bz;
+  assign gpio_in[i]  = gpio_pin[i];
+
+(Implement this wrapper in RTL and connect its `gpio_pin[i]` to FPGA pins.)
+
+------------------------------------------------------------
+5. Add boot_rom.hex and ensure memory initialization
+------------------------------------------------------------
+
+Your `h3_ahb_boot_rom.v` uses:
+
+  initial begin
+      $readmemh("boot_rom.hex", mem);
+  end
+
+Steps:
+
+1) Copy or symlink boot_rom.hex into the Quartus RTL directory:
+
+   cd ~/h3_quad_de10lite/soc/rtl
+   ln -sf ../sw/boot_rom/boot_rom.hex .
+
+2) In Quartus:
+   - Project → Add/Remove Files in Project.
+   - Ensure `boot_rom.hex` is **added** as a file in the project.
+   - Quartus automatically uses it as a memory init file due to `$readmemh`.
+
+------------------------------------------------------------
+6. Timing constraints (basic)
+------------------------------------------------------------
+
+Create an SDC file, e.g. `h3_quad_mcu.sdc` in the Quartus project directory.
+
+Add:
+
+  create_clock -name clk50 -period 20.000 [get_ports {clk}]
+
+This defines a 50 MHz clock for timing analysis.
+
+In Quartus:
+- Assignments → Settings → TimeQuest Timing Analyzer.
+- Add `h3_quad_mcu.sdc` to the project.
+
+------------------------------------------------------------
+7. Full compile and .sof generation
+------------------------------------------------------------
+
+In Quartus:
+
+1) Compile:
+   - Processing → Start Compilation.
+   - Fix any RTL issues, missing files, or pin conflicts until compilation succeeds.
+
+2) On success:
+   - Quartus produces:
+     - h3_quad_mcu.sof (SRAM configuration bitstream).
+   - Location: `~/h3_quad_de10lite/soc/quartus/output_files/h3_quad_mcu.sof` (default).
+
+------------------------------------------------------------
+8. SRAM-only configuration via JTAG
+------------------------------------------------------------
+
+To respect your **ephemeral rule**:
+
+- We use only `.sof` + JTAG → FPGA configuration **RAM**.
+- We do not generate or program `.pof` or on-chip configuration flash.
+
+Steps:
+
+1) Connect the DE10-Lite via USB (USB-Blaster II).
+
+2) In a terminal:
+
+   cd ~/h3_quad_de10lite/soc/quartus/output_files
+   quartus_pgm -m jtag -o "p;h3_quad_mcu.sof"
+
+3) Or via GUI:
+   - Tools → Programmer.
+   - Hardware Setup: USB-Blaster.
+   - Add File: h3_quad_mcu.sof.
+   - Mode: JTAG.
+   - Check “Program/Configure”.
+   - Click “Start”.
+
+After this:
+- The FPGA is configured with your SoC.
+- Boot ROM is initialized with the UART bootloader.
+- The SoC is now running, waiting for firmware over UART.
+
+Power-cycle behavior:
+- Power off → configuration SRAM is cleared → your SoC is gone.
+- Power on again → original DE10-Lite behavior (factory) returns unless you reload the .sof.
+- No flash was programmed; system is fully **ephemeral** as required.
+
+------------------------------------------------------------
+9. Quick operational test with no firmware yet
+------------------------------------------------------------
+
+At this point, if you connect a UART adapter to the DE10-Lite’s Arduino header pins mapped to `uart_rx/uart_tx`, reset the board, you should see:
+
+- Bootloader banner: “H3-BOOT” and “LEN?” on the UART.
+
+You won’t yet send firmware (that’s Phase 9), but this confirms:
+
+- Quartus project + pin mapping are correct.
+- Boot ROM is correctly initialized.
+- SoC is alive and running on the DE10-Lite.
+
+============================================================
+END OF PHASE 8
+============================================================
 
 
