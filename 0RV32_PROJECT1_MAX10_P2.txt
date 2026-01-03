@@ -1,5 +1,4 @@
 ⚠️⚠️START WITH FIRST FILE THIS IS PART2⚠️⚠️
-
 ================================================================================
 PHASE 2A: ADD HART1–HART3 (MULTI-CORE HAZARD3 TILES ON AHB M1–M3)
 (ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
@@ -400,3 +399,254 @@ WHAT PHASE 2A GIVES YOU
   - Power-cycle → factory demo.
 
 ########END P2A########
+================================================================================
+PHASE 2B: INTER‑HART MAILBOX FOR STARTING HART1–HART3
+(ALL CONTENT IN ONE COPY‑PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Enable HART0 to explicitly start HART1–HART3 after SDRAM firmware is loaded.
+
+We add:
+- A tiny **mailbox** peripheral on Wishbone.
+- Each hart gets:
+  - START_ADDR register
+  - CMD register (GO bit)
+  - STATUS register (ACTIVE/DONE)
+- HART1–3 park in ROM until GO is asserted.
+- HART0 (or SDRAM firmware) writes GO + START_ADDR to launch them.
+
+No interrupts yet. No timers. Pure polling + WFI.
+
+================================================================================
+MEMORY MAP
+================================================================================
+
+Mailbox base: **0x1000_0400**
+
+Per‑hart region (16 bytes each):
+
+Hart h region = base + 0x10 * h
+
+Offset | Register     | Description
+-------|--------------|-----------------------------------------
+0x00   | START_ADDR   | 32‑bit address to jump to
+0x04   | CMD          | bit0=GO, bit1=CLEAR_DONE
+0x08   | STATUS       | bit0=ACTIVE, bit1=DONE
+0x0C   | reserved
+
+================================================================================
+MAILBOX WISHBONE SLAVE (RTL)
+================================================================================
+
+File: rtl/soc/hart_mailbox_wb.sv
+
+module hart_mailbox_wb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // To harts
+    output reg  [31:0] hart_start_addr [0:3],
+    output reg         hart_go         [0:3],
+    input  wire        hart_active     [0:3],
+    input  wire        hart_done       [0:3]
+);
+
+    assign wb_err_o = 1'b0;
+
+    reg [31:0] start_addr_reg [0:3];
+    reg [31:0] cmd_reg        [0:3];
+    reg [31:0] status_reg     [0:3];
+
+    integer i;
+
+    wire [1:0] hart_idx = wb_adr_i[5:4];   // 0..3
+    wire [3:0] reg_sel  = wb_adr_i[3:0];   // 0x0,0x4,0x8,...
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            for (i=0;i<4;i=i+1) begin
+                start_addr_reg[i] <= 32'h8000_0000;
+                cmd_reg[i]        <= 32'h0;
+                status_reg[i]     <= 32'h0;
+                hart_start_addr[i]<= 32'h8000_0000;
+                hart_go[i]        <= 1'b0;
+            end
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            // Update ACTIVE/DONE from harts
+            for (i=0;i<4;i=i+1) begin
+                status_reg[i][0] <= hart_active[i];
+                status_reg[i][1] <= hart_done[i];
+            end
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (reg_sel[3:2])
+                        2'b00: begin
+                            start_addr_reg[hart_idx] <= wb_dat_i;
+                            hart_start_addr[hart_idx]<= wb_dat_i;
+                        end
+                        2'b01: begin
+                            cmd_reg[hart_idx] <= wb_dat_i;
+                            hart_go[hart_idx] <= wb_dat_i[0];
+                            if (wb_dat_i[1]) status_reg[hart_idx][1] <= 1'b0;
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    case (reg_sel[3:2])
+                        2'b00: wb_dat_o <= start_addr_reg[hart_idx];
+                        2'b01: wb_dat_o <= cmd_reg[hart_idx];
+                        2'b10: wb_dat_o <= status_reg[hart_idx];
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+
+================================================================================
+TOP_SOC.SV CHANGES
+================================================================================
+
+1. Add WB slave s6 for mailbox (decode 0x1000_0400).
+2. Instantiate hart_mailbox_wb.
+3. Add hart_start_addr[], hart_go[], hart_active[], hart_done[] wires.
+4. For now, tie hart_active/done low (Phase 2C will implement real signals).
+
+Example additions:
+
+// WB signals for s6
+wire [31:0] s6_adr_o, s6_dat_o, s6_dat_i;
+wire        s6_we_o, s6_cyc_o, s6_stb_o;
+wire [3:0]  s6_sel_o;
+wire        s6_ack_i, s6_err_i;
+
+// Hart mailbox signals
+wire [31:0] hart_start_addr [0:3];
+wire        hart_go         [0:3];
+wire        hart_active     [0:3];
+wire        hart_done       [0:3];
+
+assign hart_active[0]=1'b0;
+assign hart_active[1]=1'b0;
+assign hart_active[2]=1'b0;
+assign hart_active[3]=1'b0;
+
+assign hart_done[0]=1'b0;
+assign hart_done[1]=1'b0;
+assign hart_done[2]=1'b0;
+assign hart_done[3]=1'b0;
+
+hart_mailbox_wb u_hart_mb (
+    .clk(clk), .rst(rst),
+    .wb_adr_i(s6_adr_o), .wb_dat_i(s6_dat_o), .wb_dat_o(s6_dat_i),
+    .wb_we_i(s6_we_o), .wb_sel_i(s6_sel_o),
+    .wb_cyc_i(s6_cyc_o), .wb_stb_i(s6_stb_o),
+    .wb_ack_o(s6_ack_i), .wb_err_o(s6_err_i),
+    .hart_start_addr(hart_start_addr),
+    .hart_go(hart_go),
+    .hart_active(hart_active),
+    .hart_done(hart_done)
+);
+
+================================================================================
+BOOT ROM CHANGES (SECONDARY HART ENTRY)
+================================================================================
+
+Add:
+
+static inline uint32_t h3_read_mhartid(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mhartid" : "=r"(v));
+    return v;
+}
+
+#define MBOX_BASE   0x10000400u
+#define MBOX_STRIDE 0x10u
+#define MBOX_CMD_GO (1u<<0)
+
+static volatile uint32_t *mbox_start(uint32_t h)
+{ return (uint32_t*)(MBOX_BASE + MBOX_STRIDE*h + 0x00); }
+
+static volatile uint32_t *mbox_cmd(uint32_t h)
+{ return (uint32_t*)(MBOX_BASE + MBOX_STRIDE*h + 0x04); }
+
+static void secondary_hart_entry(uint32_t hartid)
+{
+    while (1) {
+        if (*mbox_cmd(hartid) & MBOX_CMD_GO) {
+            uint32_t addr = *mbox_start(hartid);
+            *mbox_cmd(hartid) = 0; // clear GO
+            void (*entry)(void) = (void(*)(void))addr;
+            entry();
+        }
+        __asm__ volatile("wfi");
+    }
+}
+
+In _start():
+
+uint32_t hartid = h3_read_mhartid();
+if (hartid != 0)
+    secondary_hart_entry(hartid);
+
+HART0 continues into the bootloader as before.
+
+================================================================================
+SDRAM FIRMWARE (PHASE 1K) — STARTING OTHER HARTS
+================================================================================
+
+In main.c:
+
+#define H3_MBOX_BASE   0x10000400u
+#define H3_MBOX_STRIDE 0x10u
+#define H3_MBOX_CMD_GO (1u<<0)
+
+static inline volatile uint32_t *H3_MBOX_START(uint32_t h)
+{ return (uint32_t*)(H3_MBOX_BASE + H3_MBOX_STRIDE*h + 0x00); }
+
+static inline volatile uint32_t *H3_MBOX_CMD(uint32_t h)
+{ return (uint32_t*)(H3_MBOX_BASE + H3_MBOX_STRIDE*h + 0x04); }
+
+To start HART1:
+
+*H3_MBOX_START(1) = 0x80000000;
+*H3_MBOX_CMD(1)   = H3_MBOX_CMD_GO;
+
+HART1 will jump into SDRAM firmware.
+
+================================================================================
+RESULT OF PHASE 2B
+================================================================================
+
+You now have:
+
+- A **4‑hart SoC** where:
+  - HART0 boots normally.
+  - HART1–3 park safely.
+  - HART0 or SDRAM firmware can start any secondary hart at any address.
+
+This is the minimal, clean, reproducible multi‑hart bring‑up mechanism.
+########END P2B########
