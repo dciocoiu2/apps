@@ -1,0 +1,980 @@
+#######################################################################
+# STEP-BY-STEP: VexRiscv SoC (UART + SPI + I2C) + Quartus Lite on Linux
+# Target: DE10-Lite (MAX 10), ephemeral (SOF-only) RISC-V SoC
+#######################################################################
+
+# This is a single, copy-pastable script-style guide that assumes:
+# - You’re on a Linux VM (Ubuntu-like)
+# - You have sudo
+# - You’ll install Java, SBT, VexRiscv, RISC-V GCC, and Quartus Prime Lite
+# - You will generate:
+#   * A VexRiscv-based SoC core in Verilog
+#   * A simple Verilog SoC top with UART + SPI + I2C MMIO
+#   * A minimal firmware loaded into BRAM
+#   * A Quartus project for DE10-Lite, programmed via .sof only
+#
+# Adjust paths (e.g., /home/you) as needed.
+
+#######################################################################
+# 0. PREPARE LINUX VM ENVIRONMENT
+#######################################################################
+
+# Update and basic tools
+sudo apt-get update
+sudo apt-get install -y git curl build-essential
+
+#######################################################################
+# 1. INSTALL JAVA + SBT (FOR VEXRISCV / SPINALHDL GENERATION)
+#######################################################################
+
+# Java (OpenJDK 8 or later)
+sudo apt-get install -y openjdk-8-jdk
+
+# SBT repository + installation (Scala Build Tool)
+echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
+curl -sL https://keyserver.ubuntu.com/pks/lookup?op=get\&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823 | sudo apt-key add -
+sudo apt-get update
+sudo apt-get install -y sbt
+
+# Verify
+java -version
+sbt sbt-version
+
+#######################################################################
+# 2. CLONE VEXRISCV AND ADD A CUSTOM SOC GENERATOR
+#######################################################################
+
+cd ~
+git clone https://github.com/SpinalHDL/VexRiscv.git
+cd VexRiscv
+
+# Create a custom Scala generator for a simple, single-core SoC with:
+# - VexRiscv core
+# - Simple instruction & data buses (IBusSimplePlugin, DBusSimplePlugin)
+# - No MMU, no caches
+# - Reset vector at 0x00000000 (BRAM)
+#
+# This generator emits a Verilog "RiscvSocCore" (CPU + bus ports),
+# NOT the full SoC; we’ll write the SoC wrapper in Verilog below.
+
+cat > src/main/scala/vexriscv/GenRiscvSocCore.scala << 'EOF'
+package vexriscv
+
+import spinal.core._
+import vexriscv.plugin._
+import vexriscv.ip._
+
+object GenRiscvSocCore {
+  def main(args: Array[String]): Unit = {
+    val report = SpinalVerilog(new VexRiscv(
+      config = VexRiscvConfig(
+        plugins = List(
+          new IBusSimplePlugin(
+            resetVector = 0x00000000l,
+            cmdForkOnSecondStage = false,
+            prediction = STATIC,
+            compressedGen = false,
+            busLatencyMin = 1,
+            injectorStage = false,
+            catchAccessFault = true,
+            catchIllegalInstruction = true,
+            bigEndian = false,
+            rspHoldValue = false,
+            relaxedPcCalculation = false
+          ),
+          new DBusSimplePlugin(
+            catchAddressMisaligned = true,
+            catchAccessFault = true
+          ),
+          new RegFilePlugin(RegFileSync),
+          new IntAluPlugin,
+          new LightShifterPlugin,
+          new HazardSimplePlugin(
+            bypassExecute = true,
+            bypassMemory = true,
+            bypassWriteBack = true,
+            bypassWriteBackBuffer = true,
+            pessimisticUseSrc = false,
+            pessimisticWriteRegFile = false,
+            pessimisticAddressMatch = false
+          ),
+          new DecoderSimplePlugin(
+            catchIllegalInstruction = true
+          ),
+          new CSRPlugin(CSRPluginConfig.small),
+          new TimerPlugin
+        )
+      )
+    ))
+
+    println(s"Generated: ${report.toplevelName} at ${report.toplevelPath}")
+  }
+}
+EOF
+
+# Generate the Verilog core (VexRiscv.v)
+sbt "runMain vexriscv.GenRiscvSocCore"
+
+# After this, you should have a generated VexRiscv Verilog core in:
+# ./VexRiscv.v  (or in the path printed at the end of the SBT run)
+
+#######################################################################
+# 3. CREATE A WORK DIR FOR THE QUARTUS PROJECT + SOC RTL
+#######################################################################
+
+cd ~
+mkdir -p riscv_soc_de10lite/rtl
+cd riscv_soc_de10lite
+
+# Copy the generated VexRiscv core
+cp ~/VexRiscv/VexRiscv.v rtl/
+
+#######################################################################
+# 4. CREATE UART, SPI, I2C, RAM, AND SOC TOP-LEVEL (VERILOG)
+#######################################################################
+
+cd rtl
+
+# 4.1 UART Transmitter
+cat > uart_tx.v << 'EOF'
+module uart_tx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire [7:0] data_in,
+    input  wire       start,
+    output reg        busy,
+    output reg        tx
+);
+
+    localparam DIVISOR = CLK_FREQ / BAUD;
+
+    reg [15:0] clk_cnt;
+    reg [3:0]  bit_idx;
+    reg [9:0]  shift_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx        <= 1'b1;
+            busy      <= 1'b0;
+            clk_cnt   <= 0;
+            bit_idx   <= 0;
+            shift_reg <= 10'b1111111111;
+        end else begin
+            if (!busy) begin
+                if (start) begin
+                    shift_reg <= {1'b1, data_in, 1'b0};
+                    busy      <= 1'b1;
+                    clk_cnt   <= 0;
+                    bit_idx   <= 0;
+                end
+            end else begin
+                if (clk_cnt == DIVISOR-1) begin
+                    clk_cnt <= 0;
+                    tx      <= shift_reg[bit_idx];
+                    bit_idx <= bit_idx + 1;
+                    if (bit_idx == 9) begin
+                        busy <= 1'b0;
+                    end
+                end else begin
+                    clk_cnt <= clk_cnt + 1;
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+# 4.2 UART Receiver
+cat > uart_rx.v << 'EOF'
+module uart_rx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire rx,
+    output reg  [7:0] data_out,
+    output reg        data_valid
+);
+
+    localparam DIVISOR = CLK_FREQ / BAUD;
+    localparam MID     = DIVISOR / 2;
+
+    reg [15:0] clk_cnt;
+    reg [3:0]  bit_idx;
+    reg [7:0]  shift_reg;
+    reg        receiving;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            receiving  <= 1'b0;
+            clk_cnt    <= 0;
+            bit_idx    <= 0;
+            data_valid <= 1'b0;
+        end else begin
+            data_valid <= 1'b0;
+            if (!receiving) begin
+                if (!rx) begin
+                    receiving <= 1'b1;
+                    clk_cnt   <= 0;
+                    bit_idx   <= 0;
+                end
+            end else begin
+                clk_cnt <= clk_cnt + 1;
+                if (bit_idx == 0 && clk_cnt == MID) begin
+                    clk_cnt <= 0;
+                    bit_idx <= 1;
+                end else if (clk_cnt == DIVISOR) begin
+                    clk_cnt <= 0;
+                    if (bit_idx >= 1 && bit_idx <= 8) begin
+                        shift_reg[bit_idx-1] <= rx;
+                    end
+                    bit_idx <= bit_idx + 1;
+                    if (bit_idx == 9) begin
+                        receiving  <= 1'b0;
+                        data_out   <= shift_reg;
+                        data_valid <= 1'b1;
+                    end
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+# 4.3 SPI Master (mode 0)
+cat > spi_master.v << 'EOF'
+module spi_master #(
+    parameter CLK_FREQ = 50000000
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [7:0]  data_in,
+    input  wire        start,
+    input  wire [15:0] clk_div,
+    output reg  [7:0]  data_out,
+    output reg         busy,
+    output reg         done,
+    output reg         sck,
+    output reg         mosi,
+    input  wire        miso,
+    output reg         ss_n
+);
+
+    reg [15:0] div_cnt;
+    reg [3:0]  bit_idx;
+    reg [7:0]  shift_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy      <= 1'b0;
+            done      <= 1'b0;
+            sck       <= 1'b0;
+            ss_n      <= 1'b1;
+            div_cnt   <= 16'd0;
+            bit_idx   <= 4'd0;
+            mosi      <= 1'b0;
+            shift_reg <= 8'h00;
+            data_out  <= 8'h00;
+        end else begin
+            done <= 1'b0;
+            if (!busy) begin
+                if (start) begin
+                    busy      <= 1'b1;
+                    ss_n      <= 1'b0;
+                    shift_reg <= data_in;
+                    bit_idx   <= 4'd7;
+                    div_cnt   <= 16'd0;
+                    sck       <= 1'b0;
+                    mosi      <= data_in[7];
+                end
+            end else begin
+                div_cnt <= div_cnt + 1;
+                if (div_cnt == clk_div) begin
+                    div_cnt <= 16'd0;
+                    sck     <= ~sck;
+                    if (sck == 1'b0) begin
+                        mosi <= shift_reg[bit_idx];
+                    end else begin
+                        shift_reg[bit_idx] <= miso;
+                        if (bit_idx == 0) begin
+                            busy     <= 1'b0;
+                            ss_n     <= 1'b1;
+                            done     <= 1'b1;
+                            data_out <= shift_reg;
+                        end else begin
+                            bit_idx <= bit_idx - 1'b1;
+                        end
+                    end
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+# 4.4 Minimal I2C Master (single-byte, single-master, 7-bit addr)
+cat > i2c_master.v << 'EOF'
+module i2c_master (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [15:0] clk_div,
+    input  wire       start,
+    input  wire       rw,        // 0=write, 1=read
+    input  wire [6:0] addr,
+    input  wire [7:0] data_in,
+    output reg  [7:0] data_out,
+    output reg        busy,
+    output reg        ack_error,
+    inout  wire       sda,
+    inout  wire       scl
+);
+    reg sda_oe;
+    reg scl_oe;
+
+    assign sda = sda_oe ? 1'b0 : 1'bz;
+    assign scl = scl_oe ? 1'b0 : 1'bz;
+
+    wire sda_in = sda;
+    wire scl_in = scl;
+
+    reg [15:0] div_cnt;
+    reg [3:0]  bit_cnt;
+    reg [3:0]  state;
+    reg [7:0]  shift_reg;
+    reg        rw_reg;
+
+    localparam ST_IDLE    = 4'd0;
+    localparam ST_START   = 4'd1;
+    localparam ST_ADDR    = 4'd2;
+    localparam ST_ADDR_ACK= 4'd3;
+    localparam ST_DATA    = 4'd4;
+    localparam ST_DATA_ACK= 4'd5;
+    localparam ST_STOP1   = 4'd6;
+    localparam ST_STOP2   = 4'd7;
+
+    localparam PH_LOW  = 2'd0;
+    localparam PH_HIGH = 2'd1;
+
+    reg [1:0] phase;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy      <= 1'b0;
+            ack_error <= 1'b0;
+            div_cnt   <= 16'd0;
+            state     <= ST_IDLE;
+            sda_oe    <= 1'b0;
+            scl_oe    <= 1'b0;
+            phase     <= PH_LOW;
+            bit_cnt   <= 4'd0;
+            shift_reg <= 8'h00;
+            data_out  <= 8'h00;
+        end else begin
+            if (!busy) begin
+                if (start) begin
+                    busy      <= 1'b1;
+                    ack_error <= 1'b0;
+                    rw_reg    <= rw;
+                    shift_reg <= {addr, rw};
+                    bit_cnt   <= 4'd7;
+                    sda_oe    <= 1'b1;
+                    scl_oe    <= 1'b0;
+                    state     <= ST_START;
+                    div_cnt   <= 16'd0;
+                    phase     <= PH_LOW;
+                end
+            end else begin
+                div_cnt <= div_cnt + 1;
+                if (div_cnt >= clk_div) begin
+                    div_cnt <= 16'd0;
+                    case (state)
+                        ST_START: begin
+                            scl_oe <= 1'b1;
+                            state  <= ST_ADDR;
+                            phase  <= PH_LOW;
+                        end
+                        ST_ADDR: begin
+                            case (phase)
+                                PH_LOW: begin
+                                    sda_oe <= ~shift_reg[bit_cnt];
+                                    phase  <= PH_HIGH;
+                                end
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    scl_oe <= 1'b1;
+                                    if (bit_cnt == 0) begin
+                                        sda_oe <= 1'b0;
+                                        state  <= ST_ADDR_ACK;
+                                    end else begin
+                                        bit_cnt <= bit_cnt - 1'b1;
+                                    end
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_ADDR_ACK: begin
+                            case (phase)
+                                PH_LOW:  phase <= PH_HIGH;
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    if (sda_in) ack_error <= 1'b1;
+                                    scl_oe <= 1'b1;
+                                    if (ack_error) begin
+                                        state <= ST_STOP1;
+                                    end else begin
+                                        bit_cnt   <= 4'd7;
+                                        shift_reg <= data_in;
+                                        state     <= ST_DATA;
+                                    end
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_DATA: begin
+                            if (!rw_reg) begin
+                                case (phase)
+                                    PH_LOW: begin
+                                        sda_oe <= ~shift_reg[bit_cnt];
+                                        phase  <= PH_HIGH;
+                                    end
+                                    PH_HIGH: begin
+                                        scl_oe <= 1'b0;
+                                        phase  <= 2'd2;
+                                    end
+                                    2'd2: begin
+                                        scl_oe <= 1'b1;
+                                        if (bit_cnt == 0) begin
+                                            sda_oe <= 1'b0;
+                                            state  <= ST_DATA_ACK;
+                                        end else begin
+                                            bit_cnt <= bit_cnt - 1'b1;
+                                        end
+                                        phase <= PH_LOW;
+                                    end
+                                endcase
+                            end else begin
+                                case (phase)
+                                    PH_LOW: begin
+                                        sda_oe <= 1'b0;
+                                        phase  <= PH_HIGH;
+                                    end
+                                    PH_HIGH: begin
+                                        scl_oe <= 1'b0;
+                                        phase  <= 2'd2;
+                                    end
+                                    2'd2: begin
+                                        shift_reg[bit_cnt] <= sda_in;
+                                        scl_oe <= 1'b1;
+                                        if (bit_cnt == 0) begin
+                                            state <= ST_DATA_ACK;
+                                        end else begin
+                                            bit_cnt <= bit_cnt - 1'b1;
+                                        end
+                                        phase <= PH_LOW;
+                                    end
+                                endcase
+                            end
+                        end
+                        ST_DATA_ACK: begin
+                            case (phase)
+                                PH_LOW: begin
+                                    if (!rw_reg)
+                                        sda_oe <= 1'b0;
+                                    else
+                                        sda_oe <= 1'b0;
+                                    phase <= PH_HIGH;
+                                end
+                                PH_HIGH: begin
+                                    scl_oe <= 1'b0;
+                                    phase  <= 2'd2;
+                                end
+                                2'd2: begin
+                                    if (!rw_reg && sda_in) ack_error <= 1'b1;
+                                    scl_oe <= 1'b1;
+                                    if (rw_reg) data_out <= shift_reg;
+                                    state <= ST_STOP1;
+                                    phase <= PH_LOW;
+                                end
+                            endcase
+                        end
+                        ST_STOP1: begin
+                            sda_oe <= 1'b1;
+                            scl_oe <= 1'b1;
+                            state  <= ST_STOP2;
+                        end
+                        ST_STOP2: begin
+                            scl_oe <= 1'b0;
+                            sda_oe <= 1'b0;
+                            busy   <= 1'b0;
+                            state  <= ST_IDLE;
+                        end
+                        default: state <= ST_IDLE;
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+EOF
+
+# 4.5 Simple BRAM (with firmware init)
+cat > bram.v << 'EOF'
+module bram #(
+    parameter WORDS = 16384
+)(
+    input  wire        clk,
+    input  wire [31:0] addr,
+    input  wire [31:0] wdata,
+    input  wire [3:0]  wstrb,
+    output reg  [31:0] rdata
+);
+    reg [31:0] mem [0:WORDS-1];
+
+    initial begin
+        $readmemh("firmware.hex", mem);
+    end
+
+    always @(posedge clk) begin
+        if (|wstrb) begin
+            if (wstrb[0]) mem[addr[17:2]][7:0]   <= wdata[7:0];
+            if (wstrb[1]) mem[addr[17:2]][15:8]  <= wdata[15:8];
+            if (wstrb[2]) mem[addr[17:2]][23:16] <= wdata[23:16];
+            if (wstrb[3]) mem[addr[17:2]][31:24] <= wdata[31:24];
+        end
+        rdata <= mem[addr[17:2]];
+    end
+endmodule
+EOF
+
+# 4.6 SoC top-level (RISC-V core + RAM + UART + SPI + I2C)
+cat > riscv_soc_top.v << 'EOF'
+module riscv_soc_top #(
+    parameter CLK_FREQ_HZ = 50000000
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire uart_rx,
+    output wire uart_tx,
+    output wire spi_sck,
+    output wire spi_mosi,
+    input  wire spi_miso,
+    output wire spi_ss_n,
+    inout  wire i2c_sda,
+    inout  wire i2c_scl
+);
+
+    // VexRiscv core signals (IBus + DBus from IBusSimplePlugin / DBusSimplePlugin)
+    wire        iBus_cmd_valid;
+    wire        iBus_cmd_ready;
+    wire [31:0] iBus_cmd_payload_pc;
+    wire        iBus_rsp_valid;
+    wire [31:0] iBus_rsp_payload_inst;
+
+    wire        dBus_cmd_valid;
+    wire        dBus_cmd_ready;
+    wire        dBus_cmd_payload_wr;
+    wire [31:0] dBus_cmd_payload_address;
+    wire [31:0] dBus_cmd_payload_data;
+    wire [1:0]  dBus_cmd_payload_size;
+    wire        dBus_rsp_ready;
+    wire        dBus_rsp_error;
+    wire [31:0] dBus_rsp_data;
+
+    VexRiscv cpu (
+        .clk(clk),
+        .reset(!rst_n),
+        .iBus_cmd_valid(iBus_cmd_valid),
+        .iBus_cmd_ready(iBus_cmd_ready),
+        .iBus_cmd_payload_pc(iBus_cmd_payload_pc),
+        .iBus_rsp_valid(iBus_rsp_valid),
+        .iBus_rsp_payload_inst(iBus_rsp_payload_inst),
+        .dBus_cmd_valid(dBus_cmd_valid),
+        .dBus_cmd_ready(dBus_cmd_ready),
+        .dBus_cmd_payload_wr(dBus_cmd_payload_wr),
+        .dBus_cmd_payload_address(dBus_cmd_payload_address),
+        .dBus_cmd_payload_data(dBus_cmd_payload_data),
+        .dBus_cmd_payload_size(dBus_cmd_payload_size),
+        .dBus_rsp_ready(dBus_rsp_ready),
+        .dBus_rsp_error(dBus_rsp_error),
+        .dBus_rsp_data(dBus_rsp_data)
+    );
+
+    // Instruction bus -> BRAM (read-only)
+    wire [31:0] imem_rdata;
+    assign iBus_cmd_ready = 1'b1;
+    bram #(
+        .WORDS(16384)
+    ) imem (
+        .clk   (clk),
+        .addr  (iBus_cmd_payload_pc),
+        .wdata (32'h0),
+        .wstrb (4'b0000),
+        .rdata (imem_rdata)
+    );
+    assign iBus_rsp_valid          = iBus_cmd_valid;
+    assign iBus_rsp_payload_inst   = imem_rdata;
+
+    // Data bus -> same BRAM + peripherals
+    localparam UART_BASE = 32'h4000_0000;
+    localparam SPI_BASE  = 32'h4000_0100;
+    localparam I2C_BASE  = 32'h4000_0200;
+
+    reg        dsel_ram;
+    reg        dsel_uart;
+    reg        dsel_spi;
+    reg        dsel_i2c;
+
+    always @(*) begin
+        dsel_ram  = 1'b0;
+        dsel_uart = 1'b0;
+        dsel_spi  = 1'b0;
+        dsel_i2c  = 1'b0;
+        if (dBus_cmd_valid) begin
+            if (dBus_cmd_payload_address[31:16] == 16'h0000) dsel_ram  = 1'b1;
+            else if ((dBus_cmd_payload_address & 32'hFFFF_FF00) == UART_BASE) dsel_uart = 1'b1;
+            else if ((dBus_cmd_payload_address & 32'hFFFF_FF00) == SPI_BASE)  dsel_spi  = 1'b1;
+            else if ((dBus_cmd_payload_address & 32'hFFFF_FF00) == I2C_BASE)  dsel_i2c  = 1'b1;
+        end
+    end
+
+    wire [31:0] d_ram_rdata;
+    reg         d_ram_ready;
+    bram #(
+        .WORDS(16384)
+    ) dmem (
+        .clk   (clk),
+        .addr  (dBus_cmd_payload_address),
+        .wdata (dBus_cmd_payload_data),
+        .wstrb (dsel_ram ? (dBus_cmd_payload_wr ? (4'b1111 >> (3 - dBus_cmd_payload_size)) : 4'b0000) : 4'b0000),
+        .rdata (d_ram_rdata)
+    );
+
+    // UART
+    reg  [7:0]  uart_tx_data;
+    reg         uart_tx_start;
+    wire        uart_tx_busy;
+    wire [7:0]  uart_rx_data;
+    wire        uart_rx_valid;
+
+    uart_tx #(
+        .CLK_FREQ(CLK_FREQ_HZ),
+        .BAUD    (115200)
+    ) u_tx (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .data_in(uart_tx_data),
+        .start  (uart_tx_start),
+        .busy   (uart_tx_busy),
+        .tx     (uart_tx)
+    );
+
+    uart_rx #(
+        .CLK_FREQ(CLK_FREQ_HZ),
+        .BAUD    (115200)
+    ) u_rx (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .rx        (uart_rx),
+        .data_out  (uart_rx_data),
+        .data_valid(uart_rx_valid)
+    );
+
+    // SPI
+    reg  [15:0] spi_divisor;
+    reg  [7:0]  spi_tx_data;
+    reg         spi_start;
+    wire [7:0]  spi_rx_data;
+    wire        spi_busy;
+    wire        spi_done;
+
+    spi_master #(
+        .CLK_FREQ(CLK_FREQ_HZ)
+    ) u_spi (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .data_in  (spi_tx_data),
+        .start    (spi_start),
+        .clk_div  (spi_divisor),
+        .data_out (spi_rx_data),
+        .busy     (spi_busy),
+        .done     (spi_done),
+        .sck      (spi_sck),
+        .mosi     (spi_mosi),
+        .miso     (spi_miso),
+        .ss_n     (spi_ss_n)
+    );
+
+    // I2C
+    reg  [15:0] i2c_divisor;
+    reg  [6:0]  i2c_addr;
+    reg  [7:0]  i2c_tx_data;
+    reg         i2c_start;
+    reg         i2c_rw;
+    wire [7:0]  i2c_rx_data;
+    wire        i2c_busy;
+    wire        i2c_ack_error;
+
+    i2c_master u_i2c (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .clk_div   (i2c_divisor),
+        .start     (i2c_start),
+        .rw        (i2c_rw),
+        .addr      (i2c_addr),
+        .data_in   (i2c_tx_data),
+        .data_out  (i2c_rx_data),
+        .busy      (i2c_busy),
+        .ack_error (i2c_ack_error),
+        .sda       (i2c_sda),
+        .scl       (i2c_scl)
+    );
+
+    reg [31:0] periph_rdata;
+    reg        periph_ready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            periph_ready  <= 1'b0;
+            uart_tx_start <= 1'b0;
+            spi_start     <= 1'b0;
+            i2c_start     <= 1'b0;
+            spi_divisor   <= 16'd50;
+            i2c_divisor   <= 16'd250;
+            i2c_addr      <= 7'h00;
+            i2c_tx_data   <= 8'h00;
+            i2c_rw        <= 1'b0;
+            uart_tx_data  <= 8'h00;
+        end else begin
+            periph_ready  <= 1'b0;
+            uart_tx_start <= 1'b0;
+            spi_start     <= 1'b0;
+            i2c_start     <= 1'b0;
+
+            if (dBus_cmd_valid && !dsel_ram) begin
+                periph_ready <= 1'b1;
+                if (dBus_cmd_payload_wr) begin
+                    case (dBus_cmd_payload_address & 32'hFFFF_FF00)
+                        UART_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: begin
+                                    uart_tx_data  <= dBus_cmd_payload_data[7:0];
+                                    uart_tx_start <= 1'b1;
+                                end
+                                default: ;
+                            endcase
+                        end
+                        SPI_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: spi_divisor <= dBus_cmd_payload_data[15:0];
+                                8'h04: begin
+                                    spi_tx_data <= dBus_cmd_payload_data[7:0];
+                                    spi_start   <= 1'b1;
+                                end
+                                default: ;
+                            endcase
+                        end
+                        I2C_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: i2c_divisor <= dBus_cmd_payload_data[15:0];
+                                8'h04: i2c_addr    <= dBus_cmd_payload_data[6:0];
+                                8'h08: begin
+                                    i2c_tx_data <= dBus_cmd_payload_data[7:0];
+                                    i2c_rw      <= dBus_cmd_payload_data[8];
+                                    i2c_start   <= 1'b1;
+                                end
+                                default: ;
+                            endcase
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    case (dBus_cmd_payload_address & 32'hFFFF_FF00)
+                        UART_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: periph_rdata <= {24'h0, uart_rx_data};
+                                8'h04: periph_rdata <= {30'h0, uart_rx_valid, uart_tx_busy};
+                                default: periph_rdata <= 32'h0;
+                            endcase
+                        end
+                        SPI_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: periph_rdata <= {16'h0, spi_divisor};
+                                8'h04: periph_rdata <= {24'h0, spi_tx_data};
+                                8'h08: periph_rdata <= {24'h0, spi_rx_data};
+                                8'h0C: periph_rdata <= {30'h0, spi_busy, spi_done};
+                                default: periph_rdata <= 32'h0;
+                            endcase
+                        end
+                        I2C_BASE: begin
+                            case (dBus_cmd_payload_address[7:0])
+                                8'h00: periph_rdata <= {16'h0, i2c_divisor};
+                                8'h04: periph_rdata <= {25'h0, i2c_addr};
+                                8'h08: periph_rdata <= {24'h0, i2c_tx_data};
+                                8'h0C: periph_rdata <= {29'h0, i2c_ack_error, i2c_busy, i2c_rw};
+                                8'h10: periph_rdata <= {24'h0, i2c_rx_data};
+                                default: periph_rdata <= 32'h0;
+                            endcase
+                        end
+                        default: periph_rdata <= 32'h0;
+                    endcase
+                end
+            end
+        end
+    end
+
+    assign dBus_rsp_error = 1'b0;
+
+    assign dBus_rsp_data  = dsel_ram ? d_ram_rdata : periph_rdata;
+    assign dBus_cmd_ready = 1'b1;
+    assign dBus_rsp_ready = dBus_cmd_valid && (dsel_ram || periph_ready);
+
+endmodule
+EOF
+
+#######################################################################
+# 5. BUILD MINIMAL RISC-V FIRMWARE AND CONVERT TO HEX
+#######################################################################
+
+cd ..
+
+sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+
+mkdir -p fw
+cd fw
+
+cat > link.ld << 'EOF'
+ENTRY(_start)
+SECTIONS
+{
+  . = 0x00000000;
+  .text : {
+    *(.text*)
+    *(.rodata*)
+  }
+  .data : {
+    *(.data*)
+    *(.sdata*)
+  }
+  .bss : {
+    *(.bss*)
+    *(.sbss*)
+    *(COMMON)
+  }
+}
+EOF
+
+cat > main.c << 'EOF'
+#define UART_BASE 0x40000000
+#define SPI_BASE  0x40000100
+#define I2C_BASE  0x40000200
+
+#define REG32(addr) (*(volatile unsigned int *)(addr))
+
+void uart_putc(char c) {
+    REG32(UART_BASE + 0x00) = (unsigned int)c;
+}
+
+void uart_puts(const char *s) {
+    while (*s) uart_putc(*s++);
+}
+
+static void delay(volatile unsigned int cnt) {
+    while (cnt--) __asm__ volatile("nop");
+}
+
+int main(void) {
+    uart_puts("Hello from VexRiscv SoC!\n");
+
+    while (1) {
+        uart_puts("Loop...\n");
+        delay(5000000);
+    }
+    return 0;
+}
+
+void _start(void) {
+    main();
+    while (1) {}
+}
+EOF
+
+riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -Os \
+    -T link.ld main.c -o firmware.elf
+
+riscv64-unknown-elf-objcopy -O verilog firmware.elf firmware.hex
+
+cd ..
+
+cp fw/firmware.hex rtl/
+
+#######################################################################
+# 6. INSTALL QUARTUS PRIME LITE (MANUAL STEP)
+#######################################################################
+
+# Download Quartus Prime Lite for Linux (Intel FPGA) from Intel’s website,
+# run the installer, and install it under e.g. /opt/intelFPGA_lite/23.x/
+# Then source the environment or add quartus to PATH.
+
+# Example (if installed in /opt/intelFPGA_lite/23.1/quartus):
+# export PATH=/opt/intelFPGA_lite/23.1/quartus/bin:$PATH
+
+#######################################################################
+# 7. CREATE QUARTUS PROJECT FOR DE10-LITE AND ADD RTL
+#######################################################################
+
+cd ~/riscv_soc_de10lite
+quartus_sh --version  # verify Quartus is on PATH
+
+# You can create the project via GUI, but here’s the minimal CLI-style:
+mkdir -p quartus
+cd quartus
+
+quartus_sh --prepare riscv_soc_de10lite -t
+# If that doesn't work, manually:
+#  - Open Quartus GUI
+#  - New Project Wizard -> Name: riscv_soc_de10lite
+#  - Top-level entity: riscv_soc_top
+#  - Device: MAX 10 device used on DE10-Lite (e.g., 10M50DAF484C7G)
+#  - Add files from ../rtl: VexRiscv.v, riscv_soc_top.v, bram.v, uart_tx.v,
+#    uart_rx.v, spi_master.v, i2c_master.v
+#  - Set riscv_soc_top as top-level
+
+# In the GUI:
+#  - Assign clock pin to the 50 MHz oscillator (per DE10-Lite manual)
+#  - Assign uart_rx/uart_tx, spi pins, i2c_sda/i2c_scl as you like
+#  - Use IO standard 3.3V LVCMOS/LVTTL
+
+# Compile the project from GUI or:
+# quartus_sh --flow compile riscv_soc_de10lite
+
+#######################################################################
+# 8. PROGRAM FPGA VOLATILELY (.SOF ONLY)
+#######################################################################
+
+# After successful compile, you’ll get riscv_soc_de10lite.sof.
+# Use Quartus Programmer:
+
+# 1. Open Quartus Programmer (GUI).
+# 2. Hardware Setup -> USB-Blaster.
+# 3. Add File -> select riscv_soc_de10lite.sof.
+# 4. Ensure only "Program/Configure" is checked for the FPGA device.
+# 5. Do NOT add any configuration flash device or .pof.
+# 6. Click Start.
+
+# The VexRiscv SoC will run your firmware from BRAM.
+# On power-cycle, the FPGA reverts to whatever is stored in config flash.
+# Your SoC + firmware is ephemeral and only lives in SRAM.
+
+#######################################################################
+# DONE
+#######################################################################
