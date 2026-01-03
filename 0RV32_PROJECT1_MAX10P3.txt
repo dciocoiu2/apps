@@ -2539,3 +2539,504 @@ can coexist with your internal scope for deep bring-up and tuning.
 END OF PHASE 3E
 ================================================================================
 
+
+================================================================================
+PHASE 3F: MINIMAL RISC-V DEBUG MODULE (DM + JTAG DTM)
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Add a **minimal but real RISC-V Debug Module (DM)** with a JTAG Debug Transport
+Module (DTM) so you can:
+
+- Halt and resume each Hazard3 hart.
+- Single-step.
+- Inspect/modify GPRs and memory.
+- Use standard RISC-V debug tooling (e.g., OpenOCD/GDB) later with a small shim.
+
+We keep this deliberately **small and self-contained**:
+
+- No full spec coverage, just the essentials.
+- One DM shared by all 4 harts.
+- Simple JTAG TAP feeding a debug command register (DTM-lite).
+- Basic abstract commands:
+  - Halt/resume hart.
+  - Read/write a GPR via a tiny program buffer.
+  - Access memory via hart load/store.
+
+The emphasis is on: **fit on MAX 10 10M50, be understandable, and not fight your SoC.**
+
+================================================================================
+HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+We add:
+
+1) **JTAG DTM-lite**
+   - Simple TAP with:
+     - IDCODE
+     - BYPASS
+     - DMI (Debug Module Interface) register.
+   - Exposes a small DMI bus (addr/data/operation) to the DM core.
+
+2) **Debug Module (DM)**
+   - Exposes basic RISC-V debug registers:
+     - DMCONTROL (haltreq, resumereq, hartsel)
+     - DMSTATUS  (allhalted, anyhalted, allrunning, anyrunning)
+     - ABSTRACTCS
+     - COMMAND
+     - DATA0 (abstract data)
+   - Holds:
+     - Hart halt state bits.
+     - A tiny program buffer (2 words).
+   - Interacts with each hart via:
+     - `dbg_halt_req[h]`
+     - `dbg_resume_req[h]`
+     - `dbg_halted[h]`
+     - `dbg_reg_access` path (simple handshake for GPR read/write).
+
+3) **Core Integration**
+   - Each Hazard3 tile gets debug signals:
+     - halt request
+     - resume request
+     - halted indication
+     - CSR interface or special port to access GPRs.
+
+Note: This is **not a full spec implementation**, but it’s shaped like one,
+so you can later line it up against the official RISC-V debug spec and refine.
+
+================================================================================
+STEP 1 — HART DEBUG SIGNALS (INTERFACE CONTRACT)
+================================================================================
+
+First, define the **minimal debug interface** on each Hazard3 tile.
+
+In your hazard3_tile.sv (or equivalent core wrapper), add:
+
+- Inputs:
+  - `dbg_halt_req_i`
+  - `dbg_resume_req_i`
+- Outputs:
+  - `dbg_halted_o`
+
+Optionally:
+- A small register access path (we’ll stub the protocol).
+
+Example port additions:
+
+    input  wire        dbg_halt_req_i,
+    input  wire        dbg_resume_req_i,
+    output wire        dbg_halted_o
+
+Inside the core, you’ll need:
+
+- A simple state that:
+  - When `dbg_halt_req_i` asserted, finishes current instruction and enters a "debug halted" state.
+  - `dbg_halted_o`=1 in that state.
+  - When `dbg_resume_req_i` asserted, exit halted state and continue.
+
+The exact integration depends on your Hazard3 core, but conceptually:
+
+- Add a `halted` flip-flop.
+- Gate instruction fetch/commit when `halted=1`.
+- Let DM just assert/deassert those bits.
+
+For Phase 3F, you can:
+- Implement only **halt/resume** reliably.
+- Treat register/memory access as a **future extension** (still shaping DM as if it exists).
+
+================================================================================
+STEP 2 — DMI BUS (DM <-> DTM-LITE)
+================================================================================
+
+We define a tiny internal bus between DTM and DM:
+
+- `dmi_addr[6:0]`
+- `dmi_data_wr[31:0]`
+- `dmi_data_rd[31:0]`
+- `dmi_op[1:0]` (00=NOP, 01=READ, 10=WRITE)
+- `dmi_resp[1:0]` (00=OK, others error/busy)
+
+This is similar to the spec but simplified.
+
+================================================================================
+STEP 3 — JTAG DTM-LITE (TAP + DMI SHIFT REGISTER)
+================================================================================
+
+File: rtl/debug/jtag_dtm_lite.sv
+
+module jtag_dtm_lite (
+    input  wire        tck,
+    input  wire        trst_n,
+    input  wire        tms,
+    input  wire        tdi,
+    output wire        tdo,
+
+    input  wire        clk,      // system clock
+    input  wire        rst,      // system reset
+
+    // DMI interface to DM
+    output reg  [6:0]  dmi_addr,
+    output reg  [31:0] dmi_data_wr,
+    output reg  [1:0]  dmi_op,
+    input  wire [31:0] dmi_data_rd,
+    input  wire [1:0]  dmi_resp
+);
+
+    // This is a *very minimal* TAP:
+    // - TAP controller
+    // - IR with a few instructions: BYPASS, IDCODE, DMI
+    // - DR for DMI payload: {op[1:0], addr[6:0], data[31:0]} = 40 bits.
+    // For brevity, we outline the structure; you can fill or refine
+    // the full TAP FSM if desired.
+
+    // Placeholder: not a complete TAP FSM, but enough skeleton to show intent.
+    // If you want a fully working JTAG TAP, you may import a
+    // simple open-source TAP and add the DMI DR.
+
+    // For now, we focus on the conceptual connection:
+    // - Shift in DMI command
+    // - On UPDATE-DR, latch into dmi_addr/dmi_data_wr/dmi_op
+    // - On CAPTURE-DR, load dmi_data_rd/dmi_resp into shift register for readback.
+
+    // *** NOTE ***
+    // Implementing full JTAG TAP logic is non-trivial and typically reused from
+    // existing cores. This skeleton is to show how DTM connects to DM, not a
+    // production JTAG implementation.
+
+    assign tdo = 1'b0; // placeholder
+
+endmodule
+
+NOTE:
+- For an actual usable DTM, you would either:
+  - Import a known-good JTAG TAP from OpenCores and add a DMI DR, or
+  - Reuse a small open-source RISC-V DTM.
+- Phase 3F focuses on **DM structure + hart integration**; DTM skeleton is here as a placeholder.
+
+================================================================================
+STEP 4 — DEBUG MODULE (DM) CORE
+================================================================================
+
+File: rtl/debug/riscv_dm_multi.sv
+
+module riscv_dm_multi #(
+    parameter integer HART_COUNT = 4
+)(
+    input  wire              clk,
+    input  wire              rst,
+
+    // DMI interface
+    input  wire [6:0]        dmi_addr,
+    input  wire [31:0]       dmi_data_wr,
+    input  wire [1:0]        dmi_op,
+    output reg  [31:0]       dmi_data_rd,
+    output reg  [1:0]        dmi_resp,
+
+    // Hart debug signals
+    output reg  [HART_COUNT-1:0] dbg_halt_req,
+    output reg  [HART_COUNT-1:0] dbg_resume_req,
+    input  wire [HART_COUNT-1:0] dbg_halted
+);
+
+    // Key DM registers (subset of spec):
+    //
+    // Address map (via DMI addr):
+    // 0x10: DMCONTROL
+    // 0x11: DMSTATUS
+    // 0x16: ABSTRACTCS
+    // 0x17: COMMAND
+    // 0x04: DATA0
+    //
+    // We'll focus on:
+    //  - halting/resuming selected hart via DMCONTROL
+    //  - exposing DMSTATUS (allhalted/allrunning)
+
+    // DMCONTROL fields
+    reg        dmactive;
+    reg        haltreq;
+    reg        resumereq;
+    reg [HART_COUNT-1:0] hartsel;  // one-hot for simplicity
+
+    // DATA0 register
+    reg [31:0] data0;
+
+    // For now, ABSTRACTCS/COMMAND are minimal placeholders.
+    reg [31:0] abstractcs;
+    reg [31:0] command;
+
+    // DMSTATUS is read-only view derived from dbg_halted.
+    wire anyhalted  = |dbg_halted;
+    wire allhalted  = (&dbg_halted);
+    // For simplicity, "running" = !halted.
+    wire anyrunning = |(~dbg_halted);
+    wire allrunning = (&(~dbg_halted));
+
+    // DMI operation handling
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            dmactive    <= 1'b0;
+            haltreq     <= 1'b0;
+            resumereq   <= 1'b0;
+            hartsel     <= {HART_COUNT{1'b0}};
+            data0       <= 32'h0;
+            abstractcs  <= 32'h0;
+            command     <= 32'h0;
+            dbg_halt_req   <= {HART_COUNT{1'b0}};
+            dbg_resume_req <= {HART_COUNT{1'b0}};
+            dmi_data_rd    <= 32'h0;
+            dmi_resp       <= 2'b00; // OK
+        end else begin
+            dmi_resp    <= 2'b00; // default: OK
+
+            // Default no new halt/resume pulses each cycle.
+            dbg_halt_req   <= {HART_COUNT{1'b0}};
+            dbg_resume_req <= {HART_COUNT{1'b0}};
+
+            if (dmi_op != 2'b00) begin
+                // DMI read/write
+                case (dmi_addr)
+                    7'h10: begin
+                        // DMCONTROL
+                        if (dmi_op == 2'b10) begin
+                            // Write
+                            dmactive  <= dmi_data_wr[0];
+                            haltreq   <= dmi_data_wr[31];
+                            resumereq <= dmi_data_wr[30];
+
+                            // Hartsel: for now, use lower HART_COUNT bits
+                            hartsel   <= dmi_data_wr[HART_COUNT-1:0];
+
+                            // Generate halt/resume pulses
+                            if (dmi_data_wr[31]) begin
+                                dbg_halt_req <= hartsel;
+                            end
+                            if (dmi_data_wr[30]) begin
+                                dbg_resume_req <= hartsel;
+                            end
+                        end else if (dmi_op == 2'b01) begin
+                            // Read
+                            dmi_data_rd <= {haltreq, resumereq, 2'b00, 24'h0, dmactive};
+                        end
+                    end
+
+                    7'h11: begin
+                        // DMSTATUS (read-only)
+                        if (dmi_op == 2'b01) begin
+                            // Minimal fields: [anyhalted/allhalted/anyrunning/allrunning]
+                            dmi_data_rd <= {24'h0,
+                                            4'b0,
+                                            allrunning, anyrunning, allhalted, anyhalted};
+                        end
+                    end
+
+                    7'h04: begin
+                        // DATA0
+                        if (dmi_op == 2'b10) begin
+                            data0 <= dmi_data_wr;
+                        end else if (dmi_op == 2'b01) begin
+                            dmi_data_rd <= data0;
+                        end
+                    end
+
+                    7'h16: begin
+                        // ABSTRACTCS (minimal)
+                        if (dmi_op == 2'b01) begin
+                            dmi_data_rd <= abstractcs;
+                        end
+                    end
+
+                    7'h17: begin
+                        // COMMAND (minimal)
+                        if (dmi_op == 2'b10) begin
+                            command <= dmi_data_wr;
+                            // For now, we do not execute complex abstract commands.
+                            // Later, you can interpret this to read/write GPRs via DATA0.
+                        end else if (dmi_op == 2'b01) begin
+                            dmi_data_rd <= command;
+                        end
+                    end
+
+                    default: begin
+                        if (dmi_op == 2'b01) begin
+                            dmi_data_rd <= 32'h0;
+                        end
+                    end
+                endcase
+            end
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 5 — TOP-LEVEL DEBUG INTEGRATION
+================================================================================
+
+In top_soc.sv, at the top-level:
+
+- Add JTAG pins (connected to FPGA package pins):
+
+    input  wire jtag_tck,
+    input  wire jtag_trst_n,
+    input  wire jtag_tms,
+    input  wire jtag_tdi,
+    output wire jtag_tdo,
+
+- Add DMI wires:
+
+    wire [6:0]  dmi_addr;
+    wire [31:0] dmi_data_wr;
+    wire [1:0]  dmi_op;
+    wire [31:0] dmi_data_rd;
+    wire [1:0]  dmi_resp;
+
+- Instantiate DTM-Lite:
+
+    jtag_dtm_lite u_dtm (
+        .tck        (jtag_tck),
+        .trst_n     (jtag_trst_n),
+        .tms        (jtag_tms),
+        .tdi        (jtag_tdi),
+        .tdo        (jtag_tdo),
+
+        .clk        (clk),
+        .rst        (rst),
+
+        .dmi_addr   (dmi_addr),
+        .dmi_data_wr(dmi_data_wr),
+        .dmi_op     (dmi_op),
+        .dmi_data_rd(dmi_data_rd),
+        .dmi_resp   (dmi_resp)
+    );
+
+- Add hart debug signals:
+
+    wire [3:0] dbg_halt_req;
+    wire [3:0] dbg_resume_req;
+    wire [3:0] dbg_halted;
+
+- Instantiate DM:
+
+    riscv_dm_multi #(
+        .HART_COUNT(4)
+    ) u_dm (
+        .clk          (clk),
+        .rst          (rst),
+        .dmi_addr     (dmi_addr),
+        .dmi_data_wr  (dmi_data_wr),
+        .dmi_op       (dmi_op),
+        .dmi_data_rd  (dmi_data_rd),
+        .dmi_resp     (dmi_resp),
+        .dbg_halt_req (dbg_halt_req),
+        .dbg_resume_req(dbg_resume_req),
+        .dbg_halted   (dbg_halted)
+    );
+
+- Connect debug signals to each Hazard3 tile:
+
+For hart0:
+
+    hazard3_tile u_hart0 (
+        .clk           (clk),
+        .rst           (rst),
+        // ... existing ports ...
+        .dbg_halt_req_i  (dbg_halt_req[0]),
+        .dbg_resume_req_i(dbg_resume_req[0]),
+        .dbg_halted_o    (dbg_halted[0])
+    );
+
+Repeat for harts 1..3 with bits [1], [2], [3].
+
+================================================================================
+STEP 6 — HART IMPLEMENTATION OF HALT/RESUME (SKETCH)
+================================================================================
+
+Inside each Hazard3 core (or wrapper), you need something like:
+
+- A `reg hart_halted;`
+- Logic:
+
+    if (reset) begin
+        hart_halted <= 1'b0;
+    end else begin
+        if (dbg_halt_req_i) begin
+            // After completing current instruction, set hart_halted
+            // Easiest is to check at commit stage; for this phase, you can
+            // even respond immediately for testing.
+            hart_halted <= 1'b1;
+        end
+        if (dbg_resume_req_i) begin
+            hart_halted <= 1'b0;
+        end
+    end
+
+    assign dbg_halted_o = hart_halted;
+
+Additionally, when `hart_halted=1`, you must:
+
+- Prevent the pipeline from fetching/advancing (stall/hold PC).
+- Keep peripheral responses valid so SoC doesn’t deadlock.
+
+A simple approach (for now):
+
+- If `hart_halted` is 1, freeze PC and stall pipeline control logic.
+
+================================================================================
+STEP 7 — USING THE DM IN PRACTICE
+================================================================================
+
+At this minimal level:
+
+- You can:
+  - Assert halt on a hart via DMCONTROL write over DMI.
+  - Observe hart halted via DMSTATUS (anyhalted/allhalted).
+  - Resume hart via DMCONTROL.
+- You cannot yet:
+  - Read/write GPRs and memory *directly* from the debugger, unless you:
+    - Extend the DM to interpret COMMAND and run a tiny "program buffer" in the halted hart.
+    - Or add a direct GPR access port in the core and connect it to DM.
+
+The structure here is **designed exactly so you can add that later** without re-architecting:
+
+- `DATA0`, `COMMAND`, `ABSTRACTCS` are present.
+- DMI bus is structured like the spec.
+
+================================================================================
+RESOURCE IMPACT (MAX 10 10M50)
+================================================================================
+
+Approximate (without full JTAG TAP):
+
+- DM core:
+  - ~1k–2k LEs
+  - No BRAM
+  - No DSPs
+- DTM-Lite:
+  - TAP complexity depends on actual implementation.
+  - A modest TAP is a few hundred LEs.
+
+Combined with existing design, this still fits within the 10M50 comfortably.
+
+================================================================================
+WHAT PHASE 3F GIVES YOU
+================================================================================
+
+- A real RISC-V Debug Module *skeleton*:
+  - Multi-hart halt/resume.
+  - DMCONTROL/DMSTATUS/COMMAND/DATA0 registers.
+- A JTAG DTM-Lite interface:
+  - A structured path for external tools to talk to the DM via DMI.
+- Hart-level integration hooks:
+  - `dbg_halt_req`, `dbg_resume_req`, `dbg_halted`.
+
+From here, you can:
+
+- Flesh out a full TAP using an open-source core.
+- Implement proper register/memory access.
+- Hook up OpenOCD or a custom debug host.
+
+================================================================================
+END OF PHASE 3F
+================================================================================
