@@ -2842,3 +2842,358 @@ endmodule
 ============================================================
 END OF PHASE 4
 =======================================================
+
+============================================================
+PHASE 5 — BOOT ROM + UART BOOTLOADER (LOADS FIRMWARE INTO INSTR SRAM)
+============================================================
+
+Goal:
+- Implement a *real* Boot ROM image that:
+  - Runs on Hazard3 core(s) after reset at 0x0000_0000.
+  - Sets up a stack in Data SRAM.
+  - Initializes UART16550 at 0x4000_0000.
+  - Receives a firmware image over UART.
+  - Writes it into Instruction SRAM at 0x0001_0000.
+  - Jumps to 0x0001_0000 to start user code.
+- Build artifacts:
+  - boot_rom.elf
+  - boot_rom.bin
+  - boot_rom.hex (32-bit wide, for $readmemh in h3_ahb_boot_rom.v)
+- Integrate: h3_ahb_boot_rom.v uses `boot_rom.hex` to initialize its BRAM.
+
+All of this respects:
+- Memory map (from Phase 2):
+  - ROM          @ 0x0000_0000 (16 KB)
+  - Instr SRAM   @ 0x0001_0000 (64 KB)
+  - Data SRAM    @ 0x1000_0000 (64 KB)
+  - UART16550    @ 0x4000_0000
+- Ephemeral rule: ROM is BRAM-in-bitstream, firmware lives only in Instr SRAM.
+
+------------------------------------------------------------
+1. Directory layout for Boot ROM software
+------------------------------------------------------------
+
+Under:
+  ~/h3_quad_de10lite/soc/sw/boot_rom
+
+Create files:
+  start.S       - reset entry and jump to boot_main
+  boot_rom.c    - C bootloader logic
+  linker.ld     - places .text in ROM, stack in Data SRAM
+  Makefile      - builds boot_rom.elf/bin/hex
+
+Commands:
+
+  cd ~/h3_quad_de10lite/soc/sw
+  mkdir -p boot_rom
+  cd boot_rom
+
+------------------------------------------------------------
+2. RISC-V reset entry (start.S)
+------------------------------------------------------------
+
+We assume:
+- Hazard3 resets to PC = 0x0000_0000.
+- We set SP (stack pointer) to top of Data SRAM (0x1000_0000 + 64 KB).
+- Then branch to boot_main() in C.
+
+File: start.S
+
+----------------------------------------
+start.S
+----------------------------------------
+    .section .init, "ax"
+    .globl _start
+    .globl boot_main
+
+_start:
+    la   sp, _stack_top
+    j    boot_main
+----------------------------------------
+
+------------------------------------------------------------
+3. Bootloader C code (boot_rom.c)
+------------------------------------------------------------
+
+Protocol:
+- Host sends 4 bytes: firmware length (little-endian).
+- Then sends exactly that many bytes of raw firmware (binary RV32IM code).
+- Bootloader stores bytes starting at 0x0001_0000, then jumps there.
+
+We use polled UART16550:
+- Base: 0x4000_0000
+- 32-bit register spacing:
+
+  Offset  Function (DLAB=0)         Comments
+  0x00    THR/RBR                   TX/RX buffer
+  0x04    IER                       Interrupt enable (we’ll disable)
+  0x08    IIR/FCR                   FIFO control
+  0x0C    LCR                       Line control
+  0x10    MCR                       Modem control
+  0x14    LSR                       Line status
+  0x18    MSR                       Modem status
+  0x1C    SCR                       Scratch
+  0x00    DLL (when DLAB=1)
+  0x04    DLM (when DLAB=1)
+
+File: boot_rom.c
+
+----------------------------------------
+boot_rom.c
+----------------------------------------
+#include <stdint.h>
+
+#define UART_BASE       0x40000000u
+
+#define UART_RBR        (*(volatile uint32_t *)(UART_BASE + 0x00))
+#define UART_THR        (*(volatile uint32_t *)(UART_BASE + 0x00))
+#define UART_IER        (*(volatile uint32_t *)(UART_BASE + 0x04))
+#define UART_IIR        (*(volatile uint32_t *)(UART_BASE + 0x08))
+#define UART_FCR        (*(volatile uint32_t *)(UART_BASE + 0x08))
+#define UART_LCR        (*(volatile uint32_t *)(UART_BASE + 0x0C))
+#define UART_MCR        (*(volatile uint32_t *)(UART_BASE + 0x10))
+#define UART_LSR        (*(volatile uint32_t *)(UART_BASE + 0x14))
+#define UART_MSR        (*(volatile uint32_t *)(UART_BASE + 0x18))
+#define UART_SCR        (*(volatile uint32_t *)(UART_BASE + 0x1C))
+#define UART_DLL        (*(volatile uint32_t *)(UART_BASE + 0x00))
+#define UART_DLM        (*(volatile uint32_t *)(UART_BASE + 0x04))
+
+#define INSTR_SRAM_BASE 0x00010000u
+#define INSTR_SRAM_MAX  0x0001FFFFu  /* 64 KB region end */
+
+static void uart_init(void) {
+    UART_IER = 0x00;
+
+    UART_LCR = 0x80;
+    UART_DLL = 0x01;
+    UART_DLM = 0x00;
+    UART_LCR = 0x03;
+
+    UART_FCR = 0x07;
+    UART_MCR = 0x00;
+}
+
+static void uart_putc(uint8_t ch) {
+    while ((UART_LSR & 0x20) == 0) {
+    }
+    UART_THR = ch;
+}
+
+static uint8_t uart_getc(void) {
+    while ((UART_LSR & 0x01) == 0) {
+    }
+    return (uint8_t)(UART_RBR & 0xFF);
+}
+
+static void uart_puts(const char *s) {
+    while (*s) {
+        uart_putc((uint8_t)*s++);
+    }
+}
+
+static uint32_t read_u32_le(void) {
+    uint32_t b0 = uart_getc();
+    uint32_t b1 = uart_getc();
+    uint32_t b2 = uart_getc();
+    uint32_t b3 = uart_getc();
+    return (b0) | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+void boot_main(void) {
+    uart_init();
+    uart_puts("H3-BOOT\r\n");
+    uart_puts("LEN?\r\n");
+
+    uint32_t len = read_u32_le();
+
+    if (len == 0) {
+        uart_puts("ERR:LEN=0\r\n");
+        while (1) { }
+    }
+
+    uint32_t max_len = (INSTR_SRAM_MAX - INSTR_SRAM_BASE + 1u);
+    if (len > max_len) {
+        uart_puts("ERR:LEN>SRAM\r\n");
+        while (1) { }
+    }
+
+    uart_puts("OK\r\n");
+    uart_puts("RX...\r\n");
+
+    volatile uint8_t *dst = (volatile uint8_t *)INSTR_SRAM_BASE;
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t b = uart_getc();
+        dst[i] = b;
+    }
+
+    uart_puts("JMP\r\n");
+
+    void (*entry)(void) = (void (*)(void))INSTR_SRAM_BASE;
+    entry();
+
+    while (1) {
+    }
+}
+
+void _start(void) {}
+----------------------------------------
+
+Notes:
+- No C library, no malloc, no global init beyond what linker does.
+- `_start` is only defined to satisfy the linker if needed; real entry is `_start` in start.S.
+
+------------------------------------------------------------
+4. Linker script (linker.ld)
+------------------------------------------------------------
+
+We must place:
+- Code (.text/.rodata/.init) in ROM at 0x0000_0000 (16 KB).
+- Data/BSS in Data SRAM at 0x1000_0000 (64 KB).
+- `_stack_top` at top of Data SRAM (0x1000_0000 + 64 KB).
+
+File: linker.ld
+
+----------------------------------------
+linker.ld
+----------------------------------------
+ENTRY(_start)
+
+MEMORY
+{
+    ROM (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
+    RAM (rwx) : ORIGIN = 0x10000000, LENGTH = 64K
+}
+
+SECTIONS
+{
+    .text : {
+        KEEP(*(.init))
+        *(.text*)
+        *(.rodata*)
+    } > ROM
+
+    .data : {
+        *(.data*)
+    } > RAM AT > ROM
+
+    .bss (NOLOAD) : {
+        *(.bss*)
+        *(COMMON)
+    } > RAM
+
+    .stack (NOLOAD) : {
+        . = ORIGIN(RAM) + LENGTH(RAM);
+        . = . - 4;
+        _stack_top = .;
+    } > RAM
+}
+----------------------------------------
+
+------------------------------------------------------------
+5. Makefile (builds ELF, BIN, HEX)
+------------------------------------------------------------
+
+We’ll:
+- Use `riscv64-unknown-elf-gcc` as the tool prefix (you can override).
+- Produce:
+  - boot_rom.elf
+  - boot_rom.bin (raw binary)
+  - boot_rom.hex (32-bit words, one per line, for $readmemh).
+
+File: Makefile
+
+----------------------------------------
+Makefile
+----------------------------------------
+RISCV_PREFIX ?= riscv64-unknown-elf
+
+CC      := $(RISCV_PREFIX)-gcc
+OBJCOPY := $(RISCV_PREFIX)-objcopy
+
+CFLAGS  := -march=rv32im -mabi=ilp32 -Os -ffreestanding -nostdlib -Wall -Wextra
+LDFLAGS := -T linker.ld -nostdlib -nostartfiles
+
+all: boot_rom.hex
+
+boot_rom.elf: start.S boot_rom.c linker.ld
+	$(CC) $(CFLAGS) -o $@ start.S boot_rom.c $(LDFLAGS)
+
+boot_rom.bin: boot_rom.elf
+	$(OBJCOPY) -O binary $< $@
+
+boot_rom.hex: boot_rom.bin
+	hexdump -v -e '1/4 "%08x\n"' $< > $@
+
+clean:
+	rm -f boot_rom.elf boot_rom.bin boot_rom.hex
+
+.PHONY: all clean
+----------------------------------------
+
+Build commands:
+
+  cd ~/h3_quad_de10lite/soc/sw/boot_rom
+  make
+
+Artifacts:
+
+  boot_rom.elf
+  boot_rom.bin
+  boot_rom.hex
+
+------------------------------------------------------------
+6. Integrating boot_rom.hex into the RTL ROM
+------------------------------------------------------------
+
+Your `h3_ahb_boot_rom.v` (from previous phase) should already contain:
+
+- A BRAM array:
+    reg [31:0] mem [0:ROM_WORDS-1];
+
+- An initialization:
+    initial begin
+        $readmemh("boot_rom.hex", mem);
+    end
+
+To hook this up:
+
+1) Copy or symlink the newly built hex into the RTL directory:
+
+   cd ~/h3_quad_de10lite/soc/rtl
+   ln -sf ../sw/boot_rom/boot_rom.hex .
+
+2) Ensure Quartus project includes:
+   - h3_ahb_boot_rom.v
+   - boot_rom.hex as a memory initialization file (Quartus usually picks it up via $readmemh if in project dir).
+
+On power-up / reset:
+- FPGA config (via SRAM) loads:
+  - SoC RTL.
+  - Boot ROM BRAM pre-initialized with `boot_rom.hex`.
+- Hazard3 core 0 reset PC = 0x0000_0000 → `_start` (start.S).
+- `_start` sets SP and jumps to `boot_main`.
+- `boot_main`:
+  - Initializes UART.
+  - Prints prompt.
+  - Waits for length + firmware.
+  - Writes firmware into Instr SRAM at 0x0001_0000.
+  - Jumps to 0x0001_0000.
+- Firmware runs entirely from Instr SRAM; nothing persistent is ever written.
+
+------------------------------------------------------------
+7. Host-side expectations (for later Phase 9)
+------------------------------------------------------------
+
+The host tool (later Phase 9) must:
+- Open the UART connected to DE10-Lite (via USB-UART bridge or external adapter).
+- Wait for `"H3-BOOT"` and `"LEN?"` messages (optional).
+- Send:
+  - 4-byte little-endian length.
+  - Then the firmware binary file (exactly that many bytes).
+
+Firmware itself will be built in Phase 7 using the Arduino-like HAL.
+
+============================================================
+END OF PHASE 5
+============================================================
+
