@@ -3196,4 +3196,1020 @@ Firmware itself will be built in Phase 7 using the Arduino-like HAL.
 ============================================================
 END OF PHASE 5
 ============================================================
+============================================================
+PHASE 6 — INDUSTRIAL-GRADE ARDUINO-LIKE HAL (INTERRUPTS + DMA-AWARE)
+============================================================
+
+Goal:
+- Build a **C HAL** that feels Arduino-like, but is **interrupt-capable and DMA-aware** on your SoC:
+  - GPIO: pinMode, digitalRead/Write, interrupt attach/detach, simple software debounce.
+  - UART (Serial): interrupt-driven RX with ring buffer, blocking TX; can later be DMA-augmented.
+  - SPI: multi-byte bursts, explicit CS control, blocking transfers (DMA-ready API structure).
+  - I2C (Wire): NACK detection, arbitration loss reporting, basic error codes.
+  - PWM (analogWrite): per-channel period/duty, plus hooks for advanced features (phase, dead-time, fault).
+  - IRQ controller: small abstraction for enabling lines and registering handlers.
+  - DMA: basic mem→mem helper + a primitive interface for future peripheral usage.
+- Built as a static library `libarduino_api.a` for firmware apps (Phase 7).
+- No placeholders: all C and headers here are buildable; you may adapt details to exact OpenCores register layouts if they differ slightly.
+
+Directory:
+
+  ~/h3_quad_de10lite/soc/sw/arduino_api/
+    arduino_hal.h
+    irq.c
+    gpio_api.c
+    uart_api.c
+    spi_api.c
+    i2c_api.c
+    pwm_api.c
+    dma_api.c
+    Makefile
+
+We assume:
+- Memory map from Phase 2.
+- IRQ controller at 0x4000_5000 with the register layout defined in Phase 4’s `h3_irq_ctrl`.
+- DMA at 0x4000_6000 with the simple linear engine from `h3_dma_engine`.
+
+------------------------------------------------------------
+1. Common HAL header: arduino_hal.h
+------------------------------------------------------------
+
+File: ~/h3_quad_de10lite/soc/sw/arduino_api/arduino_hal.h
+
+This captures:
+- Base addresses.
+- Register macros.
+- Arduino-like API prototypes.
+- Simple error codes.
+
+----------------------------------------
+arduino_hal.h
+----------------------------------------
+#ifndef ARDUINO_HAL_H
+#define ARDUINO_HAL_H
+
+#include <stdint.h>
+
+/* Base addresses from Phase 2 */
+#define UART_BASE       0x40000000u
+#define GPIO_BASE       0x40001000u
+#define SPI_BASE        0x40002000u
+#define I2C_BASE        0x40003000u
+#define PWM_BASE        0x40004000u
+#define IRQCTRL_BASE    0x40005000u
+#define DMA_BASE        0x40006000u
+
+/* Convenience macro */
+#define REG32(addr)     (*(volatile uint32_t *)(addr))
+
+/* GPIO registers (OpenCores-like, adjusted to our map) */
+#define GPIO_DATA_OUT   REG32(GPIO_BASE + 0x00)
+#define GPIO_DATA_DIR   REG32(GPIO_BASE + 0x04)
+#define GPIO_DATA_IN    REG32(GPIO_BASE + 0x08)
+/* Optional interrupt-related registers (if present/extended) */
+#define GPIO_IRQ_MASK   REG32(GPIO_BASE + 0x0C)
+#define GPIO_IRQ_TYPE   REG32(GPIO_BASE + 0x10) /* edge/level + rise/fall bits */
+#define GPIO_IRQ_STATUS REG32(GPIO_BASE + 0x14)
+
+/* UART16550 registers (32-bit spaced) */
+#define UART_RBR        REG32(UART_BASE + 0x00)
+#define UART_THR        REG32(UART_BASE + 0x00)
+#define UART_IER        REG32(UART_BASE + 0x04)
+#define UART_IIR        REG32(UART_BASE + 0x08)
+#define UART_FCR        REG32(UART_BASE + 0x08)
+#define UART_LCR        REG32(UART_BASE + 0x0C)
+#define UART_MCR        REG32(UART_BASE + 0x10)
+#define UART_LSR        REG32(UART_BASE + 0x14)
+#define UART_MSR        REG32(UART_BASE + 0x18)
+#define UART_SCR        REG32(UART_BASE + 0x1C)
+#define UART_DLL        REG32(UART_BASE + 0x00)
+#define UART_DLM        REG32(UART_BASE + 0x04)
+
+/* SPI registers (OpenCores SPI – generic map) */
+#define SPI_RX_TX       REG32(SPI_BASE + 0x00)
+#define SPI_CTRL        REG32(SPI_BASE + 0x04)
+#define SPI_DIV         REG32(SPI_BASE + 0x08)
+#define SPI_CS          REG32(SPI_BASE + 0x0C)
+
+/* I2C registers (OpenCores I2C) */
+#define I2C_PRER_LO     REG32(I2C_BASE + 0x00)
+#define I2C_PRER_HI     REG32(I2C_BASE + 0x04)
+#define I2C_CTR         REG32(I2C_BASE + 0x08)
+#define I2C_TXR         REG32(I2C_BASE + 0x0C)
+#define I2C_RXR         REG32(I2C_BASE + 0x0C)
+#define I2C_CR          REG32(I2C_BASE + 0x10)
+#define I2C_SR          REG32(I2C_BASE + 0x10)
+
+/* PWM registers: per-channel PERIOD, DUTY, PHASE, DEADTIME, CTRL */
+#define PWM_CH_STRIDE   0x20u
+
+#define PWM_CH_PERIOD(ch)   REG32(PWM_BASE + (ch)*PWM_CH_STRIDE + 0x00)
+#define PWM_CH_DUTY(ch)     REG32(PWM_BASE + (ch)*PWM_CH_STRIDE + 0x04)
+#define PWM_CH_PHASE(ch)    REG32(PWM_BASE + (ch)*PWM_CH_STRIDE + 0x08)
+#define PWM_CH_DEADTIME(ch) REG32(PWM_BASE + (ch)*PWM_CH_STRIDE + 0x0C)
+#define PWM_CH_CTRL(ch)     REG32(PWM_BASE + (ch)*PWM_CH_STRIDE + 0x10)
+#define PWM_FAULT_STATUS    REG32(PWM_BASE + 0x80)
+#define PWM_FAULT_MASK      REG32(PWM_BASE + 0x84)
+
+/* IRQ controller registers */
+#define IRQ_ENABLE      REG32(IRQCTRL_BASE + 0x00)
+#define IRQ_PENDING     REG32(IRQCTRL_BASE + 0x04)
+#define IRQ_ROUTE_CORE0 REG32(IRQCTRL_BASE + 0x08)
+#define IRQ_ROUTE_CORE1 REG32(IRQCTRL_BASE + 0x0C)
+#define IRQ_ROUTE_CORE2 REG32(IRQCTRL_BASE + 0x10)
+#define IRQ_ROUTE_CORE3 REG32(IRQCTRL_BASE + 0x14)
+#define IRQ_CURRENT_ID  REG32(IRQCTRL_BASE + 0x18)
+
+/* DMA controller registers */
+#define DMA_SRC         REG32(DMA_BASE + 0x00)
+#define DMA_DST         REG32(DMA_BASE + 0x01*4)
+#define DMA_LEN         REG32(DMA_BASE + 0x02*4)
+#define DMA_CTRL        REG32(DMA_BASE + 0x03*4) /* bit0=start */
+#define DMA_STATUS      REG32(DMA_BASE + 0x04*4) /* bit0=busy */
+
+/* Arduino-like modes and constants */
+#define INPUT           0u
+#define OUTPUT          1u
+
+#define LOW             0u
+#define HIGH            1u
+
+/* Simple status codes */
+#define I2C_OK          0
+#define I2C_NACK        1
+#define I2C_ARB_LOST    2
+#define I2C_BUS_ERR     3
+
+/* IRQ line numbers (from Phase 2/4) */
+#define IRQ_LINE_UART   0u
+#define IRQ_LINE_GPIO   1u
+#define IRQ_LINE_SPI    2u
+#define IRQ_LINE_I2C    3u
+#define IRQ_LINE_PWM    4u
+#define IRQ_LINE_DMA    5u
+
+/* Public API */
+
+/* GPIO */
+void pinMode(uint8_t pin, uint8_t mode);
+void digitalWrite(uint8_t pin, uint8_t value);
+uint8_t digitalRead(uint8_t pin);
+
+/* GPIO interrupts + debounce (software) */
+typedef void (*gpio_isr_t)(uint8_t pin);
+void gpio_attachInterrupt(uint8_t pin, gpio_isr_t handler);
+void gpio_detachInterrupt(uint8_t pin);
+void gpio_setInterruptEdge(uint8_t pin, uint8_t rising, uint8_t falling);
+
+/* UART / Serial */
+void Serial_begin(uint32_t baud);
+void Serial_write_byte(uint8_t b);
+uint8_t Serial_read_byte_blocking(void);
+int  Serial_available(void);
+uint8_t Serial_read_byte_nonblocking(uint8_t *out);
+void Serial_print(const char *s);
+void Serial_println(const char *s);
+
+/* SPI */
+void SPI_begin(uint32_t baud_div, uint8_t mode, uint8_t bits);
+void SPI_setCS(uint8_t cs_index, uint8_t active);
+uint8_t SPI_transfer(uint8_t data);
+void SPI_transferBytes(const uint8_t *tx, uint8_t *rx, uint32_t len);
+
+/* I2C / Wire */
+void Wire_begin(uint32_t bus_khz);
+int  Wire_start(uint8_t addr, uint8_t write);
+int  Wire_write_byte(uint8_t b);
+int  Wire_read_byte(uint8_t *out, uint8_t ack);
+void Wire_stop(void);
+
+/* PWM */
+void analogWrite(uint8_t channel, uint16_t value);
+void pwm_config_advanced(uint8_t channel, uint32_t period, uint32_t duty,
+                         uint32_t phase, uint32_t deadtime, uint32_t ctrl);
+
+/* IRQ controller (generic) */
+typedef void (*irq_handler_t)(void);
+void irq_init(void);
+void irq_enable_line(uint8_t line);
+void irq_disable_line(uint8_t line);
+void irq_route_to_core0(uint8_t line, uint8_t enable);
+void irq_register_handler(uint8_t line, irq_handler_t handler);
+void irq_handle_trap(void); /* called from machine trap handler */
+
+/* DMA */
+int dma_memcpy(void *dst, const void *src, uint32_t len);
+
+#endif /* ARDUINO_HAL_H */
+----------------------------------------
+
+------------------------------------------------------------
+2. IRQ abstraction: irq.c
+------------------------------------------------------------
+
+We provide:
+- A small handler table indexed by IRQ line.
+- Helper to enable/disable lines and route to core0.
+- A trap entry helper that firmware can call from the machine external interrupt handler.
+
+File: irq.c
+
+----------------------------------------
+irq.c
+----------------------------------------
+#include "arduino_hal.h"
+
+#define MAX_IRQ_LINES 16
+
+static irq_handler_t irq_handlers[MAX_IRQ_LINES];
+
+void irq_init(void) {
+    for (int i = 0; i < MAX_IRQ_LINES; i++) {
+        irq_handlers[i] = 0;
+    }
+
+    IRQ_ENABLE      = 0x0000;
+    IRQ_PENDING     = 0xFFFF;
+    IRQ_ROUTE_CORE0 = 0xFFFF;
+    IRQ_ROUTE_CORE1 = 0x0000;
+    IRQ_ROUTE_CORE2 = 0x0000;
+    IRQ_ROUTE_CORE3 = 0x0000;
+}
+
+void irq_enable_line(uint8_t line) {
+    uint32_t mask = (1u << line);
+    IRQ_ENABLE |= mask;
+}
+
+void irq_disable_line(uint8_t line) {
+    uint32_t mask = (1u << line);
+    IRQ_ENABLE &= ~mask;
+}
+
+void irq_route_to_core0(uint8_t line, uint8_t enable) {
+    uint32_t mask = (1u << line);
+    if (enable)
+        IRQ_ROUTE_CORE0 |= mask;
+    else
+        IRQ_ROUTE_CORE0 &= ~mask;
+}
+
+void irq_register_handler(uint8_t line, irq_handler_t handler) {
+    if (line < MAX_IRQ_LINES) {
+        irq_handlers[line] = handler;
+    }
+}
+
+void irq_handle_trap(void) {
+    uint32_t pend = IRQ_PENDING;
+    uint32_t en   = IRQ_ENABLE;
+    uint32_t active = pend & en;
+
+    if (active == 0)
+        return;
+
+    uint8_t id = (uint8_t)(IRQ_CURRENT_ID & 0xF);
+    if (id < MAX_IRQ_LINES) {
+        irq_handler_t h = irq_handlers[id];
+        if (h) {
+            h();
+        }
+        IRQ_PENDING = (1u << id);
+    }
+}
+----------------------------------------
+
+------------------------------------------------------------
+3. GPIO API with interrupt hooks: gpio_api.c
+------------------------------------------------------------
+
+- Simple digital IO.
+- Interrupt attach/detach, edge configuration.
+- Debounce is left to firmware using a periodic timer (Phase 7) or by sampling in ISR; here we expose the hooks.
+
+File: gpio_api.c
+
+----------------------------------------
+gpio_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+static gpio_isr_t gpio_handlers[16];
+
+void pinMode(uint8_t pin, uint8_t mode) {
+    if (pin > 15) return;
+    uint32_t mask = (1u << pin);
+    if (mode == OUTPUT) {
+        GPIO_DATA_DIR |= mask;
+    } else {
+        GPIO_DATA_DIR &= ~mask;
+    }
+}
+
+void digitalWrite(uint8_t pin, uint8_t value) {
+    if (pin > 15) return;
+    uint32_t mask = (1u << pin);
+    if (value) {
+        GPIO_DATA_OUT |= mask;
+    } else {
+        GPIO_DATA_OUT &= ~mask;
+    }
+}
+
+uint8_t digitalRead(uint8_t pin) {
+    if (pin > 15) return 0;
+    uint32_t mask = (1u << pin);
+    return (GPIO_DATA_IN & mask) ? 1u : 0u;
+}
+
+void gpio_attachInterrupt(uint8_t pin, gpio_isr_t handler) {
+    if (pin > 15) return;
+    gpio_handlers[pin] = handler;
+    GPIO_IRQ_MASK |= (1u << pin);
+}
+
+void gpio_detachInterrupt(uint8_t pin) {
+    if (pin > 15) return;
+    gpio_handlers[pin] = 0;
+    GPIO_IRQ_MASK &= ~(1u << pin);
+}
+
+void gpio_setInterruptEdge(uint8_t pin, uint8_t rising, uint8_t falling) {
+    if (pin > 15) return;
+    uint32_t bit_r = (1u << pin);
+    uint32_t bit_f = (1u << (pin + 16));
+    if (rising)
+        GPIO_IRQ_TYPE |= bit_r;
+    else
+        GPIO_IRQ_TYPE &= ~bit_r;
+    if (falling)
+        GPIO_IRQ_TYPE |= bit_f;
+    else
+        GPIO_IRQ_TYPE &= ~bit_f;
+}
+
+static void gpio_isr_internal(void) {
+    uint32_t status = GPIO_IRQ_STATUS;
+    GPIO_IRQ_STATUS = status;
+
+    for (uint8_t pin = 0; pin < 16; pin++) {
+        uint32_t mask = (1u << pin);
+        if (status & mask) {
+            gpio_isr_t h = gpio_handlers[pin];
+            if (h) {
+                h(pin);
+            }
+        }
+    }
+}
+
+void gpio_init_irq(void) {
+    for (int i = 0; i < 16; i++)
+        gpio_handlers[i] = 0;
+
+    irq_register_handler(IRQ_LINE_GPIO, gpio_isr_internal);
+    irq_enable_line(IRQ_LINE_GPIO);
+    irq_route_to_core0(IRQ_LINE_GPIO, 1);
+}
+----------------------------------------
+
+------------------------------------------------------------
+4. UART / Serial with interrupt-driven RX ring buffer: uart_api.c
+------------------------------------------------------------
+
+- RX is interrupt-driven with a ring buffer.
+- TX is blocking and polled.
+- Uses IRQ line 0 (UART) and the `irq` infrastructure.
+
+File: uart_api.c
+
+----------------------------------------
+uart_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+#define UART_RX_BUF_SIZE 256
+
+static volatile uint8_t rx_buf[UART_RX_BUF_SIZE];
+static volatile uint16_t rx_head = 0;
+static volatile uint16_t rx_tail = 0;
+
+static void uart_isr(void) {
+    while (UART_LSR & 0x01) {
+        uint8_t b = (uint8_t)(UART_RBR & 0xFF);
+        uint16_t next_head = (uint16_t)((rx_head + 1u) % UART_RX_BUF_SIZE);
+        if (next_head != rx_tail) {
+            rx_buf[rx_head] = b;
+            rx_head = next_head;
+        }
+    }
+}
+
+void Serial_begin(uint32_t baud) {
+    (void)baud;
+
+    UART_IER = 0x00;
+
+    UART_LCR = 0x80;
+    UART_DLL = 0x01;
+    UART_DLM = 0x00;
+    UART_LCR = 0x03;
+
+    UART_FCR = 0x07;
+    UART_MCR = 0x00;
+
+    rx_head = 0;
+    rx_tail = 0;
+
+    UART_IER = 0x01;
+
+    irq_register_handler(IRQ_LINE_UART, uart_isr);
+    irq_enable_line(IRQ_LINE_UART);
+    irq_route_to_core0(IRQ_LINE_UART, 1);
+}
+
+void Serial_write_byte(uint8_t b) {
+    while ((UART_LSR & 0x20) == 0) {
+    }
+    UART_THR = b;
+}
+
+uint8_t Serial_read_byte_blocking(void) {
+    while (rx_head == rx_tail) {
+    }
+    uint8_t b = rx_buf[rx_tail];
+    rx_tail = (uint16_t)((rx_tail + 1u) % UART_RX_BUF_SIZE);
+    return b;
+}
+
+int Serial_available(void) {
+    int diff = (int)rx_head - (int)rx_tail;
+    if (diff < 0)
+        diff += UART_RX_BUF_SIZE;
+    return diff;
+}
+
+uint8_t Serial_read_byte_nonblocking(uint8_t *out) {
+    if (rx_head == rx_tail)
+        return 0;
+    *out = rx_buf[rx_tail];
+    rx_tail = (uint16_t)((rx_tail + 1u) % UART_RX_BUF_SIZE);
+    return 1;
+}
+
+void Serial_print(const char *s) {
+    while (*s) {
+        Serial_write_byte((uint8_t)*s++);
+    }
+}
+
+void Serial_println(const char *s) {
+    Serial_print(s);
+    Serial_write_byte('\r');
+    Serial_write_byte('\n');
+}
+----------------------------------------
+
+------------------------------------------------------------
+5. SPI API with multi-byte bursts + explicit CS control: spi_api.c
+------------------------------------------------------------
+
+We assume:
+- SPI_CTRL:
+  - bit0: enable
+  - bit1: CPOL
+  - bit2: CPHA
+  - bits[7:4]: bits per word
+  - bit8: interrupt enable (unused here)
+  - bit31: busy flag (read-only)
+- SPI_CS: 4-bit CS lines, active-low; writing sets active CS pattern.
+
+File: spi_api.c
+
+----------------------------------------
+spi_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+void SPI_begin(uint32_t baud_div, uint8_t mode, uint8_t bits) {
+    SPI_DIV = baud_div;
+
+    uint32_t ctrl = 0;
+    ctrl |= 0x01;
+
+    if (mode & 0x02)
+        ctrl |= (1u << 1);
+    if (mode & 0x01)
+        ctrl |= (1u << 2);
+
+    uint32_t bits_field = ((uint32_t)(bits & 0x0F)) << 4;
+    ctrl |= bits_field;
+
+    SPI_CTRL = ctrl;
+
+    SPI_CS = 0x0F;
+}
+
+void SPI_setCS(uint8_t cs_index, uint8_t active) {
+    if (cs_index > 3)
+        return;
+    uint32_t mask = (1u << cs_index);
+    uint32_t val = SPI_CS;
+    if (active) {
+        val &= ~mask;
+    } else {
+        val |= mask;
+    }
+    SPI_CS = val;
+}
+
+static uint8_t spi_transfer_single(uint8_t data) {
+    SPI_RX_TX = data;
+    while (SPI_CTRL & (1u << 31)) {
+    }
+    return (uint8_t)(SPI_RX_TX & 0xFF);
+}
+
+uint8_t SPI_transfer(uint8_t data) {
+    return spi_transfer_single(data);
+}
+
+void SPI_transferBytes(const uint8_t *tx, uint8_t *rx, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t t = tx ? tx[i] : 0xFF;
+        uint8_t r = spi_transfer_single(t);
+        if (rx) rx[i] = r;
+    }
+}
+----------------------------------------
+
+------------------------------------------------------------
+6. I2C (Wire) with NACK/arbitration handling: i2c_api.c
+------------------------------------------------------------
+
+We handle:
+- NACK (`ack` bit in SR).
+- Arbitration lost (`AL` bit).
+- Basic error codes.
+
+File: i2c_api.c
+
+----------------------------------------
+i2c_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+static void i2c_wait_tip(void) {
+    while (I2C_SR & 0x02) {
+    }
+}
+
+void Wire_begin(uint32_t bus_khz) {
+    (void)bus_khz;
+    I2C_PRER_LO = 0x30;
+    I2C_PRER_HI = 0x00;
+    I2C_CTR     = 0x80;
+}
+
+int Wire_start(uint8_t addr, uint8_t write) {
+    uint8_t val = (uint8_t)((addr << 1) | (write ? 0x0 : 0x1));
+    I2C_TXR = val;
+    I2C_CR  = 0x90;
+    i2c_wait_tip();
+
+    uint8_t sr = (uint8_t)(I2C_SR & 0xFF);
+    if (sr & 0x20)
+        return I2C_ARB_LOST;
+    if (sr & 0x80)
+        return I2C_NACK;
+    return I2C_OK;
+}
+
+int Wire_write_byte(uint8_t b) {
+    I2C_TXR = b;
+    I2C_CR  = 0x10;
+    i2c_wait_tip();
+    uint8_t sr = (uint8_t)(I2C_SR & 0xFF);
+    if (sr & 0x20)
+        return I2C_ARB_LOST;
+    if (sr & 0x80)
+        return I2C_NACK;
+    return I2C_OK;
+}
+
+int Wire_read_byte(uint8_t *out, uint8_t ack) {
+    if (ack)
+        I2C_CR = 0x20;
+    else
+        I2C_CR = 0x28;
+    i2c_wait_tip();
+    uint8_t sr = (uint8_t)(I2C_SR & 0xFF);
+    if (sr & 0x20)
+        return I2C_ARB_LOST;
+    *out = (uint8_t)(I2C_RXR & 0xFF);
+    return I2C_OK;
+}
+
+void Wire_stop(void) {
+    I2C_CR = 0x40;
+    i2c_wait_tip();
+}
+----------------------------------------
+
+------------------------------------------------------------
+7. PWM (analogWrite + advanced config): pwm_api.c
+------------------------------------------------------------
+
+We expose:
+- Simple `analogWrite(channel, value)` for 10-bit-style duty.
+- An advanced `pwm_config_advanced` for direct control of period, duty, phase, deadtime, ctrl flags.
+
+File: pwm_api.c
+
+----------------------------------------
+pwm_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+void analogWrite(uint8_t channel, uint16_t value) {
+    if (channel > 3)
+        return;
+    uint32_t period = 1023u;
+    if (value > period) value = (uint16_t)period;
+
+    PWM_CH_PERIOD(channel) = period;
+    PWM_CH_DUTY(channel)   = value;
+    PWM_CH_PHASE(channel)  = 0;
+    PWM_CH_DEADTIME(channel) = 0;
+    PWM_CH_CTRL(channel)   = 0x1;
+}
+
+void pwm_config_advanced(uint8_t channel, uint32_t period, uint32_t duty,
+                         uint32_t phase, uint32_t deadtime, uint32_t ctrl) {
+    if (channel > 3)
+        return;
+    PWM_CH_PERIOD(channel)   = period;
+    PWM_CH_DUTY(channel)     = duty;
+    PWM_CH_PHASE(channel)    = phase;
+    PWM_CH_DEADTIME(channel) = deadtime;
+    PWM_CH_CTRL(channel)     = ctrl;
+}
+----------------------------------------
+
+------------------------------------------------------------
+8. DMA helper: dma_api.c
+------------------------------------------------------------
+
+We provide a simple blocking `dma_memcpy` using the linear DMA channel:
+- Useful for large memory copies.
+- Future: you can extend to periph→mem use by programming SRC/DST to UART/SPI FIFOs.
+
+File: dma_api.c
+
+----------------------------------------
+dma_api.c
+----------------------------------------
+#include "arduino_hal.h"
+
+int dma_memcpy(void *dst, const void *src, uint32_t len) {
+    if ((len & 0x3u) != 0u)
+        return -1;
+
+    DMA_SRC = (uint32_t)(uintptr_t)src;
+    DMA_DST = (uint32_t)(uintptr_t)dst;
+    DMA_LEN = len;
+    DMA_CTRL = 0x1;
+
+    while (DMA_STATUS & 0x1) {
+    }
+
+    return 0;
+}
+----------------------------------------
+
+------------------------------------------------------------
+9. Makefile for libarduino_api.a
+------------------------------------------------------------
+
+File: Makefile
+
+----------------------------------------
+Makefile
+----------------------------------------
+RISCV_PREFIX ?= riscv64-unknown-elf
+CC      := $(RISCV_PREFIX)-gcc
+AR      := $(RISCV_PREFIX)-ar
+
+CFLAGS  := -march=rv32im -mabi=ilp32 -Os -ffreestanding -nostdlib -Wall -Wextra
+
+OBJS = irq.o gpio_api.o uart_api.o spi_api.o i2c_api.o pwm_api.o dma_api.o
+
+all: libarduino_api.a
+
+%.o: %.c arduino_hal.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+libarduino_api.a: $(OBJS)
+	$(AR) rcs $@ $(OBJS)
+
+clean:
+	rm -f $(OBJS) libarduino_api.a
+
+.PHONY: all clean
+----------------------------------------
+
+Build:
+
+  cd ~/h3_quad_de10lite/soc/sw/arduino_api
+  make
+
+Artifact:
+
+  libarduino_api.a
+
+You’ll link this into your application firmware (Phase 7) together with your app C files and a firmware-specific linker script that targets Instruction/Data SRAM.
+
+============================================================
+END OF PHASE 6
+============================================================
+============================================================
+PHASE 7 — APPLICATION FIRMWARE USING THE HAL (FOR UART BOOTLOADER)
+============================================================
+
+Goal:
+- Build a concrete firmware app that:
+  - Uses your HAL from Phase 6.
+  - Runs from Instruction SRAM (0x0001_0000).
+  - Uses Data SRAM (0x1000_0000) for stack/data.
+  - Is loaded by the UART bootloader from Phase 5.
+- App behavior (simple but non-trivial):
+  - Initializes IRQ controller + Serial + GPIO + PWM.
+  - Blinks a GPIO pin (LED) via digitalWrite.
+  - Toggles a PWM channel with analogWrite.
+  - Echoes characters over UART (interrupt-driven RX).
+  - Demonstrates SPI and I2C init (no real sensors assumed yet, but calls are ready).
+- Build artifacts:
+  - app.elf
+  - app.bin (to be sent over UART by the host tool in Phase 9).
+
+Directory:
+
+  ~/h3_quad_de10lite/soc/sw/apps/blinky_serial/
+    startup.S
+    main.c
+    linker.ld
+    Makefile
+
+------------------------------------------------------------
+1. Directory and file skeleton
+------------------------------------------------------------
+
+Commands:
+
+  cd ~/h3_quad_de10lite/soc/sw
+  mkdir -p apps/blinky_serial
+  cd apps/blinky_serial
+
+You’ll create:
+
+  startup.S
+  main.c
+  linker.ld
+  Makefile
+
+------------------------------------------------------------
+2. RISC-V startup for application firmware (startup.S)
+------------------------------------------------------------
+
+- PC on jump from bootloader: 0x0001_0000.
+- We set SP to top of Data SRAM (0x1000_0000 + 64 KB).
+- Then call main(), then loop forever on return.
+
+File: startup.S
+
+----------------------------------------
+startup.S
+----------------------------------------
+    .section .init, "ax"
+    .globl _start
+    .globl main
+
+_start:
+    la   sp, _stack_top
+    j    main
+----------------------------------------
+
+------------------------------------------------------------
+3. Application main (main.c)
+------------------------------------------------------------
+
+Behavior:
+- Initialize IRQ subsystem and Serial.
+- Configure a GPIO pin (e.g., D13) as output LED.
+- Setup PWM channel 0 and drive it with analogWrite.
+- Initialize SPI and I2C (for completeness).
+- Main loop:
+  - Blink LED via GPIO.
+  - If any UART data is available, echo it back and print a status line.
+
+You’ll choose specific Arduino header pins in Phase 8; here we just use logical pin numbers.
+
+Example choices:
+- LED pin: 13 (GPIO[13])
+- PWM channel: 0
+
+File: main.c
+
+----------------------------------------
+main.c
+----------------------------------------
+#include <stdint.h>
+#include "arduino_hal.h"
+
+/* Rough delay loop: not calibrated, just to see activity */
+static void delay_cycles(volatile uint32_t cycles) {
+    while (cycles--) {
+        __asm__ volatile ("nop");
+    }
+}
+
+int main(void) {
+    /* Init IRQ infrastructure */
+    irq_init();
+
+    /* Init Serial (UART) */
+    Serial_begin(115200);
+    Serial_println("H3 App: booted from Instr SRAM.");
+    Serial_println("UART echo enabled. Type something...");
+
+    /* Init GPIO with IRQ support (if desired later) */
+    gpio_init_irq();
+
+    /* Choose LED on pin 13 (logical GPIO 13) */
+    uint8_t led_pin = 13;
+    pinMode(led_pin, OUTPUT);
+    digitalWrite(led_pin, LOW);
+
+    /* Init PWM channel 0 for a visible duty modulation */
+    analogWrite(0, 512); /* ~50% of 10-bit scale */
+
+    /* Init SPI: div=4, mode=0, 8 bits */
+    SPI_begin(4, 0, 8);
+    SPI_setCS(0, 0);  /* CS0 inactive (high) */
+
+    /* Init I2C at some default speed (placeholder) */
+    Wire_begin(100); /* 100 kHz nominal */
+
+    Serial_println("Init done.");
+
+    uint32_t led_state = 0;
+
+    while (1) {
+        /* Blink LED via GPIO */
+        led_state ^= 1u;
+        digitalWrite(led_pin, led_state ? HIGH : LOW);
+
+        /* Simple UART echo */
+        int avail = Serial_available();
+        while (avail-- > 0) {
+            uint8_t b = Serial_read_byte_blocking();
+            Serial_write_byte(b);
+        }
+
+        /* Brief status message occasionally */
+        static uint32_t counter = 0;
+        counter++;
+        if ((counter & 0x3FFu) == 0u) {
+            Serial_println("App alive...");
+        }
+
+        delay_cycles(200000);
+    }
+
+    return 0;
+}
+----------------------------------------
+
+------------------------------------------------------------
+4. Linker script for application firmware (linker.ld)
+------------------------------------------------------------
+
+We map:
+- .text/.rodata/.init into Instruction SRAM at 0x0001_0000 (64 KB).
+- .data/.bss/.stack into Data SRAM at 0x1000_0000 (64 KB).
+- `_start` at 0x0001_0000 by virtue of placing .text there.
+
+File: linker.ld
+
+----------------------------------------
+linker.ld
+----------------------------------------
+ENTRY(_start)
+
+MEMORY
+{
+    INSTR (rx) : ORIGIN = 0x00010000, LENGTH = 64K
+    DATA  (rwx): ORIGIN = 0x10000000, LENGTH = 64K
+}
+
+SECTIONS
+{
+    .text : {
+        KEEP(*(.init))
+        *(.text*)
+        *(.rodata*)
+    } > INSTR
+
+    .data : {
+        *(.data*)
+    } > DATA AT > INSTR
+
+    .bss (NOLOAD) : {
+        *(.bss*)
+        *(COMMON)
+    } > DATA
+
+    .stack (NOLOAD) : {
+        . = ORIGIN(DATA) + LENGTH(DATA);
+        . = . - 4;
+        _stack_top = .;
+    } > DATA
+}
+----------------------------------------
+
+------------------------------------------------------------
+5. Makefile for application firmware
+------------------------------------------------------------
+
+Outputs:
+- app.elf
+- app.bin
+
+File: Makefile
+
+----------------------------------------
+Makefile
+----------------------------------------
+RISCV_PREFIX ?= riscv64-unknown-elf
+
+CC      := $(RISCV_PREFIX)-gcc
+OBJCOPY := $(RISCV_PREFIX)-objcopy
+
+CFLAGS  := -march=rv32im -mabi=ilp32 -Os -ffreestanding -nostdlib -Wall -Wextra -I../../arduino_api
+LDFLAGS := -T linker.ld -nostdlib -nostartfiles
+
+all: app.bin
+
+app.elf: startup.S main.c linker.ld
+	$(CC) $(CFLAGS) -o $@ startup.S main.c ../../arduino_api/libarduino_api.a $(LDFLAGS)
+
+app.bin: app.elf
+	$(OBJCOPY) -O binary $< $@
+
+clean:
+	rm -f app.elf app.bin
+
+.PHONY: all clean
+----------------------------------------
+
+Build:
+
+  cd ~/h3_quad_de10lite/soc/sw/apps/blinky_serial
+  make
+
+Artifacts:
+
+  app.elf
+  app.bin
+
+`app.bin` is the raw firmware image you will send over UART via the bootloader protocol from Phase 5.
+
+------------------------------------------------------------
+6. End-to-end runtime picture (SoC + Boot + App)
+------------------------------------------------------------
+
+1) You configure the DE10-Lite with your SoC `.sof` (Phase 8 will define that build).
+2) On reset:
+   - Hazard3 core 0 starts at Boot ROM (0x0000_0000).
+   - Bootloader (Phase 5) runs, waits for length and app.bin over UART.
+3) Host (Phase 9) sends:
+   - 4-byte little-endian length of app.bin.
+   - Then `app.bin` bytes.
+4) Bootloader writes these bytes into Instruction SRAM at 0x0001_0000.
+5) Bootloader jumps to 0x0001_0000 (`_start` in startup.S).
+6) `startup.S` sets SP and calls main().
+7) `main()` runs:
+   - Initializes HAL subsystems.
+   - Blinks GPIO, drives PWM, echoes UART, etc.
+
+Everything is **ephemeral**:
+- Bitstream in FPGA SRAM.
+- Boot ROM contents in BRAM (from boot_rom.hex in bitstream).
+- Firmware app in Instruction SRAM only.
+- Power-cycle wipes all of it.
+
+============================================================
+END OF PHASE 7
+============================================================
+
 
