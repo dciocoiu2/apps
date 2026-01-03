@@ -1,0 +1,786 @@
+================================================================================
+PHASE 1A: QUAD-CORE-READY SINGLE-HART HAZARD3 SoC SKELETON ON DE0-LITE
+(core tile + 4-master-capable AHB interconnect + Boot ROM + top-level)
+ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX
+================================================================================
+
+GOAL OF PHASE 1A
+----------------
+Build the minimal but structurally “correct” SoC skeleton that:
+
+- Instantiates ONE Hazard3 core *via a tile wrapper* with HART_ID = 0.
+- Uses an AHB interconnect that is architected for up to FOUR masters (M0..M3), but
+  currently only connects M0.
+- Has a Boot ROM at 0x2000_0000, implemented in BRAM, with contents from bootrom.hex.
+- Has a top-level for DE0-Lite that wires clock/reset and exposes *no SDRAM, no UART*
+  yet (we’ll add those in later sub-phases).
+- Is synthesizable, programmable, and “alive” (core runs and loops in ROM).
+
+From here, all later phases add:
+- AHB→WB bridge
+- SDRAM, UART, I2C, SPI, GPIO, JTAG-UART
+- Bootloader, HAL, firmware
+- Extra cores (for dual / quad)
+
+Directory layout for Phase 1A:
+- ~/fpga/h3_phase1_sc/
+    - rtl/
+        - cores/
+            - hazard3/           (git clone)
+        - soc/
+            - hazard3_tile.sv
+            - ahb_interconnect_4m.sv
+            - boot_rom.sv
+            - top_soc.sv
+    - quartus/
+        - h3_phase1_sc.qpf / .qsf / etc.
+- ~/hazard3_fw/
+    - bootrom/
+        - bootrom.c
+        - linker.ld
+        - Makefile
+
+================================================================================
+STEP 1 — BASIC SETUP (DIRECTORIES + HAZARD3 REPO)
+================================================================================
+
+1. Create directories:
+
+   mkdir -p ~/fpga/h3_phase1_sc/rtl/cores
+   mkdir -p ~/fpga/h3_phase1_sc/rtl/soc
+   mkdir -p ~/fpga/h3_phase1_sc/quartus
+   mkdir -p ~/hazard3_fw/bootrom
+
+2. Clone official Hazard3:
+
+   cd ~/fpga/h3_phase1_sc/rtl/cores
+   git clone https://github.com/Wren6991/hazard3.git
+
+   You will use the AHB-based core from this repo; the exact module name might differ
+   (e.g. hazard3_core, hazard3_cpu, etc.). In hazard3_tile.sv below, adapt instance
+   names/ports to match the actual RTL after inspecting the repo.
+
+================================================================================
+STEP 2 — BOOT ROM C CODE + LINKER + HEX (PHASE 1A MINIMAL)
+================================================================================
+
+We’ll use a very simple ROM program that:
+- Defines _start at 0x2000_0000.
+- Executes an infinite loop (heartbeat).
+- No peripherals yet.
+
+----- FILE: ~/hazard3_fw/bootrom/linker.ld ------------------------------------
+
+ENTRY(_start)
+
+MEMORY
+{
+  ROM (rx) : ORIGIN = 0x20000000, LENGTH = 16K
+}
+
+SECTIONS
+{
+  .text :
+  {
+    *(.text.entry)
+    *(.text*)
+    *(.rodata*)
+  } > ROM
+
+  .data :
+  {
+    *(.data*)
+  } > ROM
+
+  .bss :
+  {
+    *(.bss*)
+    *(COMMON)
+  } > ROM
+}
+
+----- FILE: ~/hazard3_fw/bootrom/bootrom.c ------------------------------------
+
+#include <stdint.h>
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    // Minimal ROM stub for Phase 1A:
+    // Just loop forever to prove the core is fetching and executing.
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+----- FILE: ~/hazard3_fw/bootrom/Makefile -------------------------------------
+
+RISCV_PREFIX = riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJCOPY = $(RISCV_PREFIX)objcopy
+
+CFLAGS  = -march=rv32imc -mabi=ilp32 -Os -nostdlib -ffreestanding -Wall -Wextra
+LDFLAGS = -T linker.ld -nostartfiles -nostdlib
+
+all: bootrom.hex
+
+bootrom.elf: bootrom.c linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ bootrom.c
+
+bootrom.hex: bootrom.elf
+	$(OBJCOPY) -O verilog $< $@
+
+clean:
+	rm -f bootrom.elf bootrom.hex
+
+Build the ROM hex:
+
+   cd ~/hazard3_fw/bootrom
+   make
+
+This produces bootrom.hex; you’ll point boot_rom.sv to this file.
+
+================================================================================
+STEP 3 — BOOT_ROM RTL (AHB-LITE SLAVE @ 0x2000_0000)
+================================================================================
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/boot_rom.sv ---------------------------
+
+module boot_rom
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // AHB-Lite slave interface (read-only)
+    input  wire [31:0] HADDR,
+    input  wire [2:0]  HSIZE,
+    input  wire [1:0]  HBURST,
+    input  wire [1:0]  HTRANS,
+    input  wire        HWRITE,
+    input  wire [31:0] HWDATA,
+    output reg  [31:0] HRDATA,
+    output wire        HREADY,
+    output wire        HRESP
+);
+
+    // 16 KB ROM = 4K words of 32 bits
+    localparam ADDR_WIDTH = 12;        // 2^12 = 4096 words
+    localparam MEM_DEPTH  = 1 << ADDR_WIDTH;
+
+    reg [31:0] rom [0:MEM_DEPTH-1];
+
+    initial begin
+        // expects bootrom.hex in simulation/synthesis directory
+        $readmemh("bootrom.hex", rom);
+    end
+
+    assign HREADY = 1'b1; // zero-wait read
+    assign HRESP  = 1'b0; // OKAY
+
+    // Word-aligned address; ignore HSIZE for now (32-bit accesses)
+    wire [ADDR_WIDTH-1:0] word_addr = HADDR[ADDR_WIDTH+1:2];
+
+    always @(posedge clk) begin
+        if (HTRANS[1] && !HWRITE) begin
+            HRDATA <= rom[word_addr];
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 4 — HAZARD3 TILE WRAPPER (HART TILE, AHB MASTER)
+================================================================================
+
+We wrap a Hazard3 core into a “tile” with:
+
+- HART_ID parameter.
+- AHB-Lite master port.
+- Separate clk, rst.
+
+You MUST adapt the internal instance to match the actual Hazard3 core’s module
+name and ports from the cloned repo (hazard3/rtl/core/…).
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/hazard3_tile.sv -----------------------
+
+module hazard3_tile #(
+    parameter integer HART_ID = 0
+)(
+    input  wire        clk,
+    input  wire        rst,
+
+    // AHB-Lite master interface
+    output wire [31:0] HADDR,
+    output wire [2:0]  HSIZE,
+    output wire [1:0]  HBURST,
+    output wire [1:0]  HTRANS,
+    output wire        HWRITE,
+    output wire [31:0] HWDATA,
+    input  wire [31:0] HRDATA,
+    input  wire        HREADY,
+    input  wire        HRESP
+
+    // later: interrupts, debug, etc.
+);
+
+    // TODO: adapt this to the actual Hazard3 AHB core module and ports.
+    // The following is a schematic example:
+
+    hazard3_core_ahb #(
+        .HART_ID(HART_ID)
+    ) u_core (
+        .clk_i     (clk),
+        .rst_i     (rst),
+
+        // AHB master out
+        .haddr_o   (HADDR),
+        .hsize_o   (HSIZE),
+        .hburst_o  (HBURST),
+        .htrans_o  (HTRANS),
+        .hwrite_o  (HWRITE),
+        .hwdata_o  (HWDATA),
+
+        // AHB master in
+        .hrdata_i  (HRDATA),
+        .hready_i  (HREADY),
+        .hresp_i   (HRESP)
+
+        // interrupts, etc. → tie off or connect later
+    );
+
+endmodule
+
+NOTE:
+- After cloning Hazard3, inspect the source to find the AHB-enabled core wrapper.
+- Replace hazard3_core_ahb and the signal names above with the actual ones.
+
+================================================================================
+STEP 5 — AHB INTERCONNECT, 4-MASTER CAPABLE (PHASE 1 USES ONLY M0)
+================================================================================
+
+We design an AHB-Lite interconnect structured to support up to 4 masters (M0..M3)
+and N slaves. For Phase 1A:
+
+- Only M0 is actually driven (from hazard3_tile HART0).
+- Only S0 is used (Boot ROM).
+- S1..Sx are left to future phases (AHB→WB bridge, etc.).
+
+We’ll implement:
+- Simple fixed-priority arbitration M0 > M1 > M2 > M3.
+- Single shared bus; slaves see a single “arbiter output” view.
+- For now, one slave region: ROM at 0x2000_0000; everything else unmapped.
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/ahb_interconnect_4m.sv ----------------
+
+module ahb_interconnect_4m
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    //=====================
+    // MASTER PORTS (4x)
+    //=====================
+
+    // Master 0
+    input  wire [31:0] m0_haddr,
+    input  wire [2:0]  m0_hsize,
+    input  wire [1:0]  m0_hburst,
+    input  wire [1:0]  m0_htrans,
+    input  wire        m0_hwrite,
+    input  wire [31:0] m0_hwdata,
+    output reg  [31:0] m0_hrdata,
+    output reg         m0_hready,
+    output reg         m0_hresp,
+
+    // Master 1 (unused in Phase 1A)
+    input  wire [31:0] m1_haddr,
+    input  wire [2:0]  m1_hsize,
+    input  wire [1:0]  m1_hburst,
+    input  wire [1:0]  m1_htrans,
+    input  wire        m1_hwrite,
+    input  wire [31:0] m1_hwdata,
+    output reg  [31:0] m1_hrdata,
+    output reg         m1_hready,
+    output reg         m1_hresp,
+
+    // Master 2
+    input  wire [31:0] m2_haddr,
+    input  wire [2:0]  m2_hsize,
+    input  wire [1:0]  m2_hburst,
+    input  wire [1:0]  m2_htrans,
+    input  wire        m2_hwrite,
+    input  wire [31:0] m2_hwdata,
+    output reg  [31:0] m2_hrdata,
+    output reg         m2_hready,
+    output reg         m2_hresp,
+
+    // Master 3
+    input  wire [31:0] m3_haddr,
+    input  wire [2:0]  m3_hsize,
+    input  wire [1:0]  m3_hburst,
+    input  wire [1:0]  m3_htrans,
+    input  wire        m3_hwrite,
+    input  wire [31:0] m3_hwdata,
+    output reg  [31:0] m3_hrdata,
+    output reg         m3_hready,
+    output reg         m3_hresp,
+
+    //=====================
+    // SLAVE PORTS (here: 2, but only s0 is used)
+    //=====================
+
+    // Slave 0 (Boot ROM at 0x2000_0000)
+    output reg  [31:0] s0_haddr,
+    output reg  [2:0]  s0_hsize,
+    output reg  [1:0]  s0_hburst,
+    output reg  [1:0]  s0_htrans,
+    output reg         s0_hwrite,
+    output reg  [31:0] s0_hwdata,
+    input  wire [31:0] s0_hrdata,
+    input  wire        s0_hready,
+    input  wire        s0_hresp,
+
+    // Slave 1 (future: AHB→WB bridge for SDRAM+periph)
+    output reg  [31:0] s1_haddr,
+    output reg  [2:0]  s1_hsize,
+    output reg  [1:0]  s1_hburst,
+    output reg  [1:0]  s1_htrans,
+    output reg         s1_hwrite,
+    output reg  [31:0] s1_hwdata,
+    input  wire [31:0] s1_hrdata,
+    input  wire        s1_hready,
+    input  wire        s1_hresp
+);
+
+    // -------------------------------------------------------------------------
+    // ARBITRATION
+    // -------------------------------------------------------------------------
+    // Simple fixed priority: M0 > M1 > M2 > M3
+    // "Request" = HTRANS[1] (NONSEQ or SEQ)
+    wire m0_req = m0_htrans[1];
+    wire m1_req = m1_htrans[1];
+    wire m2_req = m2_htrans[1];
+    wire m3_req = m3_htrans[1];
+
+    reg [1:0] grant; // 0..3 = which master is granted
+
+    always @(*) begin
+        if (m0_req)      grant = 2'd0;
+        else if (m1_req) grant = 2'd1;
+        else if (m2_req) grant = 2'd2;
+        else if (m3_req) grant = 2'd3;
+        else             grant = 2'd0; // default to 0 if idle
+    end
+
+    // -------------------------------------------------------------------------
+    // MUX MASTER → SHARED BUS VIEW
+    // -------------------------------------------------------------------------
+    reg [31:0] HADDR_bus;
+    reg [2:0]  HSIZE_bus;
+    reg [1:0]  HBURST_bus;
+    reg [1:0]  HTRANS_bus;
+    reg        HWRITE_bus;
+    reg [31:0] HWDATA_bus;
+
+    always @(*) begin
+        case (grant)
+            2'd0: begin
+                HADDR_bus  = m0_haddr;
+                HSIZE_bus  = m0_hsize;
+                HBURST_bus = m0_hburst;
+                HTRANS_bus = m0_htrans;
+                HWRITE_bus = m0_hwrite;
+                HWDATA_bus = m0_hwdata;
+            end
+            2'd1: begin
+                HADDR_bus  = m1_haddr;
+                HSIZE_bus  = m1_hsize;
+                HBURST_bus = m1_hburst;
+                HTRANS_bus = m1_htrans;
+                HWRITE_bus = m1_hwrite;
+                HWDATA_bus = m1_hwdata;
+            end
+            2'd2: begin
+                HADDR_bus  = m2_haddr;
+                HSIZE_bus  = m2_hsize;
+                HBURST_bus = m2_hburst;
+                HTRANS_bus = m2_htrans;
+                HWRITE_bus = m2_hwrite;
+                HWDATA_bus = m2_hwdata;
+            end
+            2'd3: begin
+                HADDR_bus  = m3_haddr;
+                HSIZE_bus  = m3_hsize;
+                HBURST_bus = m3_hburst;
+                HTRANS_bus = m3_htrans;
+                HWRITE_bus = m3_hwrite;
+                HWDATA_bus = m3_hwdata;
+            end
+            default: begin
+                HADDR_bus  = 32'h0000_0000;
+                HSIZE_bus  = 3'b010;
+                HBURST_bus = 2'b00;
+                HTRANS_bus = 2'b00;
+                HWRITE_bus = 1'b0;
+                HWDATA_bus = 32'h0000_0000;
+            end
+        endcase
+    end
+
+    // -------------------------------------------------------------------------
+    // ADDRESS DECODE (ROM vs future-periph)
+    // -------------------------------------------------------------------------
+    // ROM at 0x2000_0000 (e.g. match upper nibble 0x2)
+    wire sel_s0 = (HADDR_bus[31:28] == 4'h2);
+    wire sel_s1 = !sel_s0; // everything else to slave 1 for now
+
+    always @(*) begin
+        // defaults
+        s0_haddr  = 32'h0;
+        s0_hsize  = 3'b010;
+        s0_hburst = 2'b00;
+        s0_htrans = 2'b00;
+        s0_hwrite = 1'b0;
+        s0_hwdata = 32'h0;
+
+        s1_haddr  = 32'h0;
+        s1_hsize  = 3'b010;
+        s1_hburst = 2'b00;
+        s1_htrans = 2'b00;
+        s1_hwrite = 1'b0;
+        s1_hwdata = 32'h0;
+
+        if (sel_s0) begin
+            s0_haddr  = HADDR_bus;
+            s0_hsize  = HSIZE_bus;
+            s0_hburst = HBURST_bus;
+            s0_htrans = HTRANS_bus;
+            s0_hwrite = HWRITE_bus;
+            s0_hwdata = HWDATA_bus;
+        end else begin
+            s1_haddr  = HADDR_bus;
+            s1_hsize  = HSIZE_bus;
+            s1_hburst = HBURST_bus;
+            s1_htrans = HTRANS_bus;
+            s1_hwrite = HWRITE_bus;
+            s1_hwdata = HWDATA_bus;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // RETURN DATA/READY/RESP TO THE GRANTED MASTER
+    // -------------------------------------------------------------------------
+    wire [31:0] HRDATA_bus = sel_s0 ? s0_hrdata : s1_hrdata;
+    wire        HREADY_bus = sel_s0 ? s0_hready : s1_hready;
+    wire        HRESP_bus  = sel_s0 ? s0_hresp  : s1_hresp;
+
+    always @(*) begin
+        // default all masters to idle OKAY
+        m0_hrdata = 32'h0;
+        m0_hready = 1'b1;
+        m0_hresp  = 1'b0;
+
+        m1_hrdata = 32'h0;
+        m1_hready = 1'b1;
+        m1_hresp  = 1'b0;
+
+        m2_hrdata = 32'h0;
+        m2_hready = 1'b1;
+        m2_hresp  = 1'b0;
+
+        m3_hrdata = 32'h0;
+        m3_hready = 1'b1;
+        m3_hresp  = 1'b0;
+
+        case (grant)
+            2'd0: begin
+                m0_hrdata = HRDATA_bus;
+                m0_hready = HREADY_bus;
+                m0_hresp  = HRESP_bus;
+            end
+            2'd1: begin
+                m1_hrdata = HRDATA_bus;
+                m1_hready = HREADY_bus;
+                m1_hresp  = HRESP_bus;
+            end
+            2'd2: begin
+                m2_hrdata = HRDATA_bus;
+                m2_hready = HREADY_bus;
+                m2_hresp  = HRESP_bus;
+            end
+            2'd3: begin
+                m3_hrdata = HRDATA_bus;
+                m3_hready = HREADY_bus;
+                m3_hresp  = HRESP_bus;
+            end
+        endcase
+    end
+
+endmodule
+
+NOTES:
+- In Phase 1A, we will:
+  - Connect only M0 to hazard3_tile HART0.
+  - Leave M1..M3 unconnected or tied off.
+  - Connect S0 to boot_rom.
+  - Tie S1 to a dummy “error slave” that returns error or zero (simple stub).
+
+================================================================================
+STEP 6 — TOP-LEVEL FOR DE0-LITE (MINIMAL, NO PERIPHERALS YET)
+================================================================================
+
+We now define a minimal top-level that:
+
+- Instantiates one hazard3_tile with HART_ID=0.
+- Instantiates ahb_interconnect_4m.
+- Instantiates boot_rom.
+- Exposes only clock and reset pins for now (we’ll add IO in later phases).
+
+----- FILE: ~/fpga/h3_phase1_sc/rtl/soc/top_soc.sv ----------------------------
+
+module top_soc
+(
+    input  wire clk_50,   // 50 MHz clock from DE0-Lite
+    input  wire reset_n   // active-low reset (pushbutton)
+);
+
+    wire clk = clk_50;
+    wire rst = ~reset_n;
+
+    //======================
+    // AHB master signals from HART0 tile (M0)
+    //======================
+    wire [31:0] m0_haddr;
+    wire [2:0]  m0_hsize;
+    wire [1:0]  m0_hburst;
+    wire [1:0]  m0_htrans;
+    wire        m0_hwrite;
+    wire [31:0] m0_hwdata;
+    wire [31:0] m0_hrdata;
+    wire        m0_hready;
+    wire        m0_hresp;
+
+    // M1..M3 unconnected in Phase 1A
+    wire [31:0] m1_haddr = 32'h0;
+    wire [2:0]  m1_hsize = 3'b010;
+    wire [1:0]  m1_hburst = 2'b00;
+    wire [1:0]  m1_htrans = 2'b00;
+    wire        m1_hwrite = 1'b0;
+    wire [31:0] m1_hwdata = 32'h0;
+    wire [31:0] m1_hrdata;
+    wire        m1_hready;
+    wire        m1_hresp;
+
+    wire [31:0] m2_haddr = 32'h0;
+    wire [2:0]  m2_hsize = 3'b010;
+    wire [1:0]  m2_hburst = 2'b00;
+    wire [1:0]  m2_htrans = 2'b00;
+    wire        m2_hwrite = 1'b0;
+    wire [31:0] m2_hwdata = 32'h0;
+    wire [31:0] m2_hrdata;
+    wire        m2_hready;
+    wire        m2_hresp;
+
+    wire [31:0] m3_haddr = 32'h0;
+    wire [2:0]  m3_hsize = 3'b010;
+    wire [1:0]  m3_hburst = 2'b00;
+    wire [1:0]  m3_htrans = 2'b00;
+    wire        m3_hwrite = 1'b0;
+    wire [31:0] m3_hwdata = 32'h0;
+    wire [31:0] m3_hrdata;
+    wire        m3_hready;
+    wire        m3_hresp;
+
+    //======================
+    // Slave 0 = boot ROM
+    // Slave 1 = dummy error slave (for Phase 1A)
+    //======================
+    wire [31:0] s0_haddr, s1_haddr;
+    wire [2:0]  s0_hsize, s1_hsize;
+    wire [1:0]  s0_hburst, s1_hburst;
+    wire [1:0]  s0_htrans, s1_htrans;
+    wire        s0_hwrite, s1_hwrite;
+    wire [31:0] s0_hwdata, s1_hwdata;
+    wire [31:0] s0_hrdata, s1_hrdata;
+    wire        s0_hready, s1_hready;
+    wire        s0_hresp,  s1_hresp;
+
+    // HART0 tile
+    hazard3_tile #(
+        .HART_ID(0)
+    ) u_hart0 (
+        .clk    (clk),
+        .rst    (rst),
+
+        .HADDR  (m0_haddr),
+        .HSIZE  (m0_hsize),
+        .HBURST (m0_hburst),
+        .HTRANS (m0_htrans),
+        .HWRITE (m0_hwrite),
+        .HWDATA (m0_hwdata),
+        .HRDATA (m0_hrdata),
+        .HREADY (m0_hready),
+        .HRESP  (m0_hresp)
+    );
+
+    // AHB interconnect, 4 masters, 2 slaves
+    ahb_interconnect_4m u_ahb_ic (
+        .clk        (clk),
+        .rst        (rst),
+
+        // M0
+        .m0_haddr   (m0_haddr),
+        .m0_hsize   (m0_hsize),
+        .m0_hburst  (m0_hburst),
+        .m0_htrans  (m0_htrans),
+        .m0_hwrite  (m0_hwrite),
+        .m0_hwdata  (m0_hwdata),
+        .m0_hrdata  (m0_hrdata),
+        .m0_hready  (m0_hready),
+        .m0_hresp   (m0_hresp),
+
+        // M1..M3 (unused)
+        .m1_haddr   (m1_haddr),
+        .m1_hsize   (m1_hsize),
+        .m1_hburst  (m1_hburst),
+        .m1_htrans  (m1_htrans),
+        .m1_hwrite  (m1_hwrite),
+        .m1_hwdata  (m1_hwdata),
+        .m1_hrdata  (m1_hrdata),
+        .m1_hready  (m1_hready),
+        .m1_hresp   (m1_hresp),
+
+        .m2_haddr   (m2_haddr),
+        .m2_hsize   (m2_hsize),
+        .m2_hburst  (m2_hburst),
+        .m2_htrans  (m2_htrans),
+        .m2_hwrite  (m2_hwrite),
+        .m2_hwdata  (m2_hwdata),
+        .m2_hrdata  (m2_hrdata),
+        .m2_hready  (m2_hready),
+        .m2_hresp   (m2_hresp),
+
+        .m3_haddr   (m3_haddr),
+        .m3_hsize   (m3_hsize),
+        .m3_hburst  (m3_hburst),
+        .m3_htrans  (m3_htrans),
+        .m3_hwrite  (m3_hwrite),
+        .m3_hwdata  (m3_hwdata),
+        .m3_hrdata  (m3_hrdata),
+        .m3_hready  (m3_hready),
+        .m3_hresp   (m3_hresp),
+
+        // Slave 0 = ROM
+        .s0_haddr   (s0_haddr),
+        .s0_hsize   (s0_hsize),
+        .s0_hburst  (s0_hburst),
+        .s0_htrans  (s0_htrans),
+        .s0_hwrite  (s0_hwrite),
+        .s0_hwdata  (s0_hwdata),
+        .s0_hrdata  (s0_hrdata),
+        .s0_hready  (s0_hready),
+        .s0_hresp   (s0_hresp),
+
+        // Slave 1 = dummy
+        .s1_haddr   (s1_haddr),
+        .s1_hsize   (s1_hsize),
+        .s1_hburst  (s1_hburst),
+        .s1_htrans  (s1_htrans),
+        .s1_hwrite  (s1_hwrite),
+        .s1_hwdata  (s1_hwdata),
+        .s1_hrdata  (s1_hrdata),
+        .s1_hready  (s1_hready),
+        .s1_hresp   (s1_hresp)
+    );
+
+    // Boot ROM at 0x2000_0000
+    boot_rom u_boot_rom (
+        .clk    (clk),
+        .rst    (rst),
+        .HADDR  (s0_haddr),
+        .HSIZE  (s0_hsize),
+        .HBURST (s0_hburst),
+        .HTRANS (s0_htrans),
+        .HWRITE (s0_hwrite),
+        .HWDATA (s0_hwdata),
+        .HRDATA (s0_hrdata),
+        .HREADY (s0_hready),
+        .HRESP  (s0_hresp)
+    );
+
+    // Dummy slave 1: always ready, returns 0, OKAY
+    assign s1_hrdata = 32'hDEAD_DEAD;
+    assign s1_hready = 1'b1;
+    assign s1_hresp  = 1'b0;
+
+endmodule
+
+================================================================================
+STEP 7 — QUARTUS PROJECT (PHASE 1A) AND BRING-UP
+================================================================================
+
+1. Create Quartus project:
+
+   cd ~/fpga/h3_phase1_sc/quartus
+   quartus &
+
+   - New Project Wizard:
+     - Directory: ~/fpga/h3_phase1_sc/quartus
+     - Name: h3_phase1_sc
+     - Top-level entity: top_soc
+   - Device: MAX 10 → 10M50DAF484C7G (DE0-Lite)
+
+2. Add RTL files:
+   - Project → Add/Remove Files in Project:
+     - ../rtl/soc/top_soc.sv
+     - ../rtl/soc/hazard3_tile.sv
+     - ../rtl/soc/ahb_interconnect_4m.sv
+     - ../rtl/soc/boot_rom.sv
+     - All relevant Hazard3 core files from ../rtl/cores/hazard3/rtl/...
+   - Make sure SystemVerilog (.sv) is enabled where needed.
+
+3. Boot ROM hex:
+   - Copy bootrom.hex into the Quartus project directory (or adjust relative
+     path in boot_rom.sv to point to ../../hazard3_fw/bootrom/bootrom.hex).
+   - Quartus must see bootrom.hex at compile time.
+
+4. Pin assignments (minimal for Phase 1A):
+   - clk_50: assign to the DE0-Lite 50 MHz pin (per board manual).
+   - reset_n: assign to a pushbutton (e.g. KEY0).
+   - No other pins needed yet.
+
+5. Compile:
+   - Processing → Start Compilation.
+   - If there are missing module names/ports:
+     - Fix hazard3_tile.sv to match the actual Hazard3 core wrapper.
+     - Ensure all Hazard3 RTL files are included.
+
+6. Program DE0-Lite:
+   - Open Quartus Programmer (quartus_pgmw).
+   - Hardware Setup → select USB-Blaster.
+   - Add h3_phase1_sc.sof from output_files/.
+   - Check “Program/Configure”.
+   - Click Start.
+
+7. After programming:
+   - The Hazard3 core (HART0) begins executing at 0x2000_0000 (Boot ROM).
+   - It runs _start(), which loops and executes WFI.
+   - From the outside, nothing visible happens yet — but the SoC is structurally
+     correct, and the CPU is alive and fetching from ROM.
+
+================================================================================
+WHAT PHASE 1A HAS ACHIEVED (QUAD-CORE FUTURE IN MIND)
+================================================================================
+
+- You now have a **single-hart Hazard3 SoC skeleton** with:
+  - A HART tile abstraction (`hazard3_tile`) with HART_ID.
+  - A **4-master-capable** AHB interconnect (`ahb_interconnect_4m`) that will
+    easily scale to dual/quad core by adding more tiles and connecting M1..M3.
+  - A Boot ROM subsystem at 0x2000_0000 using bootrom.hex.
+  - A minimal top-level for DE0-Lite that compiles and runs.
+
+- This is a **clean base** for:
+  - Phase 1B: AHB→Wishbone bridge + Wishbone interconnect.
+  - Phase 1C+: SDRAM, UART, I2C, SPI, GPIO, JTAG-UART, bootloader, HAL.
+  - Phase 2: dual-core bring-up.
+  - Phase 3: quad-core with core control and hart coordination.
