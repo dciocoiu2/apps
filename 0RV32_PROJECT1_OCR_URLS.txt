@@ -1,0 +1,101 @@
+================================================================================
+OPENCORES / MIRROR REPOS REQUIRED FOR EACH PHASE 1 PERIPHERAL
+(ONE TEXTBOX — ORGANIZED PER PHASE)
+================================================================================
+
+PHASE 1D — UART16550 (Wishbone)
+--------------------------------
+Required IP:
+  - OpenCores 16550 UART (Wishbone)
+
+Recommended maintained GitHub mirror:
+  https://github.com/wallento/uart16550
+
+Notes:
+  - Fully compatible with Wishbone.
+  - Clean, modernized version of the original OpenCores design.
+
+
+PHASE 1E — I2C MASTER (Wishbone)
+--------------------------------
+Required IP:
+  - OpenCores I2C Master by Richard Herveille
+
+Canonical GitHub mirror:
+  https://github.com/trondd/oc-i2c
+
+Notes:
+  - This is the most widely used and stable mirror.
+  - Matches the register map used in Phase 1E.
+
+
+PHASE 1F — SPI MASTER (Wishbone)
+--------------------------------
+Required IP:
+  - OpenCores SPI Master (Wishbone)
+
+Official OpenCores project page:
+  https://opencores.org/projects/spi_master
+
+Notes:
+  - No reliable GitHub mirror exists.
+  - Download the Verilog files directly from the OpenCores project page.
+
+
+PHASE 1G — GPIO
+--------------------------------
+Required IP:
+  - NONE (custom GPIO block)
+
+Notes:
+  - GPIO in Phase 1G is fully custom RTL.
+  - No external repository required.
+
+
+PHASE 1H — JTAG-UART
+--------------------------------
+Required IP:
+  - Intel/Altera JTAG UART (Avalon-MM)
+
+Source:
+  - Generated directly from Quartus IP Catalog.
+  - No external repository required.
+
+Notes:
+  - You wrap the Avalon-MM interface with a Wishbone shim.
+
+
+PHASE 1I — BOOTLOADER
+--------------------------------
+Required IP:
+  - NONE (pure C code)
+
+Notes:
+  - Bootloader is entirely your own code in bootrom.c.
+  - No external IP required.
+
+
+PHASE 1J — HAL
+--------------------------------
+Required IP:
+  - NONE (pure C code)
+
+Notes:
+  - HAL is your own C library for UART/I2C/SPI/GPIO/JTAG-UART.
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+| Phase | Peripheral | Repo / Source |
+|-------|------------|----------------|
+| 1D | UART16550 | https://github.com/wallento/uart16550 |
+| 1E | I2C Master | https://github.com/trondd/oc-i2c |
+| 1F | SPI Master | https://opencores.org/projects/spi_master |
+| 1G | GPIO | Custom RTL (no repo) |
+| 1H | JTAG-UART | Quartus IP Catalog (no repo) |
+| 1I | Bootloader | Custom C (no repo) |
+| 1J | HAL | Custom C (no repo) |
+
+================================================================================
