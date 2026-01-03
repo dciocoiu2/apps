@@ -1980,3 +1980,562 @@ From here, cloning ACC0 to ACC1/ACC2 for AES, SHA, or a DSP kernel is trivial:
 - Add new HAL functions
 
 ####END P3D####
+
+================================================================================
+PHASE 3E: ON-CHIP LOGIC ANALYZER (WB-SCOPE) FOR AHB/WB/IRQS
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Add a small, configurable on-chip logic analyzer so you can:
+
+- Capture internal signals (AHB/WB/interrupts, DMA, accelerator) in real time.
+- Control and read it entirely over Wishbone.
+- Use it as a "scope" without any external analyzers.
+- Keep resource usage modest for MAX 10 10M50.
+
+We’ll implement:
+
+- A single **logic analyzer core** (WB-scope style).
+- Parametric:
+  - CAPTURE_WIDTH (e.g., 64 bits)
+  - DEPTH = 2^ADDR_WIDTH samples (e.g., 1024)
+- Features:
+  - Arm/trigger/stop control.
+  - Simple trigger on a bit pattern.
+  - Readout over Wishbone.
+  - Status flags.
+
+We will not attempt a full ChipScope clone; this is a focused, practical core.
+
+================================================================================
+ANALYZER MODEL
+================================================================================
+
+Concept:
+
+- `probe_i[WIDTH-1:0]` sampled on each clock when enabled.
+- On trigger condition:
+  - Start recording into internal BRAM.
+  - Wrap or stop after N samples (we’ll do "capture N samples after trigger, then stop").
+- Host accesses:
+  - Control & status registers (arm, trigger value/mask, etc.).
+  - Read captured samples via a simple address/data port.
+
+Base address: **0x1000_0B00**
+
+Parameters:
+
+- WIDTH = 64 bits
+- ADDR_WIDTH = 10 → DEPTH = 1024 samples
+
+This uses:
+- ~64-bit wide BRAM buffer of 1024 entries: 64K bits (~8 KB).
+- 8 M10Ks (approx), small logic.
+
+================================================================================
+REGISTER MAP (LA0)
+================================================================================
+
+Base: 0x1000_0B00
+
+0x00: LA_CTRL (RW)
+  bit0: ARM        (1=arm analyzer, 0=disarm/reset)
+  bit1: TRIG_EN    (1=enable trigger)
+  bit2: CAP_DONE   (RO; 1=capture done)
+  bit3: CAP_BUSY   (RO; 1=capture in progress)
+  bits31:4: reserved
+
+0x04: LA_TRIG_VALUE_LO (RW)
+0x08: LA_TRIG_VALUE_HI (RW)
+  - Together form WIDTH-bit trigger value (for WIDTH<=64, LO=bits[31:0], HI=bits[63:32])
+
+0x0C: LA_TRIG_MASK_LO (RW)
+0x10: LA_TRIG_MASK_HI (RW)
+  - WIDTH-bit mask; bits set to 1 participate in trigger comparison.
+
+0x14: LA_POST_SAMPLES (RW)
+  - Number of samples to capture after trigger (<= DEPTH).
+
+0x18: LA_SAMPLE_COUNT (RO)
+  - Actual number of samples captured (<= DEPTH).
+
+0x1C: LA_READ_ADDR (RW)
+0x20: LA_READ_DATA_LO (RO)
+0x24: LA_READ_DATA_HI (RO)
+  - Read captured sample at index LA_READ_ADDR, two reads for 64-bit.
+
+No interrupt for now (polling is fine). You can add PLIC later if desired.
+
+================================================================================
+STEP 1 — LOGIC ANALYZER CORE RTL
+================================================================================
+
+File: rtl/soc/la_wb.sv
+
+module la_wb #(
+    parameter integer WIDTH      = 64,
+    parameter integer ADDR_WIDTH = 10  // DEPTH = 2^ADDR_WIDTH
+)(
+    input  wire                 clk,
+    input  wire                 rst,
+
+    // Wishbone slave
+    input  wire [31:0]          wb_adr_i,
+    input  wire [31:0]          wb_dat_i,
+    output reg  [31:0]          wb_dat_o,
+    input  wire                 wb_we_i,
+    input  wire [3:0]           wb_sel_i,
+    input  wire                 wb_cyc_i,
+    input  wire                 wb_stb_i,
+    output reg                  wb_ack_o,
+    output wire                 wb_err_o,
+
+    // Probe bus
+    input  wire [WIDTH-1:0]     probe_i
+);
+
+    assign wb_err_o = 1'b0;
+
+    localparam integer DEPTH = (1 << ADDR_WIDTH);
+
+    // Control/status registers
+    reg        reg_arm;
+    reg        reg_trig_en;
+    reg [WIDTH-1:0] reg_trig_value;
+    reg [WIDTH-1:0] reg_trig_mask;
+    reg [ADDR_WIDTH:0] reg_post_samples;  // up to DEPTH
+    reg [ADDR_WIDTH:0] reg_sample_count;
+
+    reg        cap_done;
+    reg        cap_busy;
+
+    // Sample memory
+    reg [WIDTH-1:0] sample_mem [0:DEPTH-1];
+
+    // Internal
+    reg [ADDR_WIDTH-1:0] wr_addr;
+    reg [ADDR_WIDTH:0]   post_counter;
+    reg                  triggered;
+
+    reg [ADDR_WIDTH-1:0] rd_addr;
+
+    // Trigger condition
+    wire [WIDTH-1:0] masked_probe = probe_i        & reg_trig_mask;
+    wire [WIDTH-1:0] masked_value = reg_trig_value & reg_trig_mask;
+    wire             trig_hit     = (masked_probe == masked_value);
+
+    integer i;
+
+    // Wishbone interface
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o         <= 1'b0;
+            wb_dat_o         <= 32'h0;
+
+            reg_arm          <= 1'b0;
+            reg_trig_en      <= 1'b0;
+            reg_trig_value   <= {WIDTH{1'b0}};
+            reg_trig_mask    <= {WIDTH{1'b0}};
+            reg_post_samples <= { (ADDR_WIDTH+1){1'b0} };
+            reg_sample_count <= { (ADDR_WIDTH+1){1'b0} };
+
+            cap_done         <= 1'b0;
+            cap_busy         <= 1'b0;
+            wr_addr          <= {ADDR_WIDTH{1'b0}};
+            post_counter     <= { (ADDR_WIDTH+1){1'b0} };
+            triggered        <= 1'b0;
+            rd_addr          <= {ADDR_WIDTH{1'b0}};
+        end else begin
+            wb_ack_o <= 1'b0;
+
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (wb_adr_i[5:2])
+                        4'h0: begin
+                            // LA_CTRL write
+                            reg_arm     <= wb_dat_i[0];
+                            reg_trig_en <= wb_dat_i[1];
+                            if (!wb_dat_i[0]) begin
+                                // Disarm: reset state
+                                cap_done         <= 1'b0;
+                                cap_busy         <= 1'b0;
+                                triggered        <= 1'b0;
+                                wr_addr          <= {ADDR_WIDTH{1'b0}};
+                                post_counter     <= { (ADDR_WIDTH+1){1'b0} };
+                                reg_sample_count <= { (ADDR_WIDTH+1){1'b0} };
+                            end
+                        end
+                        4'h1: begin
+                            // TRIG_VALUE_LO
+                            reg_trig_value[31:0] <= wb_dat_i;
+                        end
+                        4'h2: begin
+                            // TRIG_VALUE_HI
+                            if (WIDTH > 32)
+                                reg_trig_value[63:32] <= wb_dat_i;
+                        end
+                        4'h3: begin
+                            // TRIG_MASK_LO
+                            reg_trig_mask[31:0] <= wb_dat_i;
+                        end
+                        4'h4: begin
+                            // TRIG_MASK_HI
+                            if (WIDTH > 32)
+                                reg_trig_mask[63:32] <= wb_dat_i;
+                        end
+                        4'h5: begin
+                            // POST_SAMPLES
+                            reg_post_samples <= wb_dat_i[ADDR_WIDTH:0];
+                        end
+                        4'h7: begin
+                            // READ_ADDR
+                            rd_addr <= wb_dat_i[ADDR_WIDTH-1:0];
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    case (wb_adr_i[5:2])
+                        4'h0: begin
+                            // CTRL/STATUS combined view
+                            wb_dat_o <= {28'b0,
+                                         cap_busy, cap_done,
+                                         reg_trig_en, reg_arm};
+                        end
+                        4'h1: wb_dat_o <= reg_trig_value[31:0];
+                        4'h2: wb_dat_o <= (WIDTH > 32) ? reg_trig_value[63:32] : 32'h0;
+                        4'h3: wb_dat_o <= reg_trig_mask[31:0];
+                        4'h4: wb_dat_o <= (WIDTH > 32) ? reg_trig_mask[63:32] : 32'h0;
+                        4'h5: wb_dat_o <= { {(32-ADDR_WIDTH-1){1'b0}}, reg_post_samples };
+                        4'h6: wb_dat_o <= { {(32-ADDR_WIDTH-1){1'b0}}, reg_sample_count };
+                        4'h7: wb_dat_o <= { {(32-ADDR_WIDTH){1'b0}}, rd_addr };
+                        4'h8: wb_dat_o <= sample_mem[rd_addr][31:0];
+                        4'h9: wb_dat_o <= (WIDTH > 32) ? sample_mem[rd_addr][63:32] : 32'h0;
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+
+            // Capture state machine
+            if (!reg_arm) begin
+                cap_busy         <= 1'b0;
+                cap_done         <= 1'b0;
+                triggered        <= 1'b0;
+                wr_addr          <= {ADDR_WIDTH{1'b0}};
+                post_counter     <= { (ADDR_WIDTH+1){1'b0} };
+                reg_sample_count <= { (ADDR_WIDTH+1){1'b0} };
+            end else begin
+                if (!cap_busy && !cap_done) begin
+                    // Idle but armed, wait for trigger (or immediate capture if trig disabled)
+                    if (!reg_trig_en || trig_hit) begin
+                        // Start capture
+                        cap_busy         <= 1'b1;
+                        triggered        <= 1'b1;
+                        wr_addr          <= {ADDR_WIDTH{1'b0}};
+                        post_counter     <= { (ADDR_WIDTH+1){1'b0} };
+                        reg_sample_count <= { (ADDR_WIDTH+1){1'b0} };
+
+                        // Capture first sample immediately
+                        sample_mem[0]    <= probe_i;
+                        wr_addr          <= {{(ADDR_WIDTH-1){1'b0}},1'b1};
+                        reg_sample_count <= {{ADDR_WIDTH{1'b0}},1'b1};
+                        post_counter     <= {{ADDR_WIDTH{1'b0}},1'b1};
+                    end
+                end else if (cap_busy && triggered) begin
+                    // Capture in progress
+                    if (post_counter < reg_post_samples && reg_sample_count < DEPTH) begin
+                        sample_mem[wr_addr] <= probe_i;
+                        wr_addr             <= wr_addr + 1'b1;
+                        reg_sample_count    <= reg_sample_count + 1'b1;
+                        post_counter        <= post_counter + 1'b1;
+                    end else begin
+                        cap_busy <= 1'b0;
+                        cap_done <= 1'b1;
+                    end
+                end
+            end
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 2 — INTEGRATION INTO WISHBONE FABRIC
+================================================================================
+
+We’ll add this analyzer as a new Wishbone slave (e.g., s12) at **0x1000_0B00**.
+
+### 2.1 — wb_interconnect.sv
+
+- Add slave s12_* signals:
+
+  - s12_adr_o, s12_dat_o, s12_dat_i
+  - s12_we_o, s12_sel_o
+  - s12_cyc_o, s12_stb_o
+  - s12_ack_i, s12_err_i
+
+- Decode:
+
+  sel_s12 = (m_adr_i[31:8] == 24'h10000B);
+
+- Add s12 to the existing mux/arbiter exactly as previous slaves.
+
+No AHB master connection: the analyzer just observes signals and exposes captured data via WB.
+
+================================================================================
+STEP 3 — PROBE SIGNAL SELECTION (WHAT WE ACTUALLY CAPTURE)
+================================================================================
+
+We choose what goes into `probe_i[63:0]`. You can change this freely, but a useful default is:
+
+- Bits [31:0]: AHB address (from the currently granted master → SDRAM)
+- Bits [35:32]: AHB htrans/hwrite
+  - [33:32]: HTRANS
+  - [35:34]: unused or HSIZE/partial
+- Bits [39:36]: HSIZE/HBURST or master ID
+- Bits [47:40]: PLIC interrupt source bits (low 8 bits of pending)
+- Bits [51:48]: hart MEI lines, timer interrupt flags, etc.
+- Bits [63:52]: DMA/ACC state bits or GPIO pins.
+
+Example mapping (in top_soc.sv, or a central interconnect module):
+
+// Example: 64-bit probe bus
+wire [63:0] la0_probe;
+
+// Suppose you have global AHB bus signals:
+wire [31:0] bus_haddr;
+wire [1:0]  bus_htrans;
+wire        bus_hwrite;
+wire [2:0]  bus_hsize;
+
+// PLIC pending bits
+wire [15:1] plic_pending;  // from inside PLIC or mirrored out
+
+// Hart MEI lines
+wire [3:0]  hart_mei;
+
+// DMA/ACC busy flags from HAL-exposed wires or internal signals
+wire dma_busy_flag;   // e.g., from DMA reg_ctrl[1]
+wire acc_busy_flag;   // from ACC reg_ctrl[1]
+
+assign la0_probe[31:0]  = bus_haddr;
+assign la0_probe[33:32] = bus_htrans;
+assign la0_probe[34]    = bus_hwrite;
+assign la0_probe[37:35] = bus_hsize;
+assign la0_probe[47:40] = {plic_pending[8:1]}; // 8 lower PLIC sources
+assign la0_probe[51:48] = hart_mei;
+assign la0_probe[52]    = dma_busy_flag;
+assign la0_probe[53]    = acc_busy_flag;
+assign la0_probe[63:54] = 10'b0;
+
+You can adapt this to whatever you have named in your SoC.
+
+================================================================================
+STEP 4 — TOP-LEVEL INSTANTIATION
+================================================================================
+
+In top_soc.sv:
+
+- Declare:
+
+  wire [63:0] la0_probe;
+
+  // Map la0_probe bits as in Step 3
+  // ...
+
+- Instantiate analyzer:
+
+la_wb #(
+    .WIDTH(64),
+    .ADDR_WIDTH(10)   // 1024 samples
+) u_la0 (
+    .clk      (clk),
+    .rst      (rst),
+
+    .wb_adr_i (s12_adr_o),
+    .wb_dat_i (s12_dat_o),
+    .wb_dat_o (s12_dat_i),
+    .wb_we_i  (s12_we_o),
+    .wb_sel_i (s12_sel_o),
+    .wb_cyc_i (s12_cyc_o),
+    .wb_stb_i (s12_stb_o),
+    .wb_ack_o (s12_ack_i),
+    .wb_err_o (s12_err_i),
+
+    .probe_i  (la0_probe)
+);
+
+No interrupts; polled usage via WB.
+
+================================================================================
+STEP 5 — HAL ACCESSOR FUNCTIONS
+================================================================================
+
+In h3_soc.h:
+
+/* ============================================================================
+ * On-chip logic analyzer LA0
+ * Base: 0x1000_0B00
+ * ============================================================================
+ */
+#define H3_LA0_BASE          0x10000B00u
+
+#define H3_LA0_CTRL          (*(volatile uint32_t *)(H3_LA0_BASE + 0x00))
+#define H3_LA0_TRIG_VALUE_LO (*(volatile uint32_t *)(H3_LA0_BASE + 0x04))
+#define H3_LA0_TRIG_VALUE_HI (*(volatile uint32_t *)(H3_LA0_BASE + 0x08))
+#define H3_LA0_TRIG_MASK_LO  (*(volatile uint32_t *)(H3_LA0_BASE + 0x0C))
+#define H3_LA0_TRIG_MASK_HI  (*(volatile uint32_t *)(H3_LA0_BASE + 0x10))
+#define H3_LA0_POST_SAMPLES  (*(volatile uint32_t *)(H3_LA0_BASE + 0x14))
+#define H3_LA0_SAMPLE_COUNT  (*(volatile uint32_t *)(H3_LA0_BASE + 0x18))
+#define H3_LA0_READ_ADDR     (*(volatile uint32_t *)(H3_LA0_BASE + 0x1C))
+#define H3_LA0_READ_DATA_LO  (*(volatile uint32_t *)(H3_LA0_BASE + 0x20))
+#define H3_LA0_READ_DATA_HI  (*(volatile uint32_t *)(H3_LA0_BASE + 0x24))
+
+/* CTRL bits */
+#define H3_LA_CTRL_ARM       (1u << 0)
+#define H3_LA_CTRL_TRIG_EN   (1u << 1)
+#define H3_LA_CTRL_CAP_DONE  (1u << 2)
+#define H3_LA_CTRL_CAP_BUSY  (1u << 3)
+
+/* Simple APIs */
+void     h3_la0_config_trigger(uint64_t value, uint64_t mask);
+void     h3_la0_arm(uint32_t post_samples, int use_trigger);
+int      h3_la0_is_done(void);
+uint32_t h3_la0_sample_count(void);
+uint64_t h3_la0_read_sample(uint32_t index);
+
+In h3_soc.c:
+
+void h3_la0_config_trigger(uint64_t value, uint64_t mask)
+{
+    H3_LA0_TRIG_VALUE_LO = (uint32_t)(value & 0xFFFFFFFFu);
+    H3_LA0_TRIG_VALUE_HI = (uint32_t)((value >> 32) & 0xFFFFFFFFu);
+    H3_LA0_TRIG_MASK_LO  = (uint32_t)(mask & 0xFFFFFFFFu);
+    H3_LA0_TRIG_MASK_HI  = (uint32_t)((mask >> 32) & 0xFFFFFFFFu);
+}
+
+void h3_la0_arm(uint32_t post_samples, int use_trigger)
+{
+    H3_LA0_POST_SAMPLES = post_samples;
+
+    uint32_t ctrl = 0;
+    if (use_trigger)
+        ctrl |= H3_LA_CTRL_TRIG_EN;
+    ctrl |= H3_LA_CTRL_ARM;
+
+    H3_LA0_CTRL = ctrl;
+}
+
+int h3_la0_is_done(void)
+{
+    uint32_t ctrl = H3_LA0_CTRL;
+    return (ctrl & H3_LA_CTRL_CAP_DONE) ? 1 : 0;
+}
+
+uint32_t h3_la0_sample_count(void)
+{
+    return H3_LA0_SAMPLE_COUNT;
+}
+
+uint64_t h3_la0_read_sample(uint32_t index)
+{
+    H3_LA0_READ_ADDR = index;
+    uint32_t lo = H3_LA0_READ_DATA_LO;
+    uint32_t hi = H3_LA0_READ_DATA_HI;
+    return ((uint64_t)hi << 32) | lo;
+}
+
+================================================================================
+STEP 6 — FIRMWARE USAGE EXAMPLE
+================================================================================
+
+Example: capture AHB bus activity when PLIC source ID 6 (DMA) is active.
+
+In some debug routine on HART0:
+
+void la0_demo(void)
+{
+    h3_con_puts("LA0: configuring trigger\n");
+
+    /* Suppose we mapped dma_busy_flag to probe bit 52.
+     * We'll trigger when that bit is 1.
+     */
+    uint64_t trig_val  = (1ull << 52);
+    uint64_t trig_mask = (1ull << 52);
+
+    h3_la0_config_trigger(trig_val, trig_mask);
+
+    /* Capture 256 samples after trigger */
+    h3_la0_arm(256, 1);
+
+    h3_con_puts("LA0: armed, now start DMA\n");
+
+    /* Start a DMA transfer to generate traffic */
+    // (Use your existing DMA demo function)
+    // h3_dma_demo_start();
+
+    /* Wait for capture done */
+    while (!h3_la0_is_done()) {
+        /* spin or WFI */
+        __asm__ volatile("wfi");
+    }
+
+    uint32_t count = h3_la0_sample_count();
+    h3_con_puts("LA0: capture complete, samples=");
+    h3_con_put_hex(count);
+    h3_con_puts("\n");
+
+    /* Dump first few samples */
+    for (uint32_t i = 0; i < (count < 16 ? count : 16); i++) {
+        uint64_t s = h3_la0_read_sample(i);
+        h3_con_puts("LA0[");
+        h3_con_put_hex(i);
+        h3_con_puts("] = 0x");
+        h3_con_put_hex((uint32_t)(s >> 32));
+        h3_con_puts("_");
+        h3_con_put_hex((uint32_t)(s & 0xFFFFFFFFu));
+        h3_con_puts("\n");
+    }
+}
+
+You can later:
+- Stream all samples out over UART.
+- Parse them on a PC and render waveforms.
+
+================================================================================
+RESOURCE IMPACT (MAX 10 10M50)
+================================================================================
+
+Approximate usage:
+
+- Logic:
+  - ~300–600 LEs (control + path)
+- BRAM:
+  - 64-bit × 1024 ≈ 64K bits (~8 KB)
+  - Uses several M10K blocks (within your BRAM budget)
+
+Safe on 10M50 even with phases 1–3D already present.
+
+================================================================================
+WHAT PHASE 3E GIVES YOU
+================================================================================
+
+- A flexible, internal logic analyzer:
+  - Captures internal interconnect/IRQ/accelerator activity.
+  - Fully controlled via Wishbone.
+  - No external tools required.
+- A reusable pattern:
+  - You can add LA1, LA2, etc. with different probe buses.
+- A powerful debug tool:
+  - Ideal for verifying DMA, accelerators, RTOS scheduling, and bus contention.
+
+This sets you up nicely for Phase 3F, where a RISC-V Debug Module and external debugger
+can coexist with your internal scope for deep bring-up and tuning.
+
+================================================================================
+END OF PHASE 3E
+================================================================================
+
