@@ -1,6 +1,4 @@
 
-Phase1: 1core Hazard3 SOC
-
 ================================================================================
 PHASE 1A: QUAD-CORE-READY SINGLE-HART HAZARD3 SoC SKELETON ON DE0-LITE
 (core tile + 4-master-capable AHB interconnect + Boot ROM + top-level)
