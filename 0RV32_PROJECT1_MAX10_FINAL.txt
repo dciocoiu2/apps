@@ -107,3 +107,232 @@ pip3 install pyserial
 ============================================================
 END OF PHASE 1
 ============================================================
+============================================================
+PHASE 2 — PROJECT LAYOUT, HAZARD3 CLONE, MEMORY MAP, ADDRESS MAP
+============================================================
+
+Goal of this phase:
+- Create a clean directory structure for the whole SoC.
+- Clone Hazard3.
+- Define memory map (Boot ROM, Instruction SRAM, Data SRAM).
+- Define peripheral address map.
+- Fix all paths that later phases will rely on.
+
+All paths assume:
+- Base directory:  $HOME/h3_quad_de10lite
+- Hazard3 repo:    $HOME/h3_quad_de10lite/Hazard3
+- SoC project:     $HOME/h3_quad_de10lite/soc
+
+----------------------------------------
+1. Create base project directory
+----------------------------------------
+cd ~
+mkdir -p h3_quad_de10lite
+cd h3_quad_de10lite
+
+----------------------------------------
+2. Clone Hazard3
+----------------------------------------
+cd ~/h3_quad_de10lite
+git clone https://github.com/Wren6991/Hazard3.git
+
+----------------------------------------
+3. Create SoC project structure
+----------------------------------------
+cd ~/h3_quad_de10lite
+mkdir -p soc/rtl
+mkdir -p soc/sw/boot_rom
+mkdir -p soc/sw/bootloader
+mkdir -p soc/sw/app
+mkdir -p soc/sw/arduino_api
+mkdir -p soc/quartus
+mkdir -p soc/scripts
+
+Final tree (conceptual):
+~/h3_quad_de10lite
+  ├─ Hazard3/              (upstream core + docs)
+  └─ soc/
+     ├─ rtl/               (all custom RTL: top, interconnect, peripherals, memories)
+     ├─ sw/
+     │  ├─ boot_rom/       (reset stub, minimal init, jumps into bootloader region)
+     │  ├─ bootloader/     (UART loader that fills instruction SRAM)
+     │  ├─ app/            (user firmware main, built against Arduino-like API)
+     │  └─ arduino_api/    (pinMode, digitalWrite, Serial, SPI, I2C, PWM wrappers)
+     ├─ quartus/           (Quartus project, .qpf/.qsf, constraint files)
+     └─ scripts/           (helper scripts, UART uploader)
+
+----------------------------------------
+4. Memory map (R3, Harvard)
+----------------------------------------
+
+We define:
+
+- Boot ROM:          16 KB at 0x0000_0000
+- Instruction SRAM:  64 KB at 0x0001_0000
+- Data SRAM:         64 KB at 0x1000_0000
+- APB peripherals:   0x4000_0000 and above
+
+These align with R3 (Harvard) and keep things simple.
+
+Detail:
+
+Boot ROM:
+  Base:   0x0000_0000
+  Size:   16 KB (0x0000_4000)
+  Use:    Very small ROM that initializes cores, sets up stack, jumps to bootloader
+          (which is also in ROM or in instruction SRAM preload area depending on design).
+
+Instruction SRAM:
+  Base:   0x0001_0000
+  Size:   64 KB (0x0001_0000–0x0001_FFFF)
+  Use:    Firmware text (code) loaded over UART by bootloader.
+          All cores fetch instructions from here.
+
+Data SRAM:
+  Base:   0x1000_0000
+  Size:   64 KB (0x1000_0000–0x1000_FFFF)
+  Use:    .data, .bss, heap, stack for all cores.
+
+----------------------------------------
+5. Peripheral address map (APB)
+----------------------------------------
+
+APB base: 0x4000_0000
+
+We carve simple 4 KB windows per peripheral:
+
+UART:
+  Base:   0x4000_0000
+  Size:   4 KB (0x4000_0000–0x4000_0FFF)
+
+GPIO:
+  Base:   0x4000_1000
+  Size:   4 KB (0x4000_1000–0x4000_1FFF)
+
+SPI:
+  Base:   0x4000_2000
+  Size:   4 KB (0x4000_2000–0x4000_2FFF)
+
+I2C:
+  Base:   0x4000_3000
+  Size:   4 KB (0x4000_3000–0x4000_3FFF)
+
+PWM:
+  Base:   0x4000_4000
+  Size:   4 KB (0x4000_4000–0x4000_4FFF)
+
+This will be enforced by the APB address decoder in the SoC RTL.
+
+----------------------------------------
+6. Core architecture decisions (fixed)
+----------------------------------------
+
+Cores:
+- 4× Hazard3 cores, RV32IM, no caches.
+
+Boot:
+- Reset vector at 0x0000_0000 (Boot ROM).
+- Boot ROM sets up minimal environment, then enters the UART bootloader logic.
+- Bootloader receives firmware over UART and writes it into Instruction SRAM starting at 0x0001_0000.
+- After upload, bootloader jumps to 0x0001_0000.
+
+Heap/stack:
+- Data, BSS, stack, and heap are all in Data SRAM region 0x1000_0000–0x1000_FFFF.
+
+Instruction-side vs data-side:
+- All cores share the same instruction SRAM and data SRAM.
+- Cores use `mhartid` to customize behavior.
+
+----------------------------------------
+7. File naming conventions for later phases
+----------------------------------------
+
+In soc/rtl/:
+
+- h3_config_quad.vh        Hazard3 configuration header
+- h3_ahb_arbiter.v         AHB-Lite round-robin arbiter (4 masters)
+- h3_ahb_instr_sram.v      Instruction SRAM AHB slave (64 KB)
+- h3_ahb_data_sram.v       Data SRAM AHB slave (64 KB)
+- h3_ahb_boot_rom.v        Boot ROM AHB slave (16 KB, uses boot_rom.hex)
+- h3_ahb_to_apb.v          AHB-to-APB bridge
+- apb_uart.v               Simple UART (TX+RX)
+- apb_gpio.v               32-bit GPIO
+- apb_spi.v                SPI master
+- apb_i2c.v                I2C bit-bang master
+- apb_pwm.v                4-channel PWM
+- h3_quad_soc.v            SoC-level integration (cores + bus + memories + peripherals)
+- de10lite_quadcore_top.v  Board-level top for DE10-Lite (clock, reset, pins)
+
+In soc/sw/boot_rom/:
+- boot_rom.c               Minimal reset stub
+- linker.ld                ROM linker script
+- Makefile                 Build to boot_rom.hex
+
+In soc/sw/bootloader/:
+- bootloader.c             UART-based firmware loader
+- linker.ld                Bootloader linker script (if separate)
+- Makefile                 Build bootloader binary (may be merged with boot_rom)
+
+In soc/sw/arduino_api/:
+- arduino_hal.h            Basic definitions
+- gpio_api.c               pinMode, digitalWrite, digitalRead
+- uart_api.c               Serial.begin, Serial.print
+- pwm_api.c                analogWrite
+- spi_api.c                SPI functions
+- i2c_api.c                Wire functions
+- Makefile                 Build as a static library (libarduino_api.a)
+
+In soc/sw/app/:
+- main.c                   Example Arduino-like application
+- linker.ld                App linker script (Instruction SRAM + Data SRAM)
+- Makefile                 Build app.elf and app.bin
+
+In soc/scripts/:
+- uart_upload.py           Python script to upload app.bin over UART
+- quartus_setup.tcl        Script to create and configure Quartus project
+
+In soc/quartus/:
+- de10lite_quadcore.qpf    Quartus project file
+- de10lite_quadcore.qsf    Settings + pin assignment file(s)
+- (auto-generated output files, db/, etc.)
+
+----------------------------------------
+8. Clone Hazard3 and note core RTL path
+----------------------------------------
+
+cd ~/h3_quad_de10lite/Hazard3
+ls
+
+Key directories:
+- hdl/                     Hazard3 core and support RTL
+- doc/                     Docs
+
+Later, you will add to Quartus project:
+- hazard3_core.v
+- any required support files (e.g., multiply/div, CSR, etc.)
+
+We keep Hazard3 unmodified and configure it with our own config header.
+
+----------------------------------------
+9. Confirm toolchain + repo layout
+----------------------------------------
+
+Check:
+- RISC-V GCC:
+  which riscv32-unknown-elf-gcc
+
+- Hazard3:
+  ls ~/h3_quad_de10lite/Hazard3
+
+- SoC tree:
+  ls ~/h3_quad_de10lite/soc
+  ls ~/h3_quad_de10lite/soc/rtl
+  ls ~/h3_quad_de10lite/soc/sw
+  ls ~/h3_quad_de10lite/soc/quartus
+  ls ~/h3_quad_de10lite/soc/scripts
+
+If everything matches, you are ready for RTL integration.
+
+============================================================
+END OF PHASE 2
+============================================================
