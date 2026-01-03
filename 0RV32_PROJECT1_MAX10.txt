@@ -1,4 +1,4 @@
-
+For opencore urls see 0RV32_PROJECT1_OCURLS.txt
 ================================================================================
 PHASE 1A: QUAD-CORE-READY SINGLE-HART HAZARD3 SoC SKELETON ON DE0-LITE
 (core tile + 4-master-capable AHB interconnect + Boot ROM + top-level)
@@ -5384,5 +5384,340 @@ WHAT PHASE 1J GIVES YOU TOWARD THE QUAD-CORE GOAL
 
 ########END PHASE 1J ########
 
+================================================================================
+PHASE 1K: SDRAM-RESIDENT FIRMWARE TEMPLATE USING HAL + H3BT BOOTLOADER
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
+================================================================================
 
+GOAL OF PHASE 1K
+----------------
+Build a **first real firmware** that:
 
+- Lives in **SDRAM @ 0x80000000**, not ROM.
+- Uses the Phase 1J HAL: UART0, JTAG-UART, I2C, SPI, GPIO.
+- Is loaded by the Phase 1I bootloader via H3BT (UART0 or JTAG-UART).
+- Demonstrates:
+  - Console output.
+  - I2C write.
+  - SPI transfer.
+  - GPIO LED blink.
+
+We will create:
+
+- `linker_app.ld` — firmware linker script (ROM=bootloader, THIS=fetched into SDRAM).
+- `Makefile`      — build firmware.elf and firmware.bin.
+- `main.c`        — example SDRAM firmware using `h3_soc.h` / `h3_soc.c`.
+
+No hardware / Quartus changes. FPGA is still:
+
+- Configured via `.sof` into **SRAM only**.
+- Boot ROM is bootloader.
+- Power-cycle → DE0-Lite factory demo.
+
+================================================================================
+DIRECTORY STRUCTURE FOR APP FIRMWARE
+================================================================================
+
+Use:
+
+  ~/hazard3_fw/app/
+    - h3_soc.h      (from Phase 1J)
+    - h3_soc.c      (from Phase 1J)
+    - linker_app.ld (NEW)
+    - main.c        (NEW)
+    - Makefile      (NEW)
+
+Bootloader stays in:
+
+  ~/hazard3_fw/bootrom/
+
+================================================================================
+STEP 1 — LINKER SCRIPT FOR SDRAM FIRMWARE: linker_app.ld
+================================================================================
+
+Place firmware `.text` at 0x80000000 so the bootloader can jump there.
+
+----- FILE: ~/hazard3_fw/app/linker_app.ld ------------------------------------
+
+ENTRY(_start)
+
+MEMORY
+{
+  SDRAM (rwx) : ORIGIN = 0x80000000, LENGTH = 64M
+}
+
+SECTIONS
+{
+  .text :
+  {
+    _start = .;
+    *(.text.entry)
+    *(.text*)
+    *(.rodata*)
+  } > SDRAM
+
+  .data :
+  {
+    *(.data*)
+  } > SDRAM
+
+  .bss :
+  {
+    _bss_start = .;
+    *(.bss*)
+    *(COMMON)
+    _bss_end = .;
+  } > SDRAM
+}
+
+================================================================================
+STEP 2 — MAKEFILE FOR SDRAM FIRMWARE: Makefile
+================================================================================
+
+Builds:
+
+- `firmware.elf` — linked at 0x80000000.
+- `firmware.bin` — raw binary for H3BT.
+- Also prints checksum for convenience.
+
+----- FILE: ~/hazard3_fw/app/Makefile -----------------------------------------
+
+RISCV_PREFIX = riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJCOPY = $(RISCV_PREFIX)objcopy
+OBJDUMP = $(RISCV_PREFIX)objdump
+
+CFLAGS  = -march=rv32imc -mabi=ilp32 -Os -nostdlib -ffreestanding -Wall -Wextra
+LDFLAGS = -T linker_app.ld -nostartfiles -nostdlib
+
+SRCS = main.c h3_soc.c
+
+all: firmware.bin checksum
+
+firmware.elf: $(SRCS) linker_app.ld h3_soc.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+
+firmware.bin: firmware.elf
+	$(OBJCOPY) -O binary $< $@
+
+disasm: firmware.elf
+	$(OBJDUMP) -d $< > firmware.disasm
+
+checksum: firmware.bin
+	@python3 - << 'EOF'
+import sys
+data = open("firmware.bin","rb").read()
+cs = sum(data) & 0xFFFFFFFF
+print(f"Length: {len(data)} bytes")
+print(f"Checksum: 0x{cs:08X}")
+EOF
+
+clean:
+	rm -f firmware.elf firmware.bin firmware.disasm
+
+================================================================================
+STEP 3 — SDRAM FIRMWARE MAIN: main.c
+================================================================================
+
+Demonstrates:
+
+- Use HAL to select console (default UART, with optional JTAG).
+- Print boot banner.
+- Initialize I2C and SPI.
+- Talk to an I2C device (0x68).
+- Send one SPI command (0x9F).
+- Blink GPIO LED (bit 18).
+
+----- FILE: ~/hazard3_fw/app/main.c -------------------------------------------
+
+#include "h3_soc.h"
+
+static void select_console_startup(void)
+{
+    /* Default to UART; if JTAG-UART has data early, switch to JTAG. */
+    h3_console_select(H3_CONSOLE_UART);
+
+    for (volatile uint32_t i = 0; i < 2000000u; i++) {
+        char c;
+        if (h3_ju_getc_nonblock(&c)) {
+            (void)c;
+            h3_console_select(H3_CONSOLE_JTAG);
+            break;
+        }
+    }
+}
+
+void _start(void) __attribute__((section(".text.entry")));
+void _start(void)
+{
+    const uint32_t SYS_CLK_HZ = 50000000u;
+
+    /* Initialize UART0 for possible console use */
+    h3_uart_init(SYS_CLK_HZ, 115200u);
+
+    /* Decide console (UART0 vs JTAG-UART) */
+    select_console_startup();
+
+    h3_con_puts("\nHazard3 SDRAM Firmware (Phase 1K)\n");
+    h3_con_puts("Console selected: ");
+    if (h3_console_get() == H3_CONSOLE_UART)
+        h3_con_puts("UART0\n");
+    else
+        h3_con_puts("JTAG-UART\n");
+
+    /* I2C init */
+    if (h3_i2c_init(SYS_CLK_HZ, 100u) != H3_OK) {
+        h3_con_puts("I2C init failed\n");
+    } else {
+        h3_con_puts("I2C init OK (100 kHz)\n");
+    }
+
+    /* Try I2C write to device 0x68 */
+    h3_status_t r = h3_i2c_write_byte(0x68, 0x00, 0x55);
+    if (r == H3_OK) {
+        h3_con_puts("I2C write to 0x68 OK\n");
+    } else {
+        h3_con_puts("I2C write to 0x68 failed\n");
+    }
+
+    /* SPI init (divider=4 → ~SYS_CLK/8 depending on core) */
+    h3_spi_init(SYS_CLK_HZ, 4u);
+    h3_con_puts("SPI init OK\n");
+
+    /* SPI transfer 0x9F */
+    uint8_t spi_resp = h3_spi_transfer(0x9F);
+    h3_con_puts("SPI 0x9F -> 0x");
+    h3_uart_put_hex8(spi_resp); /* use UART hex helper; console is still consistent */
+    h3_con_puts("\n");
+
+    /* GPIO: configure bit 18 as output (LED) */
+    uint32_t led_mask = (1u << 18);
+    h3_gpio_set_dir(led_mask, led_mask);
+
+    h3_con_puts("Blinking LED on GPIO bit 18...\n");
+
+    for (int i = 0; i < 10; i++) {
+        h3_con_puts("LED ON\n");
+        h3_gpio_write(led_mask, led_mask);
+        h3_delay_cycles(5000000u);
+
+        h3_con_puts("LED OFF\n");
+        h3_gpio_write(led_mask, 0u);
+        h3_delay_cycles(5000000u);
+    }
+
+    h3_con_puts("Done. Looping.\n");
+
+    while (1) {
+        __asm__ volatile("wfi");
+    }
+}
+
+================================================================================
+STEP 4 — BUILDING THE SDRAM FIRMWARE
+================================================================================
+
+1. Ensure `h3_soc.h` and `h3_soc.c` from Phase 1J are present in:
+   ~/hazard3_fw/app/
+
+2. Create the three files above:
+   - linker_app.ld
+   - Makefile
+   - main.c
+
+3. Build:
+
+   cd ~/hazard3_fw/app
+   make
+
+   You get:
+   - firmware.elf
+   - firmware.bin
+   - Length + checksum (printed by `make checksum`).
+
+Note:
+- Only the *firmware* uses this linker/app setup.
+- The bootloader in ROM stays as Phase 1I (different directory, different Makefile).
+
+================================================================================
+STEP 5 — USING H3BT BOOTLOADER TO LOAD FIRMWARE INTO SDRAM
+================================================================================
+
+Protocol (Phase 1I):
+
+1. Bootloader waits for magic "H3BT":
+   - bytes: 0x48 0x33 0x42 0x54
+
+2. Then:
+   - 4 bytes: load address (LE) → use 0x80000000 = 00 00 00 80
+   - 4 bytes: length in bytes (LE) → length of firmware.bin
+   - 4 bytes: checksum (LE) → sum of firmware.bin bytes (mod 2^32)
+   - Then: firmware.bin payload
+
+The bootloader:
+
+- Receives all bytes.
+- Writes them to SDRAM at load address.
+- Verifies checksum.
+- Jumps to 0x80000000.
+
+### UART0 path (simplest)
+
+1. Connect UART0 to USB-serial (115200 8N1).
+2. On host:
+
+   - Note `Length` and `Checksum` printed by `make checksum`.
+
+3. Use a small Python helper, e.g.:
+
+   (You can sketch this later; conceptually it writes exactly the H3BT stream.)
+
+4. Reset board (bootloader runs), then send the H3BT stream over the UART.
+
+### JTAG-UART path
+
+- Same byte protocol, but sent via JTAG-UART instead of UART0.
+- Bootloader will likely auto-select JTAG if you type or send something early.
+
+================================================================================
+STEP 6 — RUN SEQUENCE (END-TO-END)
+================================================================================
+
+1. **FPGA config (once per power cycle):**
+   - Program `h3_phase1_sc.sof` via JTAG into SRAM:
+     - Quartus Programmer → JTAG → .sof → Program/Configure.
+   - Do NOT touch flash. On next power-cycle, board = factory demo.
+
+2. **Bootloader in ROM (Phase 1I) starts on reset.**
+   - It prints its banner on whichever console it selects.
+
+3. **Host sends H3BT stream (UART or JTAG-UART).**
+   - Using `firmware.bin`, length, checksum.
+
+4. **Bootloader loads to SDRAM & jumps to 0x80000000.**
+   - Your `main.c` now runs.
+   - You see:
+
+     - “Hazard3 SDRAM Firmware (Phase 1K)”
+     - I2C/SPI status.
+     - LED blink logs.
+
+5. **Power-cycle behavior:**
+   - FPGA loses `.sof` → reloads factory demo from flash (as required).
+   - No permanent state; everything was ephemeral in SRAM and SDRAM.
+
+================================================================================
+WHAT PHASE 1K GIVES YOU TOWARD THE QUAD-CORE GOAL
+================================================================================
+
+- A **full single-hart development loop**:
+  - ROM bootloader (Phase 1I).
+  - HAL (Phase 1J).
+  - SDRAM firmware (Phase 1K) loaded over UART/JTAG (H3BT).
+- Hardware is stable, ephemeral, and quad-core-ready:
+  - AHB fabric (4 masters).
+  - AHB→WB bridge.
+  - SDRAM, UART, I2C, SPI, GPIO, JTAG-UART all integrated.
+- You can now iterate on firmware **without touching RTL**.
+
+===
