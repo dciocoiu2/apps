@@ -529,3 +529,386 @@ WHAT PHASE 3A GIVES YOU
   - Low-power WFI loops.
   - RTOS / SMP scheduling (Phase 3C).
   - DMA completion handling (Phase 3B).
+####RND P3A$###
+
+================================================================================
+PHASE 3B: MINIMAL DMA ENGINE (ONE CHANNEL) + PLIC INTEGRATION
+(ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX)
+================================================================================
+
+OBJECTIVE
+---------
+Add a small, resource-disciplined DMA engine that fits comfortably on your
+DE10-Lite (MAX 10 10M50) and integrates cleanly with your existing SoC:
+
+- Single DMA channel (expandable later).
+- Simple memory-to-memory transfers.
+- 32-bit aligned SRC/DST/LEN.
+- DMA is an AHB master (M4).
+- Control registers on Wishbone at 0x1000_0900.
+- Completion interrupt via PLIC source ID 6.
+- HAL support + example firmware.
+
+================================================================================
+REGISTER MAP (DMA_WB)
+================================================================================
+
+Base: 0x1000_0900
+
+0x00: DMA_CTRL (RW)
+  bit0: START (write 1 to start)
+  bit1: BUSY (read-only)
+  bit2: IRQ_EN
+  bit3: DIR (reserved)
+0x04: DMA_SRC (RW)
+0x08: DMA_DST (RW)
+0x0C: DMA_LEN (RW)
+0x10: DMA_STATUS (RO/W1C)
+  bit0: DONE
+  bit1: ERROR
+0x14..1C: reserved
+
+================================================================================
+STEP 1 — DMA AHB MASTER + WISHBONE SLAVE RTL
+================================================================================
+
+File: rtl/soc/dma_wb_ahb.sv
+
+module dma_wb_ahb
+(
+    input  wire        clk,
+    input  wire        rst,
+
+    // Wishbone slave
+    input  wire [31:0] wb_adr_i,
+    input  wire [31:0] wb_dat_i,
+    output reg  [31:0] wb_dat_o,
+    input  wire        wb_we_i,
+    input  wire [3:0]  wb_sel_i,
+    input  wire        wb_cyc_i,
+    input  wire        wb_stb_i,
+    output reg         wb_ack_o,
+    output wire        wb_err_o,
+
+    // AHB master
+    output reg  [31:0] haddr,
+    output reg         hwrite,
+    output reg  [1:0]  htrans,
+    output reg  [2:0]  hsize,
+    output reg  [2:0]  hburst,
+    output reg  [31:0] hwdata,
+    input  wire [31:0] hrdata,
+    input  wire        hready,
+    input  wire [1:0]  hresp,
+
+    // Interrupt
+    output reg         dma_irq
+);
+
+    assign wb_err_o = 1'b0;
+
+    reg [31:0] reg_ctrl;
+    reg [31:0] reg_src;
+    reg [31:0] reg_dst;
+    reg [31:0] reg_len;
+    reg [31:0] reg_status;
+
+    wire ctrl_start   = reg_ctrl[0];
+    wire ctrl_busy    = reg_ctrl[1];
+    wire ctrl_irq_en  = reg_ctrl[2];
+
+    reg [31:0] cur_src;
+    reg [31:0] cur_dst;
+    reg [31:0] bytes_remaining;
+
+    typedef enum logic [2:0] {
+        DMA_IDLE = 3'd0,
+        DMA_READ = 3'd1,
+        DMA_WAIT_READ = 3'd2,
+        DMA_WRITE = 3'd3,
+        DMA_WAIT_WRITE = 3'd4,
+        DMA_DONE = 3'd5
+    } dma_state_t;
+
+    dma_state_t state;
+
+    localparam [1:0] HTRANS_IDLE   = 2'b00;
+    localparam [1:0] HTRANS_NONSEQ = 2'b10;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wb_ack_o <= 1'b0;
+            wb_dat_o <= 32'h0;
+            reg_ctrl <= 32'h0;
+            reg_src  <= 32'h0;
+            reg_dst  <= 32'h0;
+            reg_len  <= 32'h0;
+            reg_status <= 32'h0;
+
+            cur_src <= 32'h0;
+            cur_dst <= 32'h0;
+            bytes_remaining <= 32'h0;
+
+            state <= DMA_IDLE;
+
+            haddr  <= 32'h0;
+            hwrite <= 1'b0;
+            htrans <= HTRANS_IDLE;
+            hsize  <= 3'b010;
+            hburst <= 3'b000;
+            hwdata <= 32'h0;
+
+            dma_irq <= 1'b0;
+        end else begin
+            wb_ack_o <= 1'b0;
+            htrans   <= HTRANS_IDLE;
+            dma_irq  <= 1'b0;
+
+            // Wishbone interface
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+
+                if (wb_we_i) begin
+                    case (wb_adr_i[5:2])
+                        4'h0: begin
+                            reg_ctrl[2] <= wb_dat_i[2];
+                            reg_ctrl[3] <= wb_dat_i[3];
+                        end
+                        4'h1: reg_src <= wb_dat_i;
+                        4'h2: reg_dst <= wb_dat_i;
+                        4'h3: reg_len <= wb_dat_i;
+                        4'h4: begin
+                            if (wb_dat_i[0]) reg_status[0] <= 1'b0;
+                            if (wb_dat_i[1]) reg_status[1] <= 1'b0;
+                        end
+                    endcase
+                end else begin
+                    case (wb_adr_i[5:2])
+                        4'h0: wb_dat_o <= reg_ctrl;
+                        4'h1: wb_dat_o <= reg_src;
+                        4'h2: wb_dat_o <= reg_dst;
+                        4'h3: wb_dat_o <= reg_len;
+                        4'h4: wb_dat_o <= reg_status;
+                        default: wb_dat_o <= 32'h0;
+                    endcase
+                end
+            end
+
+            // DMA state machine
+            case (state)
+                DMA_IDLE: begin
+                    reg_ctrl[1] <= 1'b0;
+
+                    if (reg_ctrl[0] && reg_len != 0) begin
+                        reg_ctrl[0] <= 1'b0;
+                        reg_ctrl[1] <= 1'b1;
+                        reg_status[0] <= 1'b0;
+                        reg_status[1] <= 1'b0;
+
+                        cur_src <= reg_src;
+                        cur_dst <= reg_dst;
+                        bytes_remaining <= reg_len;
+
+                        state <= DMA_READ;
+                    end
+                end
+
+                DMA_READ: begin
+                    haddr  <= cur_src;
+                    hwrite <= 1'b0;
+                    hsize  <= 3'b010;
+                    hburst <= 3'b000;
+                    htrans <= HTRANS_NONSEQ;
+
+                    if (hready)
+                        state <= DMA_WAIT_READ;
+                end
+
+                DMA_WAIT_READ: begin
+                    if (hready) begin
+                        hwdata <= hrdata;
+                        state <= DMA_WRITE;
+                    end
+                end
+
+                DMA_WRITE: begin
+                    haddr  <= cur_dst;
+                    hwrite <= 1'b1;
+                    hsize  <= 3'b010;
+                    hburst <= 3'b000;
+                    htrans <= HTRANS_NONSEQ;
+
+                    if (hready)
+                        state <= DMA_WAIT_WRITE;
+                end
+
+                DMA_WAIT_WRITE: begin
+                    if (hready) begin
+                        if (bytes_remaining <= 4) begin
+                            state <= DMA_DONE;
+                        end else begin
+                            cur_src <= cur_src + 4;
+                            cur_dst <= cur_dst + 4;
+                            bytes_remaining <= bytes_remaining - 4;
+                            state <= DMA_READ;
+                        end
+                    end
+                end
+
+                DMA_DONE: begin
+                    reg_ctrl[1] <= 1'b0;
+                    reg_status[0] <= 1'b1;
+                    if (reg_ctrl[2])
+                        dma_irq <= 1'b1;
+                    state <= DMA_IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+================================================================================
+STEP 2 — AHB INTEGRATION (MASTER M4)
+================================================================================
+
+In your AHB interconnect:
+
+- Add DMA as a new master (M4).
+- Add arbitration entry.
+- Connect DMA’s haddr/hwrite/htrans/hsize/hburst/hwdata.
+- Return hrdata/hready/hresp to DMA.
+
+DMA can be lowest priority.
+
+================================================================================
+STEP 3 — WISHBONE INTEGRATION (SLAVE S10)
+================================================================================
+
+In wb_interconnect.sv:
+
+- Add s10_* signals.
+- Decode 0x1000_0900:
+
+  sel_s10 = (m_adr_i[31:8] == 24'h100009);
+
+- Add to master/slave mux logic.
+
+================================================================================
+STEP 4 — top_soc.sv INSTANTIATION
+================================================================================
+
+Add WB signals for s10, AHB signals for DMA, and:
+
+wire dma_irq;
+assign plic_src_irq[6] = dma_irq;
+
+Instantiate:
+
+dma_wb_ahb u_dma ( ... );
+
+Connect DMA AHB signals to AHB fabric as master M4.
+
+================================================================================
+STEP 5 — HAL EXTENSIONS
+================================================================================
+
+In h3_soc.h:
+
+#define H3_DMA_BASE        0x10000900u
+#define H3_DMA_CTRL        (*(volatile uint32_t *)(H3_DMA_BASE + 0x00))
+#define H3_DMA_SRC         (*(volatile uint32_t *)(H3_DMA_BASE + 0x04))
+#define H3_DMA_DST         (*(volatile uint32_t *)(H3_DMA_BASE + 0x08))
+#define H3_DMA_LEN         (*(volatile uint32_t *)(H3_DMA_BASE + 0x0C))
+#define H3_DMA_STATUS      (*(volatile uint32_t *)(H3_DMA_BASE + 0x10))
+
+#define H3_DMA_CTRL_START  (1u << 0)
+#define H3_DMA_CTRL_BUSY   (1u << 1)
+#define H3_DMA_CTRL_IRQ_EN (1u << 2)
+
+#define H3_DMA_STATUS_DONE (1u << 0)
+
+h3_dma_status_t h3_dma_start(uint32_t src, uint32_t dst, uint32_t len, int irq_en);
+int             h3_dma_busy(void);
+uint32_t        h3_dma_poll_done(void);
+void            h3_dma_clear_done(void);
+
+In h3_soc.c:
+
+h3_dma_status_t h3_dma_start(uint32_t src, uint32_t dst, uint32_t len, int irq_en)
+{
+    if ((src & 3) || (dst & 3) || (len & 3) || len == 0)
+        return H3_DMA_ERR_PARAM;
+
+    if (H3_DMA_CTRL & H3_DMA_CTRL_BUSY)
+        return H3_DMA_ERR_PARAM;
+
+    H3_DMA_SRC = src;
+    H3_DMA_DST = dst;
+    H3_DMA_LEN = len;
+
+    uint32_t ctrl = irq_en ? H3_DMA_CTRL_IRQ_EN : 0;
+    H3_DMA_CTRL = ctrl | H3_DMA_CTRL_START;
+
+    return H3_DMA_OK;
+}
+
+int h3_dma_busy(void)
+{
+    return (H3_DMA_CTRL & H3_DMA_CTRL_BUSY) ? 1 : 0;
+}
+
+uint32_t h3_dma_poll_done(void)
+{
+    return (H3_DMA_STATUS & H3_DMA_STATUS_DONE) ? 1u : 0u;
+}
+
+void h3_dma_clear_done(void)
+{
+    H3_DMA_STATUS = H3_DMA_STATUS_DONE;
+}
+
+================================================================================
+STEP 6 — FIRMWARE EXAMPLE (HART0)
+================================================================================
+
+In trap_handler:
+
+else if (id == 6u) {
+    h3_con_puts("HART0: DMA complete IRQ\n");
+    h3_dma_clear_done();
+}
+
+In hart0_main():
+
+h3_plic_enable_irq(0, 6, 1);
+h3_enable_mei();
+
+uint32_t *src = (uint32_t *)(H3_SDRAM_BASE + 0x00100000);
+uint32_t *dst = (uint32_t *)(H3_SDRAM_BASE + 0x00101000);
+
+for (int i = 0; i < 256; i++) {
+    src[i] = 0x12340000 + i;
+    dst[i] = 0;
+}
+
+h3_con_puts("Starting DMA...\n");
+h3_dma_start((uint32_t)src, (uint32_t)dst, 256*4, 1);
+
+while (1) __asm__ volatile("wfi");
+
+================================================================================
+RESULT OF PHASE 3B
+================================================================================
+
+You now have:
+
+- A working DMA engine.
+- AHB master integration.
+- Wishbone control block at 0x1000_0900.
+- Completion interrupt via PLIC ID 6.
+- HAL + firmware example.
+
+This sets the stage for Phase 3C (RTOS/SMP scheduler).
+
+####END P3B####
