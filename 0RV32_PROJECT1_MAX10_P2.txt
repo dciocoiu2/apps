@@ -1,3 +1,5 @@
+⚠️⚠️START WITH FIRST FILE THIS IS PART2⚠️⚠️
+
 ================================================================================
 PHASE 2A: ADD HART1–HART3 (MULTI-CORE HAZARD3 TILES ON AHB M1–M3)
 (ALL CONTENT IN ONE COPY-PASTABLE TEXTBOX, SRAM-ONLY, NO FLASH)
