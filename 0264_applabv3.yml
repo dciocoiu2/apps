@@ -1,0 +1,125 @@
+#0264_applabv3.yml
+
+networks:
+  backend:
+  code:
+  app:
+  proxy:
+
+volumes:
+  jenkins_data:
+  source_templates_data:
+  mysql1_data:
+  mysql2_data:
+  mysql3_data:
+  mysql4_data:
+
+services:
+  # --------------------------------------------------------------------------
+  # Jenkins – builds app images and writes deployment templates
+  # --------------------------------------------------------------------------
+  jenkins:
+    image: jenkins/jenkins:lts
+    user: root
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+      - code
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_templates_data:/templates
+
+  # --------------------------------------------------------------------------
+  # Source/templates holder (ephemeral)
+  # --------------------------------------------------------------------------
+  source:
+    image: alpine
+    command: ["sleep", "infinity"]
+    networks:
+      - code
+    volumes:
+      - source_templates_data:/templates
+
+  # --------------------------------------------------------------------------
+  # MySQL nodes (ephemeral)
+  # --------------------------------------------------------------------------
+  mysql1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql1_data:/var/lib/mysql
+
+  mysql2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql2_data:/var/lib/mysql
+
+  mysql3:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql3_data:/var/lib/mysql
+
+  mysql4:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql4_data:/var/lib/mysql
+
+  # --------------------------------------------------------------------------
+  # Traefik – dynamic load balancer (no external config files)
+  # --------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+    networks:
+      - proxy
+      - app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # --------------------------------------------------------------------------
+  # Controller – the single web GUI that controls everything
+  # --------------------------------------------------------------------------
+  controller:
+    image: dotnet-controller:latest
+    networks:
+      - proxy
+      - app
+      - backend
+      - code
+    depends_on:
+      - jenkins
+      - traefik
+      - mysql1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_templates_data:/templates
+    environment:
+      TEMPLATE_PATH: "/templates"
+      APP_NETWORK: "app"
+      DEFAULT_APP_IMAGE: "dotnet-app:latest"
