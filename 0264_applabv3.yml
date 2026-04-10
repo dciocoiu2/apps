@@ -1,4 +1,9 @@
 #0264_applabv3.yml
+#ex: docker run -d \
+#  --network app \
+#  --label traefik.enable=true \
+ # --label #traefik.http.routers.myapp.rule=PathPrefi#x(`/`) \
+# dotnet-app:latest
 
 networks:
   backend:
