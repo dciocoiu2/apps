@@ -1,0 +1,133 @@
+#0264_applabv2.yml
+networks:
+  backend:      # DB + Jenkins
+  code:         # Jenkins + source/templates
+  app:          # Runtime app containers
+  proxy:        # Traefik + controller
+
+volumes:
+  jenkins_data:
+  source_templates_data:
+  mysql1_data:
+  mysql2_data:
+  mysql3_data:
+  mysql4_data:
+
+services:
+  # --------------------------------------------------------------------------
+  # Jenkins – builds images and writes deployment templates
+  # --------------------------------------------------------------------------
+  jenkins:
+    image: jenkins/jenkins:lts
+    user: root
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+      - code
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_templates_data:/templates   # Jenkins writes templates here
+
+  # --------------------------------------------------------------------------
+  # Ephemeral source/templates holder (optional helper container)
+  # --------------------------------------------------------------------------
+  source:
+    image: alpine
+    command: ["sleep", "infinity"]
+    networks:
+      - code
+    volumes:
+      - source_templates_data:/templates
+
+  # --------------------------------------------------------------------------
+  # MySQL nodes (ephemeral; extend with Group Replication if you want real HA)
+  # --------------------------------------------------------------------------
+  mysql1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql1_data:/var/lib/mysql
+
+  mysql2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql2_data:/var/lib/mysql
+
+  mysql3:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql3_data:/var/lib/mysql
+
+  mysql4:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql4_data:/var/lib/mysql
+
+  # --------------------------------------------------------------------------
+  # Traefik – dynamic reverse proxy / load balancer (no external config files)
+  # --------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+    networks:
+      - proxy
+      - app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # --------------------------------------------------------------------------
+  # .NET controller – single web GUI controlling everything
+  # --------------------------------------------------------------------------
+  controller:
+    image: dotnet-controller:latest   # your ASP.NET Core GUI image
+    networks:
+      - proxy
+      - app
+      - backend
+      - code
+    depends_on:
+      - jenkins
+      - traefik
+      - mysql1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_templates_data:/templates
+    environment:
+      # Controller reads JSON/YAML templates from here (written by Jenkins)
+      TEMPLATE_PATH: "/templates"
+      # Network where new app containers should be attached
+      APP_NETWORK: "app"
+      # Default image if template doesn’t override
+      DEFAULT_APP_IMAGE: "dotnet-app:latest"
+      # You can add DB connection info, etc., as needed
+
+  # --------------------------------------------------------------------------
+  # NOTE: No app services are defined statically.
+  # The controller will create app containers dynamically using templates.
+  # --------------------------------------------------------------------------
