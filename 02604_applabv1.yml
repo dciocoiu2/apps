@@ -1,0 +1,127 @@
+#0264_applabv1.yml
+
+networks:
+  backend:      # DB + Jenkins
+  code:         # Jenkins + source
+  app:          # Runtime app containers
+  proxy:        # Traefik + controller
+
+volumes:
+  jenkins_data:
+  source_data:
+  mysql1_data:
+  mysql2_data:
+  mysql3_data:
+  mysql4_data:
+
+services:
+  # --------------------------------------------------------------------------
+  # Ephemeral source repo holder (Jenkins workspace / templates, etc.)
+  # --------------------------------------------------------------------------
+  source:
+    image: alpine/git
+    command: ["sleep", "infinity"]
+    networks:
+      - code
+    volumes:
+      - source_data:/repo
+
+  # --------------------------------------------------------------------------
+  # Jenkins – builds images (including dotnet-app:latest) and writes templates
+  # --------------------------------------------------------------------------
+  jenkins:
+    image: jenkins/jenkins:lts
+    user: root
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+      - code
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_data:/workspace/src
+
+  # --------------------------------------------------------------------------
+  # MySQL nodes (ephemeral). You can extend with Group Replication later.
+  # --------------------------------------------------------------------------
+  mysql1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql1_data:/var/lib/mysql
+
+  mysql2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql2_data:/var/lib/mysql
+
+  mysql3:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql3_data:/var/lib/mysql
+
+  mysql4:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    networks:
+      - backend
+    volumes:
+      - mysql4_data:/var/lib/mysql
+
+  # --------------------------------------------------------------------------
+  # Traefik – dynamic reverse proxy / load balancer, all config inline
+  # --------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+    networks:
+      - proxy
+      - app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # --------------------------------------------------------------------------
+  # .NET controller GUI – reads deployment templates, starts/stops app containers
+  # --------------------------------------------------------------------------
+  controller:
+    image: dotnet-controller:latest   # your ASP.NET Core GUI image
+    networks:
+      - proxy
+      - app
+      - backend
+      - code
+    depends_on:
+      - mysql1
+      - traefik
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - source_data:/templates
+    environment:
+      # Where deployment templates live (JSON/YAML describing app/language/image)
+      TEMPLATE_PATH: "/templates/deployments"
+      # Default app network for new containers
+      APP_NETWORK: "app"
+      # Example default image if template doesn’t override
+      DEFAULT_APP_IMAGE: "dotnet-app:latest"
