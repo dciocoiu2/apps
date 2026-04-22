@@ -2,26 +2,89 @@ version: "3.9"
 
 services:
   ide:
+    image: codercom/code-server:latest
     container_name: ide
-    build:
-      context: .
-      dockerfile: Dockerfile.ide
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - ide-work:/home/coder/project
     networks:
       - ide-net
+    command: >
+      bash -c "
+      apt-get update &&
+      apt-get install -y curl wget python3 python3-pip mono-complete inotify-tools &&
+      rm -rf /var/lib/apt/lists/* &&
+      curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
+      bash /tmp/dotnet-install.sh --channel 6.0 &&
+      bash /tmp/dotnet-install.sh --channel 7.0 &&
+      bash /tmp/dotnet-install.sh --channel 8.0 &&
+      code-server --install-extension ms-dotnettools.csharp &&
+      code-server --install-extension ms-python.python &&
+      code-server --install-extension ms-python.debugpy &&
+      code-server --install-extension ms-vscode.mono-debug &&
+      mkdir -p /home/coder/project/.vscode &&
+      cat << 'EOF' > /home/coder/project/.vscode/tasks.json
+      {
+        \"version\": \"2.0.0\",
+        \"tasks\": [
+          {
+            \"label\": \"Run in isolated container (auto)\",
+            \"type\": \"shell\",
+            \"command\": \"curl -s -X POST http://spawner:8090/run -H 'Content-Type: application/json' -d '{\\\\\"workspace\\\\\":\\\\\"/workspace\\\\\"}'\",
+            \"problemMatcher\": []
+          },
+          {
+            \"label\": \"Run with hot reload\",
+            \"type\": \"shell\",
+            \"command\": \"curl -s -X POST http://spawner:8090/run -H 'Content-Type: application/json' -d '{\\\\\"workspace\\\\\":\\\\\"/workspace\\\\\",\\\\\"hotReload\\\\\":true}'\",
+            \"problemMatcher\": []
+          }
+        ]
+      }
+      EOF
+      &&
+      cat << 'EOF' > /home/coder/project/.vscode/launch.json
+      {
+        \"version\": \"0.2.0\",
+        \"configurations\": [
+          {
+            \"name\": \"Attach .NET Core (remote)\",
+            \"type\": \"coreclr\",
+            \"request\": \"attach\",
+            \"processId\": \"\",
+            \"justMyCode\": true
+          },
+          {
+            \"name\": \"Python Attach (remote)\",
+            \"type\": \"python\",
+            \"request\": \"attach\",
+            \"connect\": { \"host\": \"localhost\", \"port\": 5678 }
+          }
+        ]
+      }
+      EOF
+      &&
+      code-server --bind-addr 0.0.0.0:8080 --auth none
+      "
 
   spawner:
     image: python:3.12-slim
     container_name: spawner
-    entrypoint: >
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ide-work:/workspace:rw
+    networks:
+      - ide-net
+    command: >
       bash -c "
+      pip install flask docker &&
       mkdir -p /app &&
       cat << 'EOF' > /app/spawner.py
-from flask import Flask, request, jsonify
-import docker, uuid
+from flask import Flask, request, jsonify, Response
+import docker, uuid, os, glob
 
 app = Flask(__name__)
 client = docker.from_env()
@@ -34,33 +97,50 @@ IMAGE_MAP = {
     'python': 'python:3.12-slim'
 }
 
+def detect_runtime(path):
+    csproj = glob.glob(os.path.join(path, '*.csproj'))
+    sln = glob.glob(os.path.join(path, '*.sln'))
+    py = os.path.join(path, 'main.py')
+    if csproj or sln:
+        return 'dotnet8'
+    if os.path.exists(py):
+        return 'python'
+    return 'dotnet8'
+
+def build_command(runtime, path, hot_reload=False):
+    if runtime.startswith('dotnet'):
+        if hot_reload:
+            return 'dotnet watch run'
+        return 'dotnet run'
+    if runtime == 'mono':
+        return \"bash -c 'msbuild && mono bin/Debug/*/*.exe'\"
+    if runtime == 'python':
+        if hot_reload and os.path.exists(os.path.join(path, 'app.py')):
+            return 'FLASK_APP=app.py FLASK_ENV=development flask run --host=0.0.0.0 --port=5000'
+        return 'python3 main.py'
+    return 'sh'
+
 @app.post('/run')
 def run_program():
     data = request.json or {}
-    runtime = data.get('runtime', 'dotnet8')
     workspace = data.get('workspace', '/workspace')
+    runtime = data.get('runtime') or detect_runtime(workspace)
+    hot_reload = bool(data.get('hotReload', False))
 
     if runtime not in IMAGE_MAP:
         return jsonify({'error': 'unknown runtime'}), 400
 
-    run_cmd = data.get('command')
-    if not run_cmd:
-        if runtime.startswith('dotnet'):
-            run_cmd = 'dotnet run'
-        elif runtime == 'mono':
-            run_cmd = 'bash -c \"msbuild && mono bin/Debug/*/*.exe\"'
-        else:
-            run_cmd = 'python3 main.py'
+    cmd = data.get('command') or build_command(runtime, workspace, hot_reload)
 
     container = client.containers.run(
         IMAGE_MAP[runtime],
-        command=f\"bash -c 'cd /app && {run_cmd}'\",
+        command=f\"bash -c 'cd /app && {cmd}'\",
         volumes={workspace: {'bind': '/app', 'mode': 'rw'}},
         detach=True,
         network='none',
         name=f\"run-{runtime}-{uuid.uuid4()}\"
     )
-    return jsonify({'id': container.id})
+    return jsonify({'id': container.id, 'runtime': runtime, 'command': cmd})
 
 @app.post('/kill')
 def kill():
@@ -75,66 +155,110 @@ def kill():
 def logs(cid):
     try:
         c = client.containers.get(cid)
-        return c.logs().decode('utf-8')
+        return Response(c.logs(stream=False), mimetype='text/plain')
     except:
         return 'not found', 404
 
-app.run(host='0.0.0.0', port=8090)
+@app.get('/containers')
+def containers():
+    lst = []
+    for c in client.containers.list(all=True):
+        if c.name.startswith('run-'):
+            lst.append({'id': c.id, 'name': c.name, 'status': c.status})
+    return jsonify(lst)
+
+@app.get('/gui')
+def gui():
+    html = '''
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Runtime Spawner</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    button { margin: 4px; padding: 6px 10px; }
+    pre { background: #111; color: #0f0; padding: 10px; max-height: 300px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Runtime Spawner Dashboard</h1>
+  <div>
+    <label>Runtime:</label>
+    <select id="runtime">
+      <option value="">auto</option>
+      <option value="dotnet8">.NET 8</option>
+      <option value="dotnet7">.NET 7</option>
+      <option value="dotnet6">.NET 6</option>
+      <option value="mono">Mono</option>
+      <option value="python">Python</option>
+    </select>
+    <label><input type="checkbox" id="hotReload"> Hot reload</label>
+    <button onclick="run()">Run</button>
+  </div>
+  <h2>Containers</h2>
+  <button onclick="refresh()">Refresh</button>
+  <ul id="list"></ul>
+  <h2>Logs</h2>
+  <pre id="logs"></pre>
+<script>
+async function run() {
+  const runtime = document.getElementById('runtime').value;
+  const hotReload = document.getElementById('hotReload').checked;
+  const body = { workspace: '/workspace', hotReload: hotReload };
+  if (runtime) body.runtime = runtime;
+  const res = await fetch('/run', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  const j = await res.json();
+  alert('Started: ' + JSON.stringify(j));
+  refresh();
+}
+async function refresh() {
+  const res = await fetch('/containers');
+  const j = await res.json();
+  const ul = document.getElementById('list');
+  ul.innerHTML = '';
+  j.forEach(c => {
+    const li = document.createElement('li');
+    li.textContent = c.name + ' (' + c.status + ') ';
+    const btnLog = document.createElement('button');
+    btnLog.textContent = 'Logs';
+    btnLog.onclick = () => showLogs(c.id);
+    const btnKill = document.createElement('button');
+    btnKill.textContent = 'Kill';
+    btnKill.onclick = () => kill(c.id);
+    li.appendChild(btnLog);
+    li.appendChild(btnKill);
+    ul.appendChild(li);
+  });
+}
+async function showLogs(id) {
+  const res = await fetch('/logs/' + id);
+  const txt = await res.text();
+  document.getElementById('logs').textContent = txt;
+}
+async function kill(id) {
+  await fetch('/kill', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({id:id})
+  });
+  refresh();
+}
+refresh();
+</script>
+</body>
+</html>
+'''
+    return html
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8090)
 EOF
-      pip install flask docker &&
       python3 /app/spawner.py
       "
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ide-work:/workspace:ro
-    ports:
-      - "127.0.0.1:8090:8090"
-    networks:
-      - ide-net
-
-# ---------------------------------------------------------
-# Inline Dockerfile generated at runtime
-# ---------------------------------------------------------
-# This is created dynamically by Compose using build.dockerfile
-# ---------------------------------------------------------
-x-generated-dockerfile: &dockerfile |
-  FROM codercom/code-server:latest
-
-  USER root
-
-  RUN apt-get update && \
-      apt-get install -y curl wget python3 python3-pip mono-complete && \
-      rm -rf /var/lib/apt/lists/*
-
-  RUN curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
-      bash /tmp/dotnet-install.sh --channel 6.0 && \
-      bash /tmp/dotnet-install.sh --channel 7.0 && \
-      bash /tmp/dotnet-install.sh --channel 8.0
-
-  RUN code-server --install-extension ms-dotnettools.csharp && \
-      code-server --install-extension ms-python.python && \
-      code-server --install-extension ms-python.debugpy && \
-      code-server --install-extension ms-vscode.mono-debug
-
-  RUN mkdir -p /vsdbg && \
-      wget https://aka.ms/getvsdbgsh -O /tmp/getvsdbg.sh && \
-      bash /tmp/getvsdbg.sh -v latest -l /vsdbg
-
-  USER coder
-  WORKDIR /home/coder/project
-
-  CMD ["bash", "-c", "code-server --bind-addr 0.0.0.0:8080 --auth none"]
-
-# Attach inline Dockerfile
-services:
-  ide:
-    build:
-      dockerfile: Dockerfile.ide
-
-# Compose writes the Dockerfile into the build context at runtime
-configs:
-  Dockerfile.ide:
-    content: *dockerfile
 
 networks:
   ide-net:
