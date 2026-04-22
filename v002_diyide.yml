@@ -1,0 +1,273 @@
+# ============================================================
+# USER-CONFIGURABLE RUNTIME VERSIONS
+# ============================================================
+x-runtime-config: &runtime-config
+  DOTNET_CHANNELS: "8.0 9.0"
+  DOTNET_DEFAULT: "8.0"
+  PYTHON_VERSION: "3.12"
+  PYTHON_RUNTIME_IMAGE: "python:3.12-slim"
+  MONO_VERSION: "latest"
+
+services:
+  # ============================================================
+  # IDE — Visual Studio–like browser IDE (code-server)
+  # ============================================================
+  ide:
+    image: codercom/code-server:latest
+    container_name: ide
+    environment:
+      <<: *runtime-config
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - ide-net
+    volumes:
+      - ide-work:/home/coder/project
+    command: >
+      bash -c "
+      apt-get update &&
+      apt-get install -y curl wget python3 python3-pip mono-complete inotify-tools &&
+      rm -rf /var/lib/apt/lists/* &&
+
+      # Install user-selected .NET SDK channels
+      curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
+      for channel in $DOTNET_CHANNELS; do
+        bash /tmp/dotnet-install.sh --channel $channel;
+      done &&
+
+      # Install VS Code extensions
+      code-server --install-extension ms-dotnettools.csharp &&
+      code-server --install-extension ms-python.python &&
+      code-server --install-extension ms-python.debugpy &&
+      code-server --install-extension ms-vscode.mono-debug &&
+
+      # Create VS Code tasks.json (F5-like run)
+      mkdir -p /home/coder/project/.vscode &&
+      cat << 'EOF' > /home/coder/project/.vscode/tasks.json
+      {
+        \"version\": \"2.0.0\",
+        \"tasks\": [
+          {
+            \"label\": \"Run (auto)\",
+            \"type\": \"shell\",
+            \"command\": \"curl -s -X POST http://spawner:8090/run -H 'Content-Type: application/json' -d '{\\\\\"workspace\\\\\":\\\\\"/workspace\\\\\"}'\",
+            \"problemMatcher\": []
+          },
+          {
+            \"label\": \"Run with hot reload\",
+            \"type\": \"shell\",
+            \"command\": \"curl -s -X POST http://spawner:8090/run -H 'Content-Type: application/json' -d '{\\\\\"workspace\\\\\":\\\\\"/workspace\\\\\",\\\\\"hotReload\\\\\":true}'\",
+            \"problemMatcher\": []
+          }
+        ]
+      }
+      EOF
+      &&
+
+      # Create launch.json for debugger attach
+      cat << 'EOF' > /home/coder/project/.vscode/launch.json
+      {
+        \"version\": \"0.2.0\",
+        \"configurations\": [
+          {
+            \"name\": \"Attach .NET Core\",
+            \"type\": \"coreclr\",
+            \"request\": \"attach\",
+            \"processId\": \"\"
+          },
+          {
+            \"name\": \"Python Attach\",
+            \"type\": \"python\",
+            \"request\": \"attach\",
+            \"connect\": { \"host\": \"localhost\", \"port\": 5678 }
+          }
+        ]
+      }
+      EOF
+      &&
+
+      code-server --bind-addr 0.0.0.0:8080 --auth none
+      "
+
+  # ============================================================
+  # SPAWNER — Visual Studio–style runtime launcher
+  # ============================================================
+  spawner:
+    image: python:3.12-slim
+    container_name: spawner
+    environment:
+      <<: *runtime-config
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - ide-net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ide-work:/workspace:rw
+    command: >
+      bash -c "
+      pip install flask docker &&
+      mkdir -p /app &&
+
+      # Generate spawner.py dynamically
+      cat << 'EOF' > /app/spawner.py
+from flask import Flask, request, jsonify, Response
+import docker, uuid, os, glob
+
+app = Flask(__name__)
+client = docker.from_env()
+
+DOTNET_DEFAULT = os.getenv('DOTNET_DEFAULT')
+PYTHON_RUNTIME = os.getenv('PYTHON_RUNTIME_IMAGE')
+MONO_VERSION = os.getenv('MONO_VERSION')
+
+IMAGE_MAP = {
+    'dotnet': f'mcr.microsoft.com/dotnet/sdk:{DOTNET_DEFAULT}',
+    'python': PYTHON_RUNTIME,
+    'mono': f'mono:{MONO_VERSION}'
+}
+
+def detect_runtime(path):
+    if glob.glob(os.path.join(path, '*.csproj')) or glob.glob(os.path.join(path, '*.sln')):
+        return 'dotnet'
+    if os.path.exists(os.path.join(path, 'main.py')):
+        return 'python'
+    return 'dotnet'
+
+def build_command(runtime, path, hot):
+    if runtime == 'dotnet':
+        return 'dotnet watch run' if hot else 'dotnet run'
+    if runtime == 'mono':
+        return \"bash -c 'msbuild && mono bin/Debug/*/*.exe'\"
+    if runtime == 'python':
+        if hot and os.path.exists(os.path.join(path, 'app.py')):
+            return 'FLASK_APP=app.py FLASK_ENV=development flask run --host=0.0.0.0 --port=5000'
+        return 'python3 main.py'
+    return 'sh'
+
+@app.post('/run')
+def run_program():
+    data = request.json or {}
+    workspace = data.get('workspace', '/workspace')
+    runtime = data.get('runtime') or detect_runtime(workspace)
+    hot = bool(data.get('hotReload', False))
+
+    image = IMAGE_MAP.get(runtime)
+    if not image:
+        return jsonify({'error': 'unknown runtime'}), 400
+
+    cmd = data.get('command') or build_command(runtime, workspace, hot)
+
+    container = client.containers.run(
+        image,
+        command=f\"bash -c 'cd /app && {cmd}'\",
+        volumes={workspace: {'bind': '/app', 'mode': 'rw'}},
+        detach=True,
+        network='none',
+        name=f\"run-{runtime}-{uuid.uuid4()}\"
+    )
+    return jsonify({'id': container.id, 'runtime': runtime, 'command': cmd})
+
+@app.post('/kill')
+def kill():
+    cid = (request.json or {}).get('id')
+    try:
+        client.containers.get(cid).remove(force=True)
+        return jsonify({'status': 'killed'})
+    except:
+        return jsonify({'error': 'not found'}), 404
+
+@app.get('/logs/<cid>')
+def logs(cid):
+    try:
+        c = client.containers.get(cid)
+        return Response(c.logs(), mimetype='text/plain')
+    except:
+        return 'not found', 404
+
+@app.get('/containers')
+def containers():
+    lst = []
+    for c in client.containers.list(all=True):
+        if c.name.startswith('run-'):
+            lst.append({'id': c.id, 'name': c.name, 'status': c.status})
+    return jsonify(lst)
+
+@app.get('/gui')
+def gui():
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spawner Dashboard</title>
+<style>
+body { font-family: sans-serif; margin: 20px; }
+button { margin: 4px; padding: 6px 10px; }
+pre { background: #111; color: #0f0; padding: 10px; max-height: 300px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Runtime Spawner Dashboard</h1>
+<div>
+<label>Runtime:</label>
+<select id="runtime">
+<option value="">auto</option>
+<option value="dotnet">.NET</option>
+<option value="python">Python</option>
+<option value="mono">Mono</option>
+</select>
+<label><input type="checkbox" id="hot"> Hot reload</label>
+<button onclick="run()">Run</button>
+</div>
+<h2>Containers</h2>
+<button onclick="refresh()">Refresh</button>
+<ul id="list"></ul>
+<h2>Logs</h2>
+<pre id="logs"></pre>
+<script>
+async function run() {
+  const runtime = document.getElementById('runtime').value;
+  const hot = document.getElementById('hot').checked;
+  const body = { workspace: '/workspace', hotReload: hot };
+  if (runtime) body.runtime = runtime;
+  const res = await fetch('/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  alert(await res.text());
+  refresh();
+}
+async function refresh() {
+  const res = await fetch('/containers');
+  const j = await res.json();
+  const ul = document.getElementById('list');
+  ul.innerHTML = '';
+  j.forEach(c => {
+    const li = document.createElement('li');
+    li.textContent = c.name + ' (' + c.status + ') ';
+    li.innerHTML += `<button onclick="showLogs('${c.id}')">Logs</button>`;
+    li.innerHTML += `<button onclick="kill('${c.id}')">Kill</button>`;
+    ul.appendChild(li);
+  });
+}
+async function showLogs(id) {
+  const res = await fetch('/logs/' + id);
+  document.getElementById('logs').textContent = await res.text();
+}
+async function kill(id) {
+  await fetch('/kill', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id}) });
+  refresh();
+}
+refresh();
+</script>
+</body>
+</html>
+'''
+EOF
+
+      python3 /app/spawner.py
+      "
+
+networks:
+  ide-net:
+    driver: bridge
+
+volumes:
+  ide-work:
