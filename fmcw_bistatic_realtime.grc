@@ -1,0 +1,496 @@
+<?xml version="1.0" encoding="utf-8"?>
+<flow_graph>
+  <title>FMCW_Bistatic_Realtime</title>
+  <author>Generated</author>
+  <description>Realtime FMCW bistatic: HackRF TX + HackRF RX. Real-time waterfall and per-chirp range FFT. Ensure HackRF A 10MHz OUT -> HackRF B 10MHz IN. Use attenuators and filters for bench tests.</description>
+  <id>fmcw_bistatic_realtime</id>
+
+  <!-- Variables -->
+  <variable>
+    <name>center_freq</name>
+    <value>2440000000</value>
+    <type>float</type>
+    <desc>Center frequency (Hz)</desc>
+  </variable>
+
+  <variable>
+    <name>samp_rate</name>
+    <value>4000000</value>
+    <type>float</type>
+    <desc>Sample rate (S/s)</desc>
+  </variable>
+
+  <variable>
+    <name>chirp_bw</name>
+    <value>4000000</value>
+    <type>float</type>
+    <desc>Chirp sweep bandwidth (Hz)</desc>
+  </variable>
+
+  <variable>
+    <name>chirp_time</name>
+    <value>0.002</value>
+    <type>float</type>
+    <desc>Chirp duration (s)</desc>
+  </variable>
+
+  <variable>
+    <name>prf</name>
+    <value>200</value>
+    <type>float</type>
+    <desc>Chirps per second</desc>
+  </variable>
+
+  <variable>
+    <name>tx_gain</name>
+    <value>0</value>
+    <type>int</type>
+    <desc>TX gain (dB) - keep low for bench tests</desc>
+  </variable>
+
+  <variable>
+    <name>rx_gain</name>
+    <value>20</value>
+    <type>int</type>
+    <desc>RX gain (dB)</desc>
+  </variable>
+
+  <variable>
+    <name>device_tx</name>
+    <value>hackrf=0</value>
+    <type>string</type>
+    <desc>TX HackRF device args</desc>
+  </variable>
+
+  <variable>
+    <name>device_rx</name>
+    <value>hackrf=1</value>
+    <type>string</type>
+    <desc>RX HackRF device args</desc>
+  </variable>
+
+  <!-- Blocks -->
+
+  <!-- Python chirp generator (continuous repeated chirps) -->
+  <python_block>
+    <id>chirp_source</id>
+    <name>chirp_source</name>
+    <category>Custom</category>
+    <import>import numpy as np
+from gnuradio import gr</import>
+    <make>def __init__(self, samp_rate, chirp_bw, chirp_time, prf):
+    gr.sync_block.__init__(self,
+        name='chirp_source',
+        in_sig=None,
+        out_sig=[np.complex64])
+    self.samp_rate = float(samp_rate)
+    self.chirp_bw = float(chirp_bw)
+    self.chirp_time = float(chirp_time)
+    self.prf = float(prf)
+    self.chirp_len = int(round(self.chirp_time * self.samp_rate))
+    if self.chirp_len < 16:
+        self.chirp_len = 16
+    t = np.arange(self.chirp_len) / self.samp_rate
+    k = self.chirp_bw / self.chirp_time
+    phase = 2.0 * np.pi * (0.5 * k * t**2)
+    self.chirp = (np.exp(1j * phase)).astype(np.complex64)
+    idle_len = int(round((1.0/self.prf - self.chirp_time) * self.samp_rate)) if self.prf>0 else 0
+    if idle_len < 0:
+        idle_len = 0
+    self.packet = np.concatenate((self.chirp, np.zeros(idle_len, dtype=np.complex64)))
+    self.ptr = 0
+</make>
+    <work>def work(self, input_items, output_items):
+    out = output_items[0]
+    n = len(out)
+    for i in range(n):
+        out[i] = self.packet[self.ptr]
+        self.ptr += 1
+        if self.ptr >= len(self.packet):
+            self.ptr = 0
+    return n
+</work>
+    <params>
+      <param>
+        <name>samp_rate</name>
+        <type>float</type>
+        <value>%(samp_rate)s</value>
+      </param>
+      <param>
+        <name>chirp_bw</name>
+        <type>float</type>
+        <value>%(chirp_bw)s</value>
+      </param>
+      <param>
+        <name>chirp_time</name>
+        <type>float</type>
+        <value>%(chirp_time)s</value>
+      </param>
+      <param>
+        <name>prf</name>
+        <type>float</type>
+        <value>%(prf)s</value>
+      </param>
+    </params>
+  </python_block>
+
+  <!-- Conjugate of TX chirp for dechirp -->
+  <block>
+    <key>blocks.conjugate_cc</key>
+    <id>conjugate_ref</id>
+    <param>
+      <name>name</name>
+      <value>conjugate_ref</value>
+    </param>
+  </block>
+
+  <!-- Osmocom Sink (TX HackRF) -->
+  <block>
+    <key>osmosdr.sink</key>
+    <id>osmocom_sink_tx</id>
+    <param>
+      <name>device</name>
+      <value>%(device_tx)s</value>
+    </param>
+    <param>
+      <name>sample_rate</name>
+      <value>%(samp_rate)s</value>
+    </param>
+    <param>
+      <name>center_freq</name>
+      <value>%(center_freq)s</value>
+    </param>
+    <param>
+      <name>gain</name>
+      <value>%(tx_gain)s</value>
+    </param>
+    <param>
+      <name>antenna</name>
+      <value>TX</value>
+    </param>
+  </block>
+
+  <!-- Osmocom Source (RX HackRF) -->
+  <block>
+    <key>osmosdr.source</key>
+    <id>osmocom_items[0]
+    n = len(out)
+    for i in range(n):
+        out[i] = self.packet[self.ptr]
+        self.ptr += 1
+        if self.ptr >= len(self.packet):
+            self.ptr = 0
+    return n
+</work>
+    <params>
+      <param>
+        <name>samp_rate</name>
+        <type>float</type>
+        <value>%(samp_rate)s</value>
+      </param>
+      <param>
+        <name>chirp_bw</name>
+        <type>float</type>
+        <value>%(chirp_bw)s</value>
+      </param>
+      <param>
+        <name>chirp_time</name>
+        <type>float</type>
+        <value>%(chirp_time)s</value>
+      </param>
+      <param>
+        <name>prf</name>
+        <type>float</type>
+        <value>%(prf)s</value>
+      </param>
+    </params>
+  </python_block>
+
+  <!-- Conjugate of TX chirp for dechirp -->
+  <block>
+    <key>blocks.conjugate_cc</key>
+    <id>conjugate_ref</id>
+    <param>
+      <name>name</name>
+      <value>conjugate_ref</value>
+    </param>
+  </block>
+
+  <!-- Osmocom Sink (TX HackRF) -->
+  <block>
+    <key>osmosdr.sink</key>
+    <id>osmocom_sink_tx</id>
+    <param>
+      <name>device</name>
+      <value>%(device_tx)s</value>
+    </param>
+    <param>
+      <name>sample_rate</name>
+      <value>%(samp_rate)s</value>
+    </param>
+    <param>
+      <name>center_freq</name>
+      <value>%(center_freq)s</value>
+    </param>
+    <param>
+      <name>gain</name>
+      <value>%(tx_gain)s</value>
+    </param>
+    <param>
+      <name>antenna</name>
+      <value>TX</value>
+    </param>
+  </block>
+
+  <!-- Osmocom Source (RX HackRF) -->
+  <block>
+    <key>osmosdr.source</key>
+    <id>osmocom_src_rx</id>
+    <param>
+      <name>device</name>
+      <value>%(device_rx)s</value>
+    </param>
+    <param>
+      <name>sample_rate</name>
+      <value>%(samp_rate)s</value>
+    </param>
+    <param>
+      <name>center_freq</name>
+      <value>%(center_freq)s</value>
+    </param>
+    <param>
+      <name>gain</name>
+      <value>%(rx_gain)s</value>
+    </param>
+    <param>
+      <name>antenna</name>
+      <value>RX</value>
+    </param>
+  </block>
+
+  <!-- Multiply (dechirp): RX * conj(TX_ref) -->
+  <block>
+    <key>blocks.multiply_cc</key>
+    <id>multiply_dechirp</id>
+    <param>
+      <name>name</name>
+      <value>multiply_dechirp</value>
+    </param>
+  </block>
+
+  <!-- Lowpass filter after dechirp (anti-alias / noise) -->
+  <block>
+    <key>filter.fir_filter_ccf</key>
+    <id>lowpass_after_dechirp</id>
+    <param>
+      <name>decim</name>
+      <value>1</value>
+    </param>
+    <param>
+      <name>taps</name>
+      <value>firdes.low_pass(1.0, %(samp_rate)s, %(chirp_bw)s/2.0, %(chirp_bw)s/10.0, firdes.WIN_HAMMING)</value>
+    </param>
+  </block>
+
+  <!-- QT GUI Waterfall (beat spectrogram) -->
+  <block>
+    <key>qtgui.waterfall_sink_c</key>
+    <id>qtgui_waterfall</id>
+    <param>
+      <name>fft_size</name>
+      <value>1024</value>
+    </param>
+    <param>
+      <name>sample_rate</name>
+      <value>%(samp_rate)s</value>
+    </param>
+    <param>
+      <name>center_freq</name>
+      <value>0</value>
+    </param>
+    <param>
+      <name>name</name>
+      <value>Beat Waterfall</value>
+    </param>
+  </block>
+
+  <!-- Stream to vector to get per-chirp vectors -->
+  <block>
+    <key>blocks.stream_to_vector</key>
+    <id>stream_to_vector</id>
+    <param>
+      <name>vlen</name>
+      <value>%(vec_len)s</value>
+    </param>
+  </block>
+
+  <!-- FFT per vector (range FFT) -->
+  <block>
+    <key>fft.fft_vcc</key>
+    <id>fft_block</id>
+    <param>
+      <name>vlen</name>
+      <value>%(vec_len)s</value>
+    </param>
+    <param>
+      <name>forward</name>
+      <value>True</value>
+    </param>
+  </block>
+
+  <!-- Complex to Mag^2 -->
+  <block>
+    <key>blocks.complex_to_mag_squared</key>
+    <id>c2m2</id>
+  </block>
+
+  <!-- Vector to Stream (float) for feeding image sink -->
+  <block>
+    <key>blocks.vector_to_stream</key>
+    <id>vector_to_stream</id>
+    <param>
+      <name>vlen</name>
+      <value>%(vec_len)s</value>
+    </param>
+  </block>
+
+  <!-- QT GUI Sink (FFT magnitude per chirp) -->
+  <block>
+    <key>qtgui.time_sink_f</key>
+    <id>qtgui_range_plot</id>
+    <param>
+      <name>size</name>
+      <value>%(vec_len)s</value>
+    </param>
+    <param>
+      <name>sample_rate</name>
+      <value>1</value>
+    </param>
+    <param>
+      <name>name</name>
+      <value>Range FFT (per chirp)</value>
+    </param>
+  </block>
+
+  <!-- File sink for beat magnitude (optional) -->
+  <block>
+    <key>blocks.file_sink</key>
+    <id>file_sink_beats</id>
+    <param>
+      <name>filename</name>
+      <value>beat_mag.bin</value>
+    </param>
+    <param>
+      <name>type</name>
+      <value>float</value>
+    </param>
+  </block>
+
+  <!-- Connections -->
+  <connections>
+    <!-- Chirp source -> TX -->
+    <connect>
+      <src>chirp_source</src>
+      <src_port>0</src_port>
+      <dst>osmocom_sink_tx</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- Chirp source -> conjugate_ref -->
+    <connect>
+      <src>chirp_source</src>
+      <src_port>0</src_port>
+      <dst>conjugate_ref</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- conjugate_ref -> multiply (port 1) -->
+    <connect>
+      <src>conjugate_ref</src>
+      <src_port>0</src_port>
+      <dst>multiply_dechirp</dst>
+      <dst_port>1</dst_port>
+    </connect>
+
+    <!-- RX source -> multiply (port 0) -->
+    <connect>
+      <src>osmocom_src_rx</src>
+      <src_port>0</src_port>
+      <dst>multiply_dechirp</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- multiply -> lowpass -->
+    <connect>
+      <src>multiply_dechirp</src>
+      <src_port>0</src_port>
+      <dst>lowpass_after_dechirp</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- lowpass -> waterfall (visual) -->
+    <connect>
+      <src>lowpass_after_dechirp</src>
+      <src_port>0</src_port>
+      <dst>qtgui_waterfall</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- lowpass -> stream_to_vector (per-chirp framing) -->
+    <connect>
+      <src>lowpass_after_dechirp</src>
+      <src_port>0</src_port>
+      <dst>stream_to_vector</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- stream_to_vector -> FFT -->
+    <connect>
+      <src>stream_to_vector</src>
+      <src_port>0</src_port>
+      <dst>fft_block</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- FFT -> complex_to_mag_squared -->
+    <connect>
+      <src>fft_block</src>
+      <src_port>0</src_port>
+      <dst>c2m2</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- mag^2 vector -> vector_to_stream -->
+    <connect>
+      <src>c2m2</src>
+      <src_port>0</src_port>
+      <dst>vector_to_stream</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- vector_to_stream -> range plot (time sink) -->
+    <connect>
+      <src>vector_to_stream</src>
+      <src_port>0</src_port>
+      <dst>qtgui_range_plot</dst>
+      <dst_port>0</dst_port>
+    </connect>
+
+    <!-- Also save to file -->
+    <connect>
+      <src>vector_to_stream</src>
+      <src_port>0</src_port>
+      <dst>file_sink_beats</dst>
+      <dst_port>0</dst_port>
+    </connect>
+  </connections>
+
+  <!-- Parameters computed at runtime -->
+  <param_compute>
+    <param>
+      <name>vec_len</name>
+      <expr>int(round(chirp_time * samp_rate))</expr>
+    </param>
+  </param_compute>
+
+</flow_graph>
