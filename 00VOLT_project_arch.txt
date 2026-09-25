@@ -1,0 +1,283 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║                    VOLT — VOLATILE OPEN LOGIC TOOLKIT              ║
+║                 Full Platform Feature Specification                ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  HARDWARE / FPGA PLATFORM                                            ║
+║  ─────────────────────────                                           ║
+║  • Raspberry Pi 5 control computer                                   ║
+║  • Lattice iCE40HX1K-TQ144 FPGA                                     ║
+║  • Lightside ICE4PI board support                                   ║
+║  • Official Lightside PCF pin mapping                               ║
+║  • 12 MHz onboard FPGA clock                                       ║
+║  • 5 FPGA-controlled status LEDs                                    ║
+║  • 8 PMOD I/O                                                        ║
+║  • Raspberry Pi GPIO-connected FPGA I/O                              ║
+║  • Board/resource abstraction layer                                 ║
+║  • Automatic resource conflict detection                            ║
+║                                                                      ║
+║  VOLATILE CONFIGURATION                                              ║
+║  ─────────────────────                                               ║
+║  • Runtime FPGA configuration                                       ║
+║  • Bitstreams generated directly on the Raspberry Pi                ║
+║  • Bitstreams held in Pi RAM                                       ║
+║  • Direct FPGA configuration interface                               ║
+║  • FPGA reconfiguration without Raspberry Pi reboot                 ║
+║  • Configuration verification                                       ║
+║  • CDONE monitoring                                                  ║
+║  • Configuration error detection                                    ║
+║  • Automatic post-configuration self-test                            ║
+║  • SPI-flash write protection                                       ║
+║  • Zero-persistence FPGA operating mode                              ║
+║                                                                      ║
+║  FPGA TOOLCHAIN                                                      ║
+║  ─────────────                                                       ║
+║  • Yosys synthesis                                                  ║
+║  • nextpnr-ice40 place & route                                      ║
+║  • Project IceStorm                                                 ║
+║  • icepack bitstream generation                                     ║
+║  • Reproducible builds                                              ║
+║  • Build hashing                                                     ║
+║  • Bitstream validation                                              ║
+║  • Resource utilization reports                                      ║
+║  • Timing reports                                                    ║
+║  • Build artifact cache                                              ║
+║                                                                      ║
+║  FPGA OPERATING SYSTEM / SHELL                                       ║
+║  ───────────────────────────                                         ║
+║  • Common VOLT FPGA shell                                            ║
+║  • Register bus                                                      ║
+║  • Streaming bus                                                     ║
+║  • Event/interrupt bus                                               ║
+║  • Hardware module ABI                                               ║
+║  • Module discovery                                                  ║
+║  • Hardware resource manager                                         ║
+║  • 64-bit timestamp engine                                           ║
+║  • Hardware FIFO subsystem                                           ║
+║  • GPIO fabric                                                       ║
+║  • Trigger engine                                                    ║
+║  • Clock/reset management                                            ║
+║  • Hardware health/heartbeat                                         ║
+║                                                                      ║
+║  DIGITAL LOGIC ANALYZER                                              ║
+║  ─────────────────────                                               ║
+║  • Multi-channel digital capture                                     ║
+║  • Edge detection                                                    ║
+║  • Rising-edge trigger                                               ║
+║  • Falling-edge trigger                                              ║
+║  • Both-edge trigger                                                 ║
+║  • Level trigger                                                     ║
+║  • Pattern trigger                                                   ║
+║  • Sequential trigger                                                ║
+║  • Pre-trigger capture                                               ║
+║  • Post-trigger capture                                              ║
+║  • Single-shot capture                                               ║
+║  • Continuous capture                                                ║
+║  • Timestamped samples                                               ║
+║  • Hardware FIFO buffering                                            ║
+║  • Streaming capture to Raspberry Pi                                 ║
+║  • VCD export                                                        ║
+║  • CSV export                                                        ║
+║  • JSON export                                                       ║
+║                                                                      ║
+║  PROTOCOL ANALYSIS                                                   ║
+║  ─────────────────                                                   ║
+║                                                                      ║
+║  SPI                                                                  ║
+║  • SPI analyzer                                                       ║
+║  • SPI master                                                         ║
+║  • CPOL/CPHA                                                         ║
+║  • MSB/LSB                                                            ║
+║  • Configurable word length                                          ║
+║  • Chip-select decoding                                              ║
+║  • Transaction reconstruction                                        ║
+║  • Timestamped transactions                                          ║
+║                                                                      ║
+║  I²C                                                                  ║
+║  • I²C analyzer                                                       ║
+║  • I²C master                                                         ║
+║  • START/STOP detection                                               ║
+║  • Address decoding                                                  ║
+║  • Read/write decoding                                                ║
+║  • ACK/NACK                                                           ║
+║  • Repeated START                                                     ║
+║  • Clock stretching detection                                         ║
+║                                                                      ║
+║  UART                                                                 ║
+║  • UART analyzer                                                      ║
+║  • UART transmitter                                                   ║
+║  • Configurable baud rate                                             ║
+║  • Configurable data bits                                             ║
+║  • Parity                                                             ║
+║  • Stop bits                                                          ║
+║  • Framing-error detection                                            ║
+║                                                                      ║
+║  SIGNAL GENERATION                                                    ║
+║  ─────────────────                                                    ║
+║  • GPIO waveform generation                                           ║
+║  • Square wave                                                        ║
+║  • Pulse generation                                                   ║
+║  • Triangle waveform                                                  ║
+║  • Sawtooth waveform                                                  ║
+║  • Sine waveform                                                      ║
+║  • Arbitrary waveform tables                                          ║
+║  • Programmable pattern generation                                    ║
+║  • PWM generation                                                     ║
+║  • SPI master                                                         ║
+║  • I²C master                                                         ║
+║  • UART transmitter                                                   ║
+║                                                                      ║
+║  MEASUREMENT                                                          ║
+║  ───────────                                                          ║
+║  • Frequency counter                                                  ║
+║  • Reciprocal frequency measurement                                   ║
+║  • Period measurement                                                 ║
+║  • Pulse-width measurement                                            ║
+║  • High-time measurement                                              ║
+║  • Low-time measurement                                               ║
+║  • Duty-cycle measurement                                             ║
+║  • Edge/event counters                                                ║
+║  • Hardware timestamping                                              ║
+║                                                                      ║
+║  DIGITAL TESTING                                                      ║
+║  ──────────────                                                       ║
+║  • PRBS generator                                                     ║
+║  • PRBS checker                                                       ║
+║  • BER/error counting                                                 ║
+║  • LFSR engine                                                        ║
+║  • CRC accelerator                                                   ║
+║  • CRC-8                                                              ║
+║  • CRC-16                                                              ║
+║  • CRC-32                                                              ║
+║                                                                      ║
+║  DSP / HARDWARE ACCELERATION                                          ║
+║  ──────────────────────────                                           ║
+║  • Moving-average filter                                              ║
+║  • FIR filter                                                         ║
+║  • CIC filter                                                         ║
+║  • Decimator                                                          ║
+║  • Threshold detector                                                 ║
+║  • Peak detector                                                      ║
+║  • Digital correlator                                                 ║
+║  • Fixed-point arithmetic                                             ║
+║  • Hardware preprocessing                                             ║
+║                                                                      ║
+║  DYNAMIC HARDWARE COMPOSITION                                         ║
+║  ──────────────────────────                                           ║
+║  • Hardware module manifests                                          ║
+║  • Module capability discovery                                        ║
+║  • Automatic FPGA resource allocation                                 ║
+║  • GPIO allocation                                                    ║
+║  • PMOD allocation                                                    ║
+║  • FIFO allocation                                                    ║
+║  • BRAM/resource checking                                             ║
+║  • Clock-resource checking                                            ║
+║  • Automatic top-level HDL generation                                 ║
+║  • Runtime synthesis                                                  ║
+║  • Runtime place & route                                              ║
+║  • Runtime bitstream generation                                       ║
+║  • Runtime FPGA deployment                                            ║
+║                                                                      ║
+║  HOST SOFTWARE                                                        ║
+║  ─────────────                                                        ║
+║  • volt CLI                                                           ║
+║  • voltd daemon                                                       ║
+║  • Python API                                                         ║
+║  • C/C++ low-level library                                            ║
+║  • Board API                                                          ║
+║  • FPGA API                                                           ║
+║  • Module API                                                         ║
+║  • Capture API                                                        ║
+║  • Resource API                                                       ║
+║                                                                      ║
+║  NETWORK / REMOTE CONTROL                                              ║
+║  ──────────────────────                                               ║
+║  • REST API                                                           ║
+║  • WebSocket streaming                                                ║
+║  • Remote capture                                                     ║
+║  • Remote FPGA configuration                                          ║
+║  • Remote module control                                              ║
+║  • Live instrument data                                               ║
+║                                                                      ║
+║  WEB INTERFACE                                                        ║
+║  ─────────────                                                        ║
+║  • Hardware dashboard                                                 ║
+║  • FPGA status                                                        ║
+║  • Resource viewer                                                    ║
+║  • Module manager                                                     ║
+║  • Logic-analyzer waveform viewer                                     ║
+║  • SPI transaction viewer                                             ║
+║  • I²C transaction viewer                                             ║
+║  • UART monitor                                                       ║
+║  • Frequency/period display                                           ║
+║  • Waveform generator control                                        ║
+║  • Live capture                                                      ║
+║  • Register inspector                                                ║
+║  • Diagnostics                                                        ║
+║                                                                      ║
+║  DATA / CAPTURE                                                       ║
+║  ─────────────                                                        ║
+║  • Native .VLT capture format                                         ║
+║  • CSV                                                                 ║
+║  • JSON                                                                ║
+║  • VCD                                                                 ║
+║  • Timestamp-preserving capture                                       ║
+║  • Binary high-speed streaming                                        ║
+║  • Capture metadata                                                   ║
+║  • Configuration hash                                                 ║
+║                                                                      ║
+║  VERIFICATION                                                         ║
+║  ───────────                                                          ║
+║  • RTL simulation                                                     ║
+║  • Verilator regression                                               ║
+║  • Icarus Verilog regression                                          ║
+║  • Host unit tests                                                    ║
+║  • Protocol golden-vector tests                                       ║
+║  • Integration tests                                                  ║
+║  • Hardware-in-the-loop testing                                       ║
+║  • Automated self-test                                                ║
+║  • Timing verification                                                ║
+║  • Resource verification                                              ║
+║                                                                      ║
+║  SELF-TEST                                                            ║
+║  ─────────                                                            ║
+║  • FPGA configuration test                                            ║
+║  • Clock test                                                         ║
+║  • Register-bus test                                                  ║
+║  • FIFO test                                                          ║
+║  • Timestamp test                                                     ║
+║  • GPIO test                                                          ║
+║  • PMOD test                                                          ║
+║  • Trigger test                                                       ║
+║  • SPI loopback                                                       ║
+║  • I²C loopback                                                       ║
+║  • UART loopback                                                      ║
+║  • PWM test                                                           ║
+║  • Frequency-counter test                                             ║
+║  • PRBS/CRC test                                                      ║
+║                                                                      ║
+║  DEVELOPMENT / REPRODUCIBILITY                                        ║
+║  ────────────────────────────                                         ║
+║  • Versioned FPGA modules                                             ║
+║  • Versioned module ABI                                               ║
+║  • Build manifests                                                    ║
+║  • SHA-256 bitstream hashes                                           ║
+║  • PCF hash                                                           ║
+║  • Toolchain version tracking                                         ║
+║  • Resource utilization reports                                       ║
+║  • Timing reports                                                     ║
+║  • Deterministic builds                                               ║
+║  • Pi-side build cache                                                ║
+║                                                                      ║
+║  SAFETY / PERSISTENCE MODEL                                           ║
+║  ─────────────────────────                                            ║
+║  • SPI-flash programming disabled                                     ║
+║  • No VOLT code stored in FPGA SPI flash                              ║
+║  • Runtime bitstreams live in Pi RAM                                  ║
+║  • FPGA configuration is volatile                                     ║
+║  • Configuration-resource isolation                                   ║
+║  • Reserved-pin enforcement                                           ║
+║  • Invalid bitstream rejection                                        ║
+║  • Resource-conflict rejection                                        ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
