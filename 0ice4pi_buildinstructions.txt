@@ -1,0 +1,22 @@
+1. download ice4pi.pcf in the same directory as project
+2. run ice4pi_wim11envsetup.ps1
+3. run 0ice4pi_ex1.ps1
+4. follow bellow steps:
+##flow_steps##
+ # 1. Synthesize
+yosys -p "synth_ice40 -top top -json top.json" top.v
+# 2. Place & Route using ice4pi.pcf
+nextpnr-ice40 --hx1k --package vq100 --pcf ice4pi.pcf --json top.json --ascii top.asc
+# 3. Pack to Bitstream
+icepack top.asc hardware.bin
+# 4. Stream to SRAM
+python bitstream_loader.py hardware.bin COM3
+## general flow##
+1. synthesis
+yosis -p "synth_ice40 -top top -json top.json" top.v
+2. place and route( pnr) using pcf
+nextpnr-ice40 --hx1k --package vq100 --pcf ice4pi.pcf --json top.json --ascii top.asc
+3. pack to bitstream
+icepack top.asc hardware.bin
+4. stream to fpga
+python bitstrm.py hardware.bin <ESP32S3_COMM PORT>
