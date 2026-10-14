@@ -1,4 +1,4 @@
-# Master Deployment Guide: NEORV32 Nommu Linux with Python 3 on DE10-Lite
+# Master Deployment Guide: NEORV32 Nommu Linux with Python 3, SD Card Rootfs, Package Manager (opkg), Dual ENC28J60 Ethernet & SSH on DE10-Lite
 
 ## SECTION 1: VirtualBox VM Setup & Specifications
 
@@ -22,7 +22,7 @@ Save this script inside your VM as build_neorv32_linux.sh, make it executable (c
 
 #!/bin/bash
 # ==============================================================================
-# NEORV32 Nommu Linux & Python 3 Automated Build Script
+# NEORV32 Nommu Linux, Python 3, Opkg Package Manager & Dual Ethernet Build Script
 # ==============================================================================
 set -e
 
@@ -37,31 +37,34 @@ sudo apt update && sudo apt install -y \
     u-boot-tools device-tree-compiler cpio wget curl libgmp-dev libmpfr-dev \
     libmpc-dev texinfo gawk libtool automake pkg-config libexpat1-dev python3 python3-pip
 
-echo "=== [2/5] Cloning Buildroot (for rootfs with Python 3) ==="
+echo "=== [2/5] Cloning Buildroot (for rootfs with Python 3, Dropbear SSH, and Opkg) ==="
 if [ ! -d "buildroot" ]; then
     git clone --depth 1 --branch 2024.02.x https://github.com/buildroot/buildroot.git buildroot
 fi
 
-echo "=== [3/5] Configuring Buildroot for RISC-V 32-bit Nommu & Python 3 ==="
+echo "=== [3/5] Configuring Buildroot for RISC-V 32-bit Nommu, Python 3, SSH & Opkg ==="
 cd buildroot
 
-cat << 'EOF' > configs/neorv32_python_defconfig
+cat << 'EOF' > configs/neorv32_full_defconfig
 BR2_riscv=y
 BR2_riscv_custom=y
 BR2_riscv_isa_custom_rv32imac=y
 BR2_BINFMT_FLAT=y
 BR2_PACKAGE_PYTHON3=y
 BR2_PACKAGE_PYTHON3_PYC_COMPILER=y
-BR2_TARGET_ROOTFS_CPIO=y
-BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_OPKG=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="120M"
 EOF
 
-make neorv32_python_defconfig
+make neorv32_full_defconfig
 make -j$(nproc)
 
-cp output/images/rootfs.cpio.gz "$SHARED_OUT/rootfs.cpio.gz"
+cp output/images/rootfs.ext4 "$SHARED_OUT/rootfs.ext4"
 
-echo "=== [4/5] Cloning Linux Kernel & Compiling Nommu Image ==="
+echo "=== [4/5] Cloning Linux Kernel & Compiling Nommu Image with SPI, SD, and Ethernet Drivers ==="
 cd "$WORK_DIR"
 if [ ! -d "linux" ]; then
     git clone --depth 1 --branch linux-6.6.y https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
@@ -74,13 +77,22 @@ make ARCH=riscv defconfig
 scripts/config --disable CONFIG_MMU
 scripts/config --enable CONFIG_BINFMT_FLAT
 scripts/config --set-str CONFIG_PAGE_OFFSET "0x40000000"
+scripts/config --enable CONFIG_SPI
+scripts/config --enable CONFIG_SPI_MASTER
+scripts/config --enable CONFIG_MMC
+scripts/config --enable CONFIG_MMC_SPI
+scripts/config --enable CONFIG_NET
+scripts/config --enable CONFIG_INET
+scripts/config --enable CONFIG_NETDEVICES
+scripts/config --enable CONFIG_ETHERNET
+scripts/config --enable CONFIG_ENC28J60
 
 make ARCH=riscv CROSS_COMPILE=riscv64-unknown-elf- olddefconfig
 make ARCH=riscv CROSS_COMPILE=riscv64-unknown-elf- -j$(nproc) Image
 
 cp arch/riscv/boot/Image "$SHARED_OUT/Image"
 
-echo "=== [5/5] Generating NEORV32 Device Tree Blob (.dtb) ==="
+echo "=== [5/5] Generating NEORV32 Device Tree Blob (.dtb) with Shared SPI Bus ==="
 cd "$WORK_DIR"
 cat << 'EOF' > neorv32.dts
 /dts-v1/;
@@ -115,6 +127,32 @@ cat << 'EOF' > neorv32.dts
             status = "okay";
             current-speed = <115200>;
         };
+
+        spi0: spi@ffe00200 {
+            compatible = "neorv32,spi";
+            reg = <0xffe00200 0x400>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            mmc-card@0 {
+                compatible = "mmc-spi-slot";
+                reg = <0>;
+                spi-max-frequency = <10000000>;
+            };
+
+            ethernet@1 {
+                compatible = "microchip,enc28j60";
+                reg = <1>;
+                spi-max-frequency = <12000000>;
+            };
+
+            ethernet@2 {
+                compatible = "microchip,enc28j60";
+                reg = <2>;
+                spi-max-frequency = <12000000>;
+            };
+        };
     };
 };
 EOF
@@ -122,16 +160,25 @@ EOF
 dtc -I dts -O dtb -o neorv32.dtb neorv32.dts
 cp neorv32.dtb "$SHARED_OUT/neorv32.dtb"
 
-echo "=== Build Complete! Artifacts synced to Windows at C:\fpga_projects\output ==="
+echo "=== Build Complete! Artifacts (Image, neorv32.dtb, rootfs.ext4) synced to Windows at C:\fpga_projects\output ==="
 
-## SECTION 3: Arduino Giga R1 WiFi Serial Bridge Sketch
+## SECTION 3: Hardware Peripheral Wiring (Shared SPI Bus & Serial Bridge)
 
-Connect DE10-Lite Arduino header to Arduino Giga R1 WiFi:
-- DE10-Lite ARDUINO_IO[1] (TX) -> Giga Pin 0 (RX1)
-- DE10-Lite ARDUINO_IO[0] (RX) <- Giga Pin 1 (TX1)
-- DE10-Lite GND <-> Giga GND
+1. Arduino Giga R1 Serial Bridge Wiring:
+   - DE10-Lite ARDUINO_IO[1] (TX) -> Giga Pin 0 (RX1)
+   - DE10-Lite ARDUINO_IO[0] (RX) <- Giga Pin 1 (TX1)
+   - DE10-Lite GND <-> Giga GND
 
-Upload this sketch via Arduino IDE:
+2. Shared SPI Bus Wiring (SD Card Reader & Dual ENC28J60 Modules):
+   - SCK  -> ARDUINO_IO[13] (Shared Clock)
+   - MOSI -> ARDUINO_IO[11] (Shared Data In)
+   - MISO -> ARDUINO_IO[12] (Shared Data Out)
+   - CS (SD Card Reader)     -> ARDUINO_IO[2]
+   - CS (ENC28J60 Module #1) -> ARDUINO_IO[10] (becomes eth0)
+   - CS (ENC28J60 Module #2) -> ARDUINO_IO[9]  (becomes eth1)
+   - VCC / GND               -> 3.3V & GND
+
+Upload this bridge sketch to Arduino Giga R1 via Arduino IDE:
 
 void setup() {
   Serial.begin(115200);   // Native USB connection to Windows 11 PC
@@ -157,15 +204,17 @@ void loop() {
 ## SECTION 5: Quartus Project Setup, Generation & Execution
 
 1. Create Project: Open Quartus Prime Lite, create project in C:\fpga_projects\hardware. Target Device Family: MAX 10. Specific Device: 10M50DAF484C7G.
-2. Integrate NEORV32 & SDRAM IP: Unpack NEORV32 core files and the DE10-Lite SDRAM controller module into the project source directory.
+2. Integrate NEORV32 & SPI/SDRAM IP: Unpack NEORV32 core files, the DE10-Lite SDRAM controller module, and enable internal SPI controller generics in the processor instantiation.
 3. Configure Processor Generics: In top-level VHDL wrapper, set:
    - CPU_EXTENSION_RISCV_M = true
    - CPU_EXTENSION_RISCV_A = true
    - CPU_EXTENSION_RISCV_C = true
    - Base boot address mapped to 0x40000000.
-4. Pin Assignments (.qsf): Map 50MHz clock, SDRAM pins, and UART0 TX/RX to Arduino header constraints:
-   - set_location_assignment PIN_AB5 -to ar_uart_txd
-   - set_location_assignment PIN_AB6 -to ar_uart_rxd
+4. Pin Assignments (.qsf): Map 50MHz clock, SDRAM pins, UART0 TX/RX, and shared SPI bus / Chip Select lines to physical pins.
 5. Compilation & Programming: Click Start Compilation, open Quartus Programmer, select USB-Blaster, program the .sof bitstream.
-6. Booting and Running Python 3: Open serial terminal on Windows connected to Arduino Giga R1 COM port at 115200 8N1. Load binaries into DE10-Lite SDRAM, release reset, and type:
-   python3 --version
+6. SD Card Preparation: Flash `rootfs.ext4` directly onto a partition of your microSD card using a tool like Rufus or `dd` on your PC, and place `Image` and `neorv32.dtb` in the boot partition/directory.
+7. Execution & Package Management: Plug the SD card into your reader module, open serial terminal on Windows connected to Arduino Giga R1 COM port at 115200 8N1, reset the FPGA, and boot up. 
+   Once booted, assign an IP via `ifconfig eth0 <IP>`, SSH in (`ssh root@<IP>`), and use `opkg` to manage packages:
+   - Update repository lists: `opkg update`
+   - Install a package: `opkg install <package_name>`
+   - Run Python 3 or custom C GPIO scripts remotely!
