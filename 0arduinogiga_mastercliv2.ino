@@ -2,7 +2,8 @@
   Comprehensive Master Hardware CLI Firmware for Arduino Giga R1 WiFi
   Target IDE: Arduino IDE 2.x
   Board: Arduino Giga R1 WiFi (STM32H747XI Dual-Core)
-
+Baud: 115200
+Voltage-level: max 3.3v
 */
 
 #include <Wire.h>
