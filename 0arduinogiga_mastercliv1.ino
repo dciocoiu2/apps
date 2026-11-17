@@ -2,6 +2,18 @@
   Modular Hardware CLI Controller for Arduino Giga R1 WiFi
   Target IDE: Arduino IDE 2.x
   Board: Arduino Giga R1 WiFi (STM32H747XI)
+Usage:
+1.serial terminal settings:
+ baud: 115200
+ Line_end: NL&CR or just Newline
+2.usefull cli commands:
+ help - list commands
+ status - view system checks
+ example: 
+ i2c on/off
+ pinmode 2 out D2 as out
+ write 2 1 turn pin2 to high
+
 */
 
 #include <Wire.h>
