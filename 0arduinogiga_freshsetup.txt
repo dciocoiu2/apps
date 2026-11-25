@@ -1,2 +1,36 @@
-1.in Arduino ide add the following board: Arduino Mbed OS GIGA Boards
-2.
+Do this first prior to flashing any of the mastercli ino files
+
+ARDUINO IDE 2 SETUP & FLASHING STEPS FOR GIGA R1 WIFi (v1 - v7)
+==================================================================
+Safety Reminder: Keep all external I/O and shield wiring strictly at 3.3V logic.
+
+STEP 1: Install Arduino IDE 2 & Connect Hardware
+- Install Arduino IDE 2 and connect the Arduino GIGA R1 WiFi over a data USB-C cable.
+- Attach the Wi-Fi/BLE antenna if using wireless features.
+- Verify: The board power LED turns on.
+
+STEP 2: Install the Arduino Mbed OS GIGA Boards Package
+- In Arduino IDE 2, open Boards Manager (left sidebar or Tools > Board > Boards Manager).
+- Search for "Arduino Mbed OS GIGA Boards" and click Install.
+- Verify: "Arduino GIGA R1 WiFi" appears under Tools > Board > Arduino Mbed OS GIGA Boards.
+
+STEP 3: Install Required Libraries for v5 - v7 (Skip for v1 - v4)
+- Open Library Manager (left sidebar or Sketch > Include Library > Manage Libraries).
+- For v5, v6, v7: Install "ArduinoBLE".
+- For v6, v7: Install "Arduino_GigaDisplay_GFX" (and dependencies when prompted).
+- Verify: Libraries appear as installed without missing-dependency errors.
+
+STEP 4: Select Board and Serial Port
+- Go to Tools > Board and select "Arduino GIGA R1 WiFi".
+- Go to Tools > Port and select the GIGA R1 WiFi serial port.
+- Verify: Bottom-right status bar shows "Arduino GIGA R1 WiFi" and the active port.
+
+STEP 5: Create Sketch, Paste Firmware, and Upload
+- Select File > New Sketch, paste the firmware code for your chosen version (v1 through v7), and click Upload.
+- If the USB port drops during upload, double-tap the reset button to enter bootloader mode and retry.
+- Verify: Output console shows "Done uploading" with no build or flash errors.
+
+STEP 6: Verify in Serial Monitor
+- Open Serial Monitor (Ctrl+Shift+M or Cmd+Shift+M).
+- Set baud rate to 115200 and line ending to Newline (or Both NL & CR).
+- Run "help" and "status" to confirm the CLI prompt responds.
