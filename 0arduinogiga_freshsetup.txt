@@ -1,0 +1,2 @@
+1.in Arduino ide add the following board: Arduino Mbed OS GIGA Boards
+2.
