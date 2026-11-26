@@ -1,7 +1,4 @@
-#!/bin/bash
-
-##FILE NAME: setup_pinetapp
-sh
+#!/usr/bin/env bash
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -34,61 +31,17 @@ mkdir -p \
   /var/lib/netfw/web \
   /var/log/netfw
 
-# Detect physical network interfaces (excluding loopback, bridges, virtual/tunnel links)
-mapfile -t ALL_IFACES < <(
-  ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | \
-    grep -vE '^(lo|br-|virbr|docker|veth|wg|tailscale|tun|tap)' || true
-)
-
-MGMT_IFS=()
-DATA_IFS=()
-
-for iface in "${ALL_IFACES[@]}"; do
-  if [[ "$iface" == wl* ]]; then
-    MGMT_IFS+=("$iface")
-    continue
-  fi
-  driver_path="/sys/class/net/${iface}/device/driver"
-  if [[ -L "$driver_path" ]]; then
-    drv_name="$(basename "$(readlink -f "$driver_path")")"
-    # Raspberry Pi 5 onboard MACB/brcm/rp1-eth vs PCIe add-on NICs
-    if [[ "$drv_name" == *"macb"* || "$drv_name" == *"brcm"* || "$drv_name" == *"rp1"* ]]; then
-      MGMT_IFS+=("$iface")
-      continue
-    fi
-  fi
-  DATA_IFS+=("$iface")
-done
-
-# Fallback if driver detection is inconclusive on a given kernel
-if [[ "${#MGMT_IFS[@]}" -eq 0 && "${#ALL_IFACES[@]}" -gt 0 ]]; then
-  MGMT_IFS=("${ALL_IFACES[0]}")
-  DATA_IFS=("${ALL_IFACES[@]:1}")
-fi
-
-WAN_IF="${DATA_IFS[0]:-}"
-if [[ "${#DATA_IFS[@]}" -gt 1 ]]; then
-  LAN_IFS_JSON=$(printf '%s\n' "${DATA_IFS[@]:1}" | jq -R . | jq -s .)
-else
-  LAN_IFS_JSON='[]'
-fi
-
-if [[ "${#MGMT_IFS[@]}" -gt 0 ]]; then
-  MGMT_IFS_JSON=$(printf '%s\n' "${MGMT_IFS[@]}" | jq -R . | jq -s .)
-else
-  MGMT_IFS_JSON='[]'
-fi
-
+# Blank initial configuration: no preconfigured interfaces, subnets, or active features
 if [[ ! -f /etc/netfw/config.json ]]; then
-  cat <<EOF > /etc/netfw/config.json
+  cat <<'EOF' > /etc/netfw/config.json
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "interfaces": {
-    "mgmt": ${MGMT_IFS_JSON},
-    "wan": "${WAN_IF}",
-    "lan": ${LAN_IFS_JSON},
-    "lan_ip": "192.168.50.1/24",
-    "lan_subnet": "192.168.50.0/24"
+    "mgmt": [],
+    "wan": "",
+    "lan": [],
+    "lan_ip": "",
+    "lan_subnet": ""
   },
   "features": {
     "router": false,
@@ -101,34 +54,34 @@ if [[ ! -f /etc/netfw/config.json ]]; then
     "web_ui": false
   },
   "ngfw": {
-    "ssh_allow_cidrs": ["0.0.0.0/0"],
-    "suricata_enabled": true
+    "ssh_allow_cidrs": [],
+    "suricata_enabled": false
   },
   "dhcp": {
-    "range_start": "192.168.50.100",
-    "range_end": "192.168.50.200",
-    "lease_time": "12h"
+    "range_start": "",
+    "range_end": "",
+    "lease_time": ""
   },
   "dns": {
-    "listen_ip": "192.168.50.1",
-    "upstream_dns": ["1.1.1.1", "9.9.9.9"]
+    "listen_ip": "",
+    "upstream_dns": []
   },
   "l4_lb": {
-    "vip": "192.168.50.10",
-    "port": 8443,
-    "protocol": "tcp",
-    "scheduler": "wlc",
+    "vip": "",
+    "port": null,
+    "protocol": "",
+    "scheduler": "",
     "backends": []
   },
   "app_gw_afw_l7_lb": {
-    "listen_port": 8080,
-    "waf_enabled": true,
+    "listen_port": null,
+    "waf_enabled": false,
     "backends": []
   },
   "web_ui": {
-    "bind_ip": "0.0.0.0",
-    "port": 8090,
-    "web_dir": "/var/lib/netfw/web"
+    "bind_ip": "",
+    "port": null,
+    "web_dir": ""
   }
 }
 EOF
@@ -166,13 +119,12 @@ def set_sysctl(key, val):
 
 
 def configure_switch_and_ip(cfg):
-    iface_cfg = cfg["interfaces"]
-    mgmt_set = set(iface_cfg.get("mgmt", []))
-    wan = iface_cfg.get("wan", "")
+    iface_cfg = cfg.get("interfaces", {})
+    mgmt_set = {m for m in iface_cfg.get("mgmt", []) if m}
+    wan = iface_cfg.get("wan", "") or ""
     lan_ifs = [i for i in iface_cfg.get("lan", []) if i and i != wan and i not in mgmt_set]
-    features = cfg["features"]
+    features = cfg.get("features", {})
 
-    # Keep management interfaces up and never enslaved to bridges
     for m_if in mgmt_set:
         run(["ip", "link", "set", m_if, "nomaster"], check=False)
         run(["ip", "link", "set", m_if, "up"], check=False)
@@ -201,8 +153,8 @@ def configure_switch_and_ip(cfg):
         for nic in lan_ifs:
             run(["ip", "link", "set", nic, "up"], check=False)
 
-    if target_if and (features.get("router") or features.get("dhcp") or features.get("dns")):
-        lan_ip = iface_cfg["lan_ip"]
+    lan_ip = iface_cfg.get("lan_ip", "") or ""
+    if target_if and lan_ip and (features.get("router") or features.get("dhcp") or features.get("dns")):
         ip_only = lan_ip.split("/")[0]
         existing = run(["ip", "-4", "addr", "show", "dev", target_if], check=False).stdout
         if ip_only not in existing:
@@ -213,24 +165,24 @@ def configure_switch_and_ip(cfg):
 
 
 def configure_nftables(cfg, lan_target_if):
-    iface_cfg = cfg["interfaces"]
+    iface_cfg = cfg.get("interfaces", {})
     mgmt_ifs = [m for m in iface_cfg.get("mgmt", []) if m]
-    wan = iface_cfg.get("wan", "")
-    subnet = iface_cfg.get("lan_subnet", "192.168.50.0/24")
-    f = cfg["features"]
+    wan = iface_cfg.get("wan", "") or ""
+    subnet = iface_cfg.get("lan_subnet", "") or ""
+    f = cfg.get("features", {})
 
     router_on = bool(f.get("router"))
     ngfw_on = bool(f.get("ngfw"))
     l4_on = bool(f.get("l4_lb"))
     web_on = bool(f.get("web_ui"))
-    web_port = int(cfg.get("web_ui", {}).get("port", 8090))
+    web_port = cfg.get("web_ui", {}).get("port")
 
     set_sysctl("net.ipv4.ip_forward", 1 if (router_on or l4_on) else 0)
 
     policy_input = "drop" if ngfw_on else "accept"
     policy_forward = "drop" if ngfw_on else "accept"
 
-    ssh_cidrs = cfg.get("ngfw", {}).get("ssh_allow_cidrs", ["0.0.0.0/0"])
+    ssh_cidrs = [c for c in cfg.get("ngfw", {}).get("ssh_allow_cidrs", []) if c]
     ssh_rules = "\n".join(
         f"    ip saddr {cidr} tcp dport 22 accept" for cidr in ssh_cidrs
     )
@@ -248,14 +200,14 @@ def configure_nftables(cfg, lan_target_if):
         "    ipv6 nexthdr icmpv6 accept",
     ]
 
-    # Always allow SSH and web admin UI on dedicated management interfaces
     for m_if in mgmt_ifs:
         lines.append(f'    iifname "{m_if}" tcp dport 22 accept')
-        if web_on:
-            lines.append(f'    iifname "{m_if}" tcp dport {web_port} accept')
+        if web_on and web_port:
+            lines.append(f'    iifname "{m_if}" tcp dport {int(web_port)} accept')
 
     if ngfw_on:
-        lines.append(ssh_rules)
+        if ssh_rules:
+            lines.append(ssh_rules)
         if lan_target_if:
             lines.append(f'    iifname "{lan_target_if}" accept')
         lines.append("    counter drop")
@@ -268,7 +220,6 @@ def configure_nftables(cfg, lan_target_if):
         "    ct state established,related accept",
     ])
 
-    # Prevent forwarding from/to management interfaces unless explicitly needed
     for m_if in mgmt_ifs:
         lines.append(f'    iifname "{m_if}" drop')
         lines.append(f'    oifname "{m_if}" drop')
@@ -291,20 +242,20 @@ def configure_nftables(cfg, lan_target_if):
 
     if l4_on:
         l4 = cfg.get("l4_lb", {})
-        vip = l4.get("vip")
+        vip = l4.get("vip") or ""
         port = l4.get("port")
-        proto = l4.get("protocol", "tcp")
-        backends = l4.get("backends", [])
-        if vip and port and backends:
+        proto = l4.get("protocol") or ""
+        backends = [b for b in l4.get("backends", []) if b]
+        if vip and port and proto and backends:
             if len(backends) == 1:
                 lines.append(
-                    f"    ip daddr {vip} {proto} dport {port} dnat to {backends[0]}"
+                    f"    ip daddr {vip} {proto} dport {int(port)} dnat to {backends[0]}"
                 )
             else:
                 count = len(backends)
                 for idx, be in enumerate(backends):
                     lines.append(
-                        f"    ip daddr {vip} {proto} dport {port} numgen inc mod {count} == {idx} dnat to {be}"
+                        f"    ip daddr {vip} {proto} dport {int(port)} numgen inc mod {count} == {idx} dnat to {be}"
                     )
 
     lines.extend([
@@ -314,7 +265,7 @@ def configure_nftables(cfg, lan_target_if):
         "    type nat hook postrouting priority srcnat; policy accept;",
     ])
 
-    if router_on and wan and wan not in mgmt_ifs:
+    if router_on and subnet and wan and wan not in mgmt_ifs:
         lines.append(f'    ip saddr {subnet} oifname "{wan}" masquerade')
     if l4_on:
         lines.append("    masquerade")
@@ -331,16 +282,16 @@ def configure_nftables(cfg, lan_target_if):
 
 
 def configure_dnsmasq(cfg, lan_target_if):
-    dhcp_on = bool(cfg["features"].get("dhcp"))
-    dns_on = bool(cfg["features"].get("dns"))
+    dhcp_on = bool(cfg.get("features", {}).get("dhcp"))
+    dns_on = bool(cfg.get("features", {}).get("dns"))
+    lan_ip = (cfg.get("interfaces", {}).get("lan_ip") or "").split("/")[0]
 
-    if not lan_target_if or (not dhcp_on and not dns_on):
+    if not lan_target_if or not lan_ip or (not dhcp_on and not dns_on):
         if os.path.exists(DNSMASQ_CONF):
             os.remove(DNSMASQ_CONF)
         run(["systemctl", "stop", "dnsmasq"], check=False)
         return
 
-    lan_ip = cfg["interfaces"]["lan_ip"].split("/")[0]
     lines = [
         f"interface={lan_target_if}",
         "bind-interfaces",
@@ -348,22 +299,26 @@ def configure_dnsmasq(cfg, lan_target_if):
 
     if dns_on:
         dns_cfg = cfg.get("dns", {})
-        listen_ip = dns_cfg.get("listen_ip", lan_ip)
+        listen_ip = dns_cfg.get("listen_ip") or lan_ip
+        upstreams = [ns for ns in dns_cfg.get("upstream_dns", []) if ns]
         lines.append(f"listen-address={listen_ip}")
-        lines.append("no-resolv")
-        for ns in dns_cfg.get("upstream_dns", ["1.1.1.1"]):
-            lines.append(f"server={ns}")
+        if upstreams:
+            lines.append("no-resolv")
+            for ns in upstreams:
+                lines.append(f"server={ns}")
     else:
         lines.append("port=0")
 
     if dhcp_on:
         dhcp_cfg = cfg.get("dhcp", {})
-        start = dhcp_cfg.get("range_start", "192.168.50.100")
-        end = dhcp_cfg.get("range_end", "192.168.50.200")
-        lease = dhcp_cfg.get("lease_time", "12h")
-        lines.append(f"dhcp-range={start},{end},{lease}")
-        lines.append(f"dhcp-option=option:router,{lan_ip}")
-        lines.append(f"dhcp-option=option:dns-server,{lan_ip}")
+        start = dhcp_cfg.get("range_start") or ""
+        end = dhcp_cfg.get("range_end") or ""
+        lease = dhcp_cfg.get("lease_time") or ""
+        if start and end:
+            range_line = f"dhcp-range={start},{end}" + (f",{lease}" if lease else "")
+            lines.append(range_line)
+            lines.append(f"dhcp-option=option:router,{lan_ip}")
+            lines.append(f"dhcp-option=option:dns-server,{lan_ip}")
     else:
         lines.append("no-dhcp-interface=" + lan_target_if)
 
@@ -374,8 +329,8 @@ def configure_dnsmasq(cfg, lan_target_if):
 
 
 def configure_suricata(cfg):
-    ngfw_on = bool(cfg["features"].get("ngfw"))
-    suricata_on = ngfw_on and bool(cfg.get("ngfw", {}).get("suricata_enabled", True))
+    ngfw_on = bool(cfg.get("features", {}).get("ngfw"))
+    suricata_on = ngfw_on and bool(cfg.get("ngfw", {}).get("suricata_enabled"))
     if suricata_on:
         run(["systemctl", "enable", "--now", "suricata"], check=False)
     else:
@@ -383,36 +338,36 @@ def configure_suricata(cfg):
 
 
 def configure_ipvs(cfg):
-    l4_on = bool(cfg["features"].get("l4_lb"))
+    l4_on = bool(cfg.get("features", {}).get("l4_lb"))
     run(["ipvsadm", "-C"], check=False)
     if not l4_on:
         return
     l4 = cfg.get("l4_lb", {})
-    vip = l4.get("vip")
-    port = str(l4.get("port", ""))
-    sched = l4.get("scheduler", "wlc")
-    backends = l4.get("backends", [])
-    if vip and port and backends:
-        run(["ipvsadm", "-A", "-t", f"{vip}:{port}", "-s", sched], check=False)
+    vip = l4.get("vip") or ""
+    port = l4.get("port")
+    sched = l4.get("scheduler") or ""
+    backends = [b for b in l4.get("backends", []) if b]
+    if vip and port and sched and backends:
+        run(["ipvsadm", "-A", "-t", f"{vip}:{int(port)}", "-s", sched], check=False)
         for be in backends:
-            run(["ipvsadm", "-a", "-t", f"{vip}:{port}", "-r", be, "-m"], check=False)
+            run(["ipvsadm", "-a", "-t", f"{vip}:{int(port)}", "-r", be, "-m"], check=False)
 
 
 def configure_app_gw_l7(cfg):
-    l7_on = bool(cfg["features"].get("app_gw_afw_l7_lb"))
-    if not l7_on:
+    l7_on = bool(cfg.get("features", {}).get("app_gw_afw_l7_lb"))
+    l7 = cfg.get("app_gw_afw_l7_lb", {})
+    port = l7.get("listen_port")
+    if not l7_on or not port:
         if os.path.exists(NGINX_CONF):
             os.remove(NGINX_CONF)
         run(["systemctl", "stop", "nginx"], check=False)
         return
 
-    l7 = cfg.get("app_gw_afw_l7_lb", {})
-    port = int(l7.get("listen_port", 8080))
-    waf_on = bool(l7.get("waf_enabled", True))
-    backends = l7.get("backends", [])
+    waf_on = bool(l7.get("waf_enabled"))
+    backends = [b for b in l7.get("backends", []) if b]
 
     os.makedirs("/etc/nginx/modsec", exist_ok=True)
-    if not os.path.exists(MODSEC_MAIN):
+    if waf_on and not os.path.exists(MODSEC_MAIN):
         crs_setup = "/usr/share/modsecurity-crs/crs-setup.conf.example"
         crs_rules = "/usr/share/modsecurity-crs/rules/*.conf"
         modsec_lines = [
@@ -437,7 +392,7 @@ def configure_app_gw_l7(cfg):
         "}",
         "",
         "server {",
-        f"    listen {port};",
+        f"    listen {int(port)};",
         waf_block,
         "    location / {",
         "        proxy_pass http://netfw_l7_pool;",
@@ -456,8 +411,9 @@ def configure_app_gw_l7(cfg):
 
 
 def configure_web_ui(cfg):
-    web_on = bool(cfg["features"].get("web_ui"))
-    if web_on:
+    web_on = bool(cfg.get("features", {}).get("web_ui"))
+    web_cfg = cfg.get("web_ui", {})
+    if web_on and web_cfg.get("bind_ip") and web_cfg.get("port"):
         run(["systemctl", "restart", "netfw-web.service"], check=False)
     else:
         run(["systemctl", "stop", "netfw-web.service"], check=False)
@@ -475,7 +431,7 @@ def main():
     configure_ipvs(cfg)
     configure_app_gw_l7(cfg)
     configure_web_ui(cfg)
-    print(f"[netfw] Applied v{cfg.get('version', '1.1.0')} (LAN target: {lan_target_if or 'none'})")
+    print(f"[netfw] Applied v{cfg.get('version', '1.2.0')} (LAN target: {lan_target_if or 'none'})")
 
 
 if __name__ == "__main__":
@@ -483,7 +439,6 @@ if __name__ == "__main__":
 EOF
 chmod 0755 /usr/local/lib/netfw/apply.py
 
-# JSON API + external disk file server (no hardcoded webpage content)
 cat <<'EOF' > /usr/local/lib/netfw/web_server.py
 #!/usr/bin/env python3
 import http.server
@@ -491,6 +446,7 @@ import json
 import mimetypes
 import os
 import subprocess
+import sys
 import threading
 from urllib.parse import urlparse
 
@@ -547,9 +503,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        with LOCK:
+            cfg = read_cfg()
+
         if path == "/api/status":
-            with LOCK:
-                cfg = read_cfg()
             self._send_json(200, {
                 "version": cfg.get("version"),
                 "interfaces": cfg.get("interfaces"),
@@ -558,13 +515,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
-            with LOCK:
-                cfg = read_cfg()
             self._send_json(200, cfg)
             return
 
-        with LOCK:
-            web_dir = read_cfg().get("web_ui", {}).get("web_dir", "/var/lib/netfw/web")
+        web_dir = cfg.get("web_ui", {}).get("web_dir") or ""
+        if not web_dir:
+            self._send_json(404, {"error": "web_ui.web_dir is not configured"})
+            return
 
         rel = "index.html" if path == "/" else path.lstrip("/")
         base_abs = os.path.realpath(web_dir)
@@ -663,10 +620,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     cfg = read_cfg()
     web_cfg = cfg.get("web_ui", {})
-    bind_ip = web_cfg.get("bind_ip", "0.0.0.0")
-    port = int(web_cfg.get("port", 8090))
-    os.makedirs(web_cfg.get("web_dir", "/var/lib/netfw/web"), exist_ok=True)
-    server = http.server.ThreadingHTTPServer((bind_ip, port), Handler)
+    bind_ip = web_cfg.get("bind_ip") or ""
+    port = web_cfg.get("port")
+    if not bind_ip or not port:
+        print("web_ui.bind_ip and web_ui.port must be configured before starting web server", file=sys.stderr)
+        sys.exit(1)
+    web_dir = web_cfg.get("web_dir") or ""
+    if web_dir:
+        os.makedirs(web_dir, exist_ok=True)
+    server = http.server.ThreadingHTTPServer((bind_ip, int(port)), Handler)
     server.serve_forever()
 
 
@@ -696,13 +658,12 @@ VALID_FEATURES=(
 usage() {
   cat <<'USAGE'
 Usage:
-  netfw status                         Show management/data interfaces and features
+  netfw status                         Show configured interfaces and features
   netfw enable <feature|all>           Enable a feature (or 'all') in config.json
   netfw disable <feature|all>          Disable a feature (or 'all') in config.json
   netfw set <jq_path> <json_or_val>    Set a config field (e.g., netfw set .interfaces.wan eth1)
   netfw show                           Print full /etc/netfw/config.json
   netfw apply                          Apply config.json to kernel, firewall, DNS/DHCP, L4/L7, Web API
-  netfw detect-ifaces                  Auto-classify management vs data NICs into config.json
 
 Features:
   router            IPv4 routing + NAT masquerade
@@ -749,7 +710,7 @@ cmd="${1:-status}"
 case "$cmd" in
   status)
     echo "=== Interfaces ==="
-    jq -r '.interfaces | "Mgmt: \(.mgmt | join(", ")) | WAN: \(.wan) | LAN: \(.lan | join(", ")) | LAN IP: \(.lan_ip)"' "$CFG"
+    jq -r '.interfaces | "Mgmt: \(.mgmt | join(", ")) | WAN: \(.wan) | LAN: \(.lan | join(", ")) | LAN IP: \(.lan_ip) | Subnet: \(.lan_subnet)"' "$CFG"
     echo "=== Features ==="
     jq -r '.features | to_entries[] | "  \(.key): \(.value)"' "$CFG"
     ;;
@@ -780,50 +741,6 @@ case "$cmd" in
     ;;
   apply)
     python3 "$APPLY"
-    ;;
-  detect-ifaces)
-    mapfile -t ALL_IFACES < <(
-      ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | \
-        grep -vE '^(lo|br-|virbr|docker|veth|wg|tailscale|tun|tap)' || true
-    )
-    MGMT_IFS=()
-    DATA_IFS=()
-    for iface in "${ALL_IFACES[@]}"; do
-      if [[ "$iface" == wl* ]]; then
-        MGMT_IFS+=("$iface")
-        continue
-      fi
-      driver_path="/sys/class/net/${iface}/device/driver"
-      if [[ -L "$driver_path" ]]; then
-        drv_name="$(basename "$(readlink -f "$driver_path")")"
-        if [[ "$drv_name" == *"macb"* || "$drv_name" == *"brcm"* || "$drv_name" == *"rp1"* ]]; then
-          MGMT_IFS+=("$iface")
-          continue
-        fi
-      fi
-      DATA_IFS+=("$iface")
-    done
-    if [[ "${#MGMT_IFS[@]}" -eq 0 && "${#ALL_IFACES[@]}" -gt 0 ]]; then
-      MGMT_IFS=("${ALL_IFACES[0]}")
-      DATA_IFS=("${ALL_IFACES[@]:1}")
-    fi
-    WAN_IF="${DATA_IFS[0]:-}"
-    if [[ "${#DATA_IFS[@]}" -gt 1 ]]; then
-      LAN_JSON=$(printf '%s\n' "${DATA_IFS[@]:1}" | jq -R . | jq -s .)
-    else
-      LAN_JSON='[]'
-    fi
-    if [[ "${#MGMT_IFS[@]}" -gt 0 ]]; then
-      MGMT_JSON=$(printf '%s\n' "${MGMT_IFS[@]}" | jq -R . | jq -s .)
-    else
-      MGMT_JSON='[]'
-    fi
-    tmp="$(mktemp)"
-    jq --argjson mgmt "$MGMT_JSON" --arg wan "$WAN_IF" --argjson lan "$LAN_JSON" \
-      '.interfaces.mgmt = $mgmt | .interfaces.wan = $wan | .interfaces.lan = $lan' "$CFG" > "$tmp"
-    mv "$tmp" "$CFG"
-    chmod 0640 "$CFG"
-    echo "Mgmt=$(jq -r '.interfaces.mgmt | join(",")' "$CFG") | WAN=$WAN_IF | LAN=$(jq -r '.interfaces.lan | join(",")' "$CFG")"
     ;;
   -h|--help|help)
     usage
@@ -868,4 +785,4 @@ EOF
 
 systemctl daemon-reload
 systemctl enable netfw.service
-echo "[netfw v1.1] Installation complete. Run 'sudo netfw status' to inspect."
+echo "[netfw v1.2] Installation complete with blank initial config. Configure via 'netfw' CLI or web API."
